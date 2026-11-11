@@ -46,6 +46,17 @@ class CmsTest(unittest.TestCase):
         self.assertFalse(cms.is_tv(title))
         self.assertEqual(cms.episode_count(title), 1)
 
+    def test_map_vod_keeps_source_name_for_line_prefix(self):
+        row = {
+            "vod_id": 11, "vod_name": "源名前缀", "type_name": "电影",
+            "vod_play_from": "m3u8", "vod_play_url": "正片$https://a.invalid/p.m3u8",
+        }
+        api = "https://a.invalid/api.php/provide/vod"
+        named = cms.map_vod(row, {"id": "s_1", "name": "本地", "api": api})
+        self.assertEqual(named.provider_name, "本地")
+        unnamed = cms.map_vod(row, {"id": "s_2", "api": api})
+        self.assertEqual(unnamed.provider_name, "s_2")
+
     def test_xml_response(self):
         xml = ('<rss><list><video><id>3</id><name>XML片</name><type>电影</type>'
                '<dl><dd flag="m3u8"><![CDATA[正片$https://a.invalid/x.m3u8]]></dd></dl>'

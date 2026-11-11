@@ -384,7 +384,8 @@ def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
     return None
 
 
-def _clamp_line(value: str, names: list[str]) -> int | None:
+def _clamp_line(value: str, names: list[str],
+                brief: dict | None = None) -> int | None:
     raw = str(value or "").strip()
     if not raw:
         return None
@@ -392,7 +393,8 @@ def _clamp_line(value: str, names: list[str]) -> int | None:
         number = int(raw)
         return number if 0 <= number < len(names) else None
     for i, name in enumerate(names):
-        if name == raw or fake.line_label(name) == raw:
+        if name == raw or fake.line_label(name) == raw \
+                or (brief is not None and fake.line_display(brief, name) == raw):
             return i
     return None
 
@@ -401,7 +403,7 @@ def _line_from_body(brief: dict, body: dict) -> int:
     names = brief.get("line_names") or []
     wanted = str(body.get("line") or "")
     if wanted:
-        found = _clamp_line(wanted, names)
+        found = _clamp_line(wanted, names, brief)
         if found is not None:
             return found
     index = body.get("direct_link_quality_index")
@@ -437,7 +439,7 @@ def _range_selection(request: Request, brief: dict) -> tuple[int, bool]:
             if key in parsed and key not in params:
                 params[key] = parsed[key][0]
     if params.get("line"):
-        found = _clamp_line(params["line"], names)
+        found = _clamp_line(params["line"], names, brief)
         if found is not None:
             return found, True
     index = params.get("direct_link_quality_index")
@@ -617,7 +619,8 @@ async def preset_m3u8(mg: str, request: Request):
     order = [line] + [i for i in range(len(names)) if i != line]
     out = ["#EXTM3U", "#EXT-X-VERSION:3"]
     for rank, no in enumerate(order):
-        label = (fake.line_label(names[no]) if names else "原画").replace('"', "")
+        label = (fake.line_display(brief, names[no]) if names
+                 else "原画").replace('"', "")
         bw = 9_000_000 - rank if no == line else 2_000_000 + rank
         out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},PROGRAM-ID=1,'
                    f'NAME="{label}"')

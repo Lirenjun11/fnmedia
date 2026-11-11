@@ -39,6 +39,7 @@ class OnlineTitle:
     provider: str
     vod_id: str
     title: str
+    provider_name: str = ""
     type_name: str = ""
     year: str = ""
     area: str = ""
@@ -154,6 +155,7 @@ def map_vod(v: dict, source: dict) -> OnlineTitle | None:
             f"{parsed.scheme}://{parsed.netloc}/", poster.lstrip("/"))
     return OnlineTitle(
         provider=source["id"], vod_id=str(v["vod_id"]), title=title,
+        provider_name=str(source.get("name") or source.get("id") or ""),
         type_name=clean_text(v.get("type_name") or ""),
         year=str(v.get("vod_year") or ""),
         area=str(v.get("vod_area") or ""), remarks=str(v.get("vod_remarks") or ""),

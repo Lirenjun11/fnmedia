@@ -123,7 +123,8 @@ def brief_of(t: cms.OnlineTitle, guid: str) -> dict:
     first = (t.lines.get(names[0]) or []) if names else []
     first_url = first[0].url if first else ""
     return {
-        "guid": guid, "provider": t.provider, "vod_id": t.vod_id,
+        "guid": guid, "provider": t.provider,
+        "provider_name": t.provider_name or t.provider, "vod_id": t.vod_id,
         "title": t.title, "type_name": t.type_name, "year": t.year,
         "area": t.area, "remarks": t.remarks, "score": t.score,
         "poster": t.poster, "overview": t.overview, "actor": t.actor,
@@ -352,11 +353,17 @@ def line_label(name: str) -> str:
     return _LINE_LABELS.get(str(name).lower(), str(name))
 
 
+def line_display(b: dict, name: str) -> str:
+    label = line_label(name)
+    provider = str(b.get("provider_name") or b.get("provider") or "").strip()
+    return f"{provider}：{label}" if provider else label
+
+
 def qualities(b: dict) -> list[dict]:
     names = b.get("line_names") or []
     if len(names) < 2:
         return []
-    return [{"resolution": line_label(name), "bitrate": line_code(name),
+    return [{"resolution": line_display(b, name), "bitrate": line_code(name),
              "progressive": True, "is_m3u8": False} for name in names]
 
 

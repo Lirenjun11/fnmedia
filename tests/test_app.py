@@ -154,7 +154,8 @@ class AppContractTest(unittest.TestCase):
         import cms as cms_mod
         import fake
         title = cms_mod.OnlineTitle(
-            provider="s_1", vod_id="104", title="换线契约", type_name="电视剧",
+            provider="s_1", vod_id="104", title="换线契约",
+            provider_name="本地", type_name="电视剧",
             lines={
                 "line-a": [cms_mod.Episode("第1集", "https://a.invalid/1.m3u8"),
                            cms_mod.Episode("第2集", "https://a.invalid/2.m3u8")],
@@ -177,9 +178,10 @@ class AppContractTest(unittest.TestCase):
                                               ["line-a", "line-b"]))
             sl = client.get(f"/v/api/v1/stream/list/{eg}").json()["data"]
             self.assertEqual(len(sl["qualities"]), 3)
-            self.assertEqual(sl["qualities"][1]["resolution"], "line-b")
+            self.assertEqual(sl["qualities"][1]["resolution"], "本地：line-b")
             self.assertTrue(sl["qualities"][1]["progressive"])
             self.assertFalse(sl["qualities"][1]["is_m3u8"])
+            self.assertEqual(brief["provider_name"], "本地")
             code = sl["qualities"][1]["bitrate"]
             posted = client.post("/v/api/v1/stream/list",
                                  json={"item_guid": eg}).json()["data"]
@@ -187,10 +189,16 @@ class AppContractTest(unittest.TestCase):
             switched = client.post("/v/api/v1/stream", json={
                 "media_guid": mg, "bitrate": str(code)}).json()["data"]
             self.assertEqual(switched["video_stream"]["bps"], code)
-            self.assertEqual(switched["video_stream"]["resolution_type"], "line-b")
+            self.assertEqual(switched["video_stream"]["resolution_type"],
+                             "本地：line-b")
             legacy = client.post("/v/api/v1/stream", json={
                 "media_guid": mg, "bitrate": "L2"}).json()["data"]
-            self.assertEqual(legacy["video_stream"]["resolution_type"], "line-c")
+            self.assertEqual(legacy["video_stream"]["resolution_type"],
+                             "本地：line-c")
+            by_label = client.post("/v/api/v1/stream", json={
+                "media_guid": mg, "line": "本地：line-c"}).json()["data"]
+            self.assertEqual(by_label["video_stream"]["resolution_type"],
+                             "本地：line-c")
             played = client.post("/v/api/v1/play/play", json={
                 "media_guid": mg, "bitrate": code}).json()["data"]
             self.assertIn("preset.m3u8", played["play_link"])
@@ -199,9 +207,9 @@ class AppContractTest(unittest.TestCase):
             master = client.get(played["play_link"])
             self.assertEqual(master.status_code, 200)
             self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 3)
-            self.assertIn('NAME="line-b"', master.text)
+            self.assertIn('NAME="本地：line-b"', master.text)
             self.assertIn("main.m3u8?line=1&index=1", master.text)
-            self.assertTrue(master.text.split('NAME="line-b"')[0]
+            self.assertTrue(master.text.split('NAME="本地：line-b"')[0]
                             .endswith("BANDWIDTH=9000000,PROGRAM-ID=1,"))
             auto = client.post("/v/api/v1/play/play",
                                json={"media_guid": mg}).json()["data"]
