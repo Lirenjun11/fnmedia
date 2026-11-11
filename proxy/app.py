@@ -608,24 +608,15 @@ async def preset_m3u8(mg: str, request: Request):
         return Response(status_code=404)
     line, _ = _range_selection(request, brief)
     names = brief.get("line_names") or []
-    if request.query_params.get("auto") == "1" \
-            and config.get().get("auto_best_source", True):
-        winner = await _race_lines(request.app.state.src, brief, guid, index,
-                                   line, 3.0)
-        if winner:
-            line = winner[0]
-            hls.remember_playlist_meta((guid, line, index), winner[3])
-    # 多线路 master：飞牛播放器的清晰度/线路切换依赖多播放源，单变体会切不动。
-    order = [line] + [i for i in range(len(names)) if i != line]
-    out = ["#EXTM3U", "#EXT-X-VERSION:3"]
-    for rank, no in enumerate(order):
-        label = (fake.line_display(brief, names[no]) if names
-                 else "原画").replace('"', "")
-        bw = 9_000_000 - rank if no == line else 2_000_000 + rank
-        out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},PROGRAM-ID=1,'
-                   f'NAME="{label}"')
-        out.append(f"main.m3u8?line={no}&index={index}")
-    text = "\n".join(out) + "\n"
+    # 只给当前线路一条变体：手机端会按 master 变体顺序串行预取每一条
+    # main.m3u8，多线路会把起播拖过播放器超时；换线由 qualities 触发的
+    # play/play 重新下发单变体 master 完成。
+    label = (fake.line_display(brief, names[line]) if names
+             else "原画").replace('"', "")
+    auto = "&auto=1" if request.query_params.get("auto") == "1" else ""
+    text = ("#EXTM3U\n#EXT-X-VERSION:3\n"
+            f'#EXT-X-STREAM-INF:BANDWIDTH=2000000,PROGRAM-ID=1,NAME="{label}"\n'
+            f"main.m3u8?line={line}&index={index}{auto}\n")
     return Response(text, media_type="application/vnd.apple.mpegurl",
                     headers={"Access-Control-Allow-Origin": "*",
                              "Cache-Control": "no-store"})

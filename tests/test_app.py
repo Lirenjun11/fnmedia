@@ -206,14 +206,18 @@ class AppContractTest(unittest.TestCase):
             self.assertNotIn("auto=1", played["play_link"])
             master = client.get(played["play_link"])
             self.assertEqual(master.status_code, 200)
-            self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 3)
+            # 手机端会串行预取 master 的每个变体，必须只下发当前线路一条
+            self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 1)
             self.assertIn('NAME="本地：line-b"', master.text)
             self.assertIn("main.m3u8?line=1&index=1", master.text)
             self.assertTrue(master.text.split('NAME="本地：line-b"')[0]
-                            .endswith("BANDWIDTH=9000000,PROGRAM-ID=1,"))
+                            .endswith("BANDWIDTH=2000000,PROGRAM-ID=1,"))
             auto = client.post("/v/api/v1/play/play",
                                json={"media_guid": mg}).json()["data"]
             self.assertIn("auto=1", auto["play_link"])
+            auto_master = client.get(auto["play_link"])
+            self.assertEqual(auto_master.text.count("#EXT-X-STREAM-INF"), 1)
+            self.assertIn("main.m3u8?line=0&index=1&auto=1", auto_master.text)
 
     def test_probe_requires_keyword(self):
         with TestClient(appmod.app) as client:
