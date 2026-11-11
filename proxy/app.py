@@ -94,8 +94,11 @@ async def access_log(request: Request, call_next):
         runtime.log(f"ERROR {request.method} {request.url.path} {type(exc).__name__}")
         raise
     path = request.url.path
-    if path.endswith("/task/running") or "/sys/img/" in path or \
-            path.startswith("/v/api/ext/logs"):
+    if path.endswith("/task/running") or path.startswith("/v/api/ext/logs"):
+        return resp
+    if "/sys/img/" in path:
+        if resp.status_code >= 400 or "online/" in path:
+            runtime.log(f"{request.method} {path} -> {resp.status_code}")
         return resp
     if "/api/" in path or path.startswith(ONLINE) or path.startswith("/online/") or path.startswith("/_ext/"):
         runtime.log(f"{request.method} {path} -> {resp.status_code} "
@@ -352,6 +355,8 @@ async def _item_title_detail(brief: dict, guid: str, request: Request):
         except Exception as exc:
             runtime.log(f"douban enrich error: {type(exc).__name__}")
     detail = playstate.apply(detail, guid)
+    runtime.log(f"detail poster: {str(detail.get('posters'))[:100]!r} "
+                f"backdrops={str(detail.get('backdrops'))[:100]!r}")
     return JSONResponse(fake.ok(fake.normalize_detail(detail, _ua(request))))
 
 
@@ -370,6 +375,7 @@ async def season_route(guid: str, request: Request):
         total = len(fake.episode_list(brief))
         for row in rows:
             row["number_of_episodes"] = total
+            row["local_number_of_episodes"] = total
     return JSONResponse(fake.ok(fake.normalize_cards(rows, ua)))
 
 
@@ -502,11 +508,9 @@ def _clamp_line(value: str, names: list[str],
 
 def _line_from_body(brief: dict, body: dict) -> int:
     names = brief.get("line_names") or []
-    wanted = str(body.get("line") or "")
-    if wanted:
-        found = _clamp_line(wanted, names, brief)
-        if found is not None:
-            return found
+    found = fake.line_index(body.get("bitrate"), names)
+    if found is not None:
+        return found
     index = body.get("direct_link_quality_index")
     if index is not None:
         try:
@@ -515,8 +519,12 @@ def _line_from_body(brief: dict, body: dict) -> int:
             number = -1
         if 0 <= number < len(names):
             return number
-    found = fake.line_index(body.get("bitrate"), names)
-    return found if found is not None else 0
+    wanted = str(body.get("line") or "")
+    if wanted:
+        found = _clamp_line(wanted, names, brief)
+        if found is not None:
+            return found
+    return 0
 
 
 def _video_guid_for(guid: str, index: int, mg: str) -> str:
@@ -539,10 +547,10 @@ def _range_selection(request: Request, brief: dict) -> tuple[int, bool]:
         for key in ("line", "bitrate", "direct_link_quality_index"):
             if key in parsed and key not in params:
                 params[key] = parsed[key][0]
-    if params.get("line"):
-        found = _clamp_line(params["line"], names, brief)
-        if found is not None:
-            return found, True
+    # 客户端可能把新的 bitrate 追加到旧 play_link 上，优先于残留的 line。
+    found = fake.line_index(params.get("bitrate"), names)
+    if found is not None:
+        return found, True
     index = params.get("direct_link_quality_index")
     if index not in (None, ""):
         try:
@@ -551,9 +559,10 @@ def _range_selection(request: Request, brief: dict) -> tuple[int, bool]:
             number = -1
         if 0 <= number < len(names):
             return number, True
-    found = fake.line_index(params.get("bitrate"), names)
-    if found is not None:
-        return found, True
+    if params.get("line"):
+        found = _clamp_line(params["line"], names, brief)
+        if found is not None:
+            return found, True
     return 0, False
 
 
@@ -705,9 +714,30 @@ async def play_play(request: Request):
         link, "HLS" if is_hls else "MP4"))
 
 
+async def _warm_line(client, brief: dict, guid: str, index: int,
+                     no: int) -> tuple | None:
+    key = (guid, no, index)
+    hit = hls.get_playlist_text(key)
+    if hit:
+        return (no,) + hit
+    picked = _pick(brief, no, index)
+    if not picked:
+        return None
+    try:
+        url = hls.ensure_public_target(picked[0])
+        text, base, meta = await hls.fetch_playlist(
+            client, url, timeout=min(float(config.get().get("play_timeout", 8.0)),
+                                     2.0))
+    except Exception:
+        return None
+    hls.remember_playlist_text(key, text, base, meta)
+    hls.remember_playlist_meta(key, meta)
+    return no, text, base, meta
+
+
 @app.get(f"{ONLINE}/{{mg}}/preset.m3u8")
 async def preset_m3u8(mg: str, request: Request):
-    """播放入口清单：官方播放器要求 play_link 是 master，哪怕只有一条变体。"""
+    """播放 master：列出全部可用线路，网页可切 level，手机预取命中缓存。"""
     resolved = request.app.state.store.resolve_media(mg)
     if not resolved:
         return Response(status_code=404)
@@ -717,15 +747,34 @@ async def preset_m3u8(mg: str, request: Request):
         return Response(status_code=404)
     line, _ = _range_selection(request, brief)
     names = brief.get("line_names") or []
-    # 只给当前线路一条变体：手机端会按 master 变体顺序串行预取每一条
-    # main.m3u8，多线路会把起播拖过播放器超时；换线由 qualities 触发的
-    # play/play 重新下发单变体 master 完成。
-    label = (fake.line_display(brief, names[line]) if names
-             else "原画").replace('"', "")
-    auto = "&auto=1" if request.query_params.get("auto") == "1" else ""
-    text = ("#EXTM3U\n#EXT-X-VERSION:3\n"
-            f'#EXT-X-STREAM-INF:BANDWIDTH=2000000,PROGRAM-ID=1,NAME="{label}"\n'
-            f"main.m3u8?line={line}&index={index}{auto}\n")
+    line = max(0, min(line, len(names) - 1)) if names else 0
+    order = [line] + [i for i in range(len(names)) if i != line and
+                      _pick(brief, i, index)]
+    # 当前线路必须就绪；其余线路后台并发预热。手机端会对每个变体串行取
+    # main.m3u8，预热后大部分命中缓存，避免累计成起播超时。
+    tasks = {no: asyncio.create_task(
+        _warm_line(request.app.state.src, brief, guid, index, no))
+        for no in order}
+    selected = tasks.get(line)
+    if selected is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(selected),
+                                   timeout=min(float(config.get().get(
+                                       "play_timeout", 8.0)), 2.0))
+        except asyncio.TimeoutError:
+            pass
+    rest = [task for no, task in tasks.items() if no != line]
+    if rest:
+        await asyncio.wait(rest, timeout=0.5)
+    out = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    for rank, no in enumerate(order):
+        label = (fake.line_display(brief, names[no]) if names
+                 else "原画").replace('"', "")
+        bw = 9_000_000 - rank if no == line else 2_000_000 + rank
+        out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},PROGRAM-ID=1,'
+                   f'NAME="{label}"')
+        out.append(f"main.m3u8?line={no}&index={index}")
+    text = "\n".join(out) + "\n"
     return Response(text, media_type="application/vnd.apple.mpegurl",
                     headers={"Access-Control-Allow-Origin": "*",
                              "Cache-Control": "no-store"})
@@ -745,11 +794,19 @@ async def main_m3u8(mg: str, request: Request):
     except ValueError:
         line = 0
     auto_start = request.query_params.get("auto") == "1"
+    if not auto_start:
+        cached = hls.get_playlist_text((guid, line, index))
+        if cached:
+            text, base, meta = cached
+            return hls.playlist_response(text, base, SEG_PREFIX,
+                                         f"{ONLINE}/variant",
+                                         hls.is_master(text))
     if auto_start and config.get().get("auto_best_source", True):
         winner = await _race_lines(request.app.state.src, brief, guid, index,
                                    line, 3.0)
         if winner:
             attempt, text, base, meta = winner
+            hls.remember_playlist_text((guid, attempt, index), text, base, meta)
             hls.remember_playlist_meta((guid, attempt, index), meta)
             hls.remember_playlist_meta((guid, line, index), meta)
             if attempt != line:
@@ -785,6 +842,7 @@ async def main_m3u8(mg: str, request: Request):
                 last_error = type(exc).__name__
                 _mark_bad_line(guid, attempt)
                 continue
+            hls.remember_playlist_text((guid, attempt, index), text, base, meta)
             hls.remember_playlist_meta((guid, attempt, index), meta)
             hls.remember_playlist_meta((guid, line, index), meta)
             if attempt != line:

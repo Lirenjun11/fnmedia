@@ -31,6 +31,25 @@ def is_master(text: str) -> bool:
     return "#EXT-X-STREAM-INF" in text
 
 
+def is_playlist(text: str) -> bool:
+    head = (text or "").lstrip()[:64]
+    return head.startswith("#EXTM3U") or "#EXTINF" in (text or "")[:2048]
+
+
+_M3U8_RE = re.compile(r'''(?:https?:)?//[^\s"'<>\\]+?\.m3u8[^\s"'<>\\]*''')
+_REL_M3U8_RE = re.compile(r'''["']([^"']+?\.m3u8[^"']*)["']''')
+
+
+def extract_m3u8(text: str) -> str:
+    """分享播放页（HTML/JSON）里硬编码的 m3u8 地址。"""
+    plain = (text or "").replace("\\/", "/")
+    for pattern in (_M3U8_RE, _REL_M3U8_RE):
+        match = pattern.search(plain)
+        if match:
+            return match.group(1) if pattern is _REL_M3U8_RE else match.group(0)
+    return ""
+
+
 def ensure_public_target(url: str) -> str:
     """分片、图片与直链代理的目标校验。
 
@@ -103,6 +122,28 @@ def build_playlist_meta(text: str, child: dict | None = None) -> dict:
     return meta
 
 
+_PLAYLISTS: dict = {}
+_PLAYLIST_TTL = 120.0
+
+
+def remember_playlist_text(key: tuple, text: str, base: str, meta: dict) -> None:
+    _PLAYLISTS[key] = (time.monotonic(), text, base, meta)
+    if len(_PLAYLISTS) > 400:
+        for stale in list(_PLAYLISTS)[:80]:
+            _PLAYLISTS.pop(stale, None)
+
+
+def get_playlist_text(key: tuple) -> tuple[str, str, dict] | None:
+    hit = _PLAYLISTS.get(key)
+    if not hit:
+        return None
+    ts, text, base, meta = hit
+    if time.monotonic() - ts > _PLAYLIST_TTL:
+        _PLAYLISTS.pop(key, None)
+        return None
+    return text, base, meta
+
+
 _META: dict = {}
 _META_TTL = 120.0
 
@@ -164,6 +205,14 @@ async def fetch_playlist(client: httpx.AsyncClient, url: str,
     resp.raise_for_status()
     text = resp.text
     base = str(resp.url)
+    if not is_playlist(text):
+        if depth < 2:
+            child = extract_m3u8(text)
+            if child:
+                return await fetch_playlist(
+                    client, ensure_public_target(urllib.parse.urljoin(base, child)),
+                    timeout, depth + 1)
+        raise ValueError("not a playlist")
     if is_master(text) and depth < 2:
         best = pick_best_variant(text)
         if best:

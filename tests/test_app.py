@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import httpx
 import hls
 
 
@@ -36,6 +37,10 @@ import config
 
 
 class AppContractTest(unittest.TestCase):
+    def setUp(self):
+        hls._PLAYLISTS.clear()
+        hls._META.clear()
+
     @classmethod
     def tearDownClass(cls):
         config.save({**config.get(), "sources": [], "subscriptions": []})
@@ -204,20 +209,24 @@ class AppContractTest(unittest.TestCase):
             self.assertIn("preset.m3u8", played["play_link"])
             self.assertIn("line=1", played["play_link"])
             self.assertNotIn("auto=1", played["play_link"])
-            master = client.get(played["play_link"])
-            self.assertEqual(master.status_code, 200)
-            # 手机端会串行预取 master 的每个变体，必须只下发当前线路一条
-            self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 1)
-            self.assertIn('NAME="本地：line-b"', master.text)
-            self.assertIn("main.m3u8?line=1&index=1", master.text)
-            self.assertTrue(master.text.split('NAME="本地：line-b"')[0]
-                            .endswith("BANDWIDTH=2000000,PROGRAM-ID=1,"))
-            auto = client.post("/v/api/v1/play/play",
-                               json={"media_guid": mg}).json()["data"]
-            self.assertIn("auto=1", auto["play_link"])
-            auto_master = client.get(auto["play_link"])
-            self.assertEqual(auto_master.text.count("#EXT-X-STREAM-INF"), 1)
-            self.assertIn("main.m3u8?line=0&index=1&auto=1", auto_master.text)
+            async def fake_fetch(_client, url, timeout=3.0, depth=0):
+                return ("#EXTM3U\n#EXTINF:1.0,\ns.ts\n", url,
+                        {"width": 0, "height": 0, "bandwidth": 0})
+            with patch.object(hls, "ensure_public_target", new=lambda u: u), \
+                    patch.object(hls, "fetch_playlist", new=fake_fetch):
+                master = client.get(played["play_link"])
+                self.assertEqual(master.status_code, 200)
+                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 3)
+                self.assertIn('NAME="本地：line-b"', master.text)
+                self.assertIn("main.m3u8?line=1&index=1", master.text)
+                self.assertTrue(master.text.split('NAME="本地：line-b"')[0]
+                                .endswith("BANDWIDTH=9000000,PROGRAM-ID=1,"))
+                auto = client.post("/v/api/v1/play/play",
+                                   json={"media_guid": mg}).json()["data"]
+                self.assertIn("auto=1", auto["play_link"])
+                auto_master = client.get(auto["play_link"])
+            self.assertEqual(auto_master.text.count("#EXT-X-STREAM-INF"), 3)
+            self.assertIn("main.m3u8?line=0&index=1", auto_master.text)
 
     def test_episode_detail_and_play_info(self):
         import cms as cms_mod
@@ -241,7 +250,7 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(episode["parent_guid"], sg)
             self.assertEqual(episode["episode_number"], 2)
             self.assertEqual(episode["media_guid"], fake.ep_media_guid(eg))
-            self.assertTrue(episode["posters"].startswith("/online/"))
+            self.assertTrue(episode["posters"].startswith("online/"))
             self.assertEqual(episode["backdrops"], episode["posters"])
             phone = {"User-Agent": "fnos-media/1.8.0 (Android 14; Phone)"}
             mobile_seasons = client.get(f"/v/api/v1/season/list/{guid}",
@@ -322,9 +331,15 @@ class AppContractTest(unittest.TestCase):
                                      json={"media_guid": mg,
                                            "bitrate": fake.line_code("lz")},
                                      headers=headers).json()["data"]
-                master = client.get(played["play_link"], headers=headers)
+                async def fake_fetch(_client, url, timeout=3.0, depth=0):
+                    return ("#EXTM3U\n#EXTINF:1.0,\ns.ts\n", url,
+                            {"width": 0, "height": 0, "bandwidth": 0})
+                with patch.object(hls, "ensure_public_target",
+                                  new=lambda u: u), \
+                        patch.object(hls, "fetch_playlist", new=fake_fetch):
+                    master = client.get(played["play_link"], headers=headers)
                 self.assertEqual(master.status_code, 200)
-                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 1)
+                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 2)
                 self.assertIn('NAME="本地：lz"', master.text)
 
     def test_probe_requires_keyword(self):
@@ -683,6 +698,33 @@ class AppContractTest(unittest.TestCase):
 
 
 class HlsTest(unittest.TestCase):
+    def test_fetch_resolves_share_page_to_m3u8(self):
+        def handler(request):
+            url = str(request.url)
+            if url.endswith(".m3u8"):
+                return httpx.Response(
+                    200, text="#EXTM3U\n#EXTINF:6.0,\nseg.ts\n")
+            return httpx.Response(
+                200, headers={"content-type": "text/html"},
+                text='<script>var u="https:\\/\\/cdn.invalid\\/p\\/index.m3u8";'
+                     "</script>")
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.object(hls, "ensure_public_target", new=lambda u: u):
+            text, base, _meta = asyncio.run(
+                hls.fetch_playlist(client, "https://play.invalid/play/abc"))
+        self.assertIn("#EXTINF", text)
+        self.assertIn("index.m3u8", base)
+
+    def test_fetch_rejects_page_without_m3u8(self):
+        def handler(_request):
+            return httpx.Response(200, headers={"content-type": "text/html"},
+                                  text="<html>403</html>")
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.object(hls, "ensure_public_target", new=lambda u: u):
+            with self.assertRaises(ValueError):
+                asyncio.run(hls.fetch_playlist(
+                    client, "https://play.invalid/play/abc"))
+
     def test_rewrite_relative_and_key(self):
         text = ("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.key\"\n"
                 "#EXTINF:6.0,\nseg1.ts\n#EXTINF:6.0,\nhttps://cdn.invalid/seg2.ts\n")

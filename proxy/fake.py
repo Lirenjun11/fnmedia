@@ -56,7 +56,8 @@ def poster_path(url: str) -> str:
     if not url or not url.startswith("http"):
         return ""
     token = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-    return f"/online/{token}.jpg"
+    # 官方图片均为相对路径，客户端统一拼 /v/api/v1/sys/img 前缀。
+    return f"online/{token}.jpg"
 
 
 def is_tv_client(ua: str) -> bool:
@@ -195,7 +196,8 @@ def detail_item(b: dict) -> dict:
         "air_date": b.get("year") or "", "season_number": 0,
         "number_of_seasons": 1 if b.get("is_tv") else 0,
         "number_of_episodes": b.get("episodes", 0),
-        "local_number_of_episodes": 0, "local_number_of_seasons": 0,
+        "local_number_of_episodes": b.get("episodes", 0) if b.get("is_tv") else 0,
+        "local_number_of_seasons": 1 if b.get("is_tv") else 0,
         "can_play": 1, "type": "TV" if b.get("is_tv") else "Movie",
         "play_error": "", "parent_guid": "", "ancestor_guid": "",
         "ancestor_name": "🌐在线资源",
@@ -265,7 +267,13 @@ def episode_item(b: dict, index: int) -> dict:
 
 def season_item(b: dict) -> dict:
     rows = season_list(b)
-    return rows[0] if rows else {}
+    if not rows:
+        return {}
+    row = rows[0]
+    total = len(episode_list(b))
+    row["number_of_episodes"] = total
+    row["local_number_of_episodes"] = total
+    return row
 
 
 def episode_list(b: dict) -> list[dict]:

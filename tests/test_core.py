@@ -194,12 +194,12 @@ class FakeTest(unittest.TestCase):
 
     def test_poster_path_uses_short_prefix(self):
         path = fake.poster_path("https://img.invalid/p.jpg")
-        self.assertTrue(path.startswith("/online/"))
+        self.assertTrue(path.startswith("online/"))
         self.assertTrue(path.endswith(".jpg"))
 
     def test_detail_posters_use_proxy_path(self):
         detail = fake.detail_item(dict(self.brief, poster="https://img.invalid/p.jpg"))
-        self.assertTrue(detail["posters"].startswith("/online/"))
+        self.assertTrue(detail["posters"].startswith("online/"))
         self.assertEqual(detail["backdrops"], detail["posters"])
 
     def test_map_vod_resolves_relative_poster(self):
