@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
+import shutil
+import subprocess
 import time
 import urllib.parse
 
@@ -25,6 +28,70 @@ def encode_url(url: str) -> str:
 def decode_url(token: str) -> str:
     padded = token + "=" * (-len(token) % 4)
     return base64.urlsafe_b64decode(padded).decode()
+
+
+_OPENSSL = shutil.which("openssl")
+
+
+def can_decrypt() -> bool:
+    return bool(_OPENSSL)
+
+
+def encode_seg(url: str, key_url: str = "", iv: str = "") -> str:
+    if not key_url:
+        return encode_url(url)
+    raw = json.dumps({"u": url, "k": key_url, "iv": iv}, separators=(",", ":"))
+    return "k" + base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def decode_seg(token: str) -> tuple[str, str, str]:
+    if not token.startswith("k"):
+        return decode_url(token), "", ""
+    padded = token[1:] + "=" * (-len(token[1:]) % 4)
+    data = json.loads(base64.urlsafe_b64decode(padded).decode())
+    return str(data.get("u", "")), str(data.get("k", "")), str(data.get("iv", ""))
+
+
+_KEYS: dict = {}
+_KEY_TTL = 120.0
+
+
+async def fetch_key(client, url: str, timeout: float = 8.0) -> bytes:
+    now = time.monotonic()
+    hit = _KEYS.get(url)
+    if hit and now - hit[0] < _KEY_TTL:
+        return hit[1]
+    resp = await client.get(url, headers={"User-Agent": _UA}, timeout=timeout)
+    resp.raise_for_status()
+    _KEYS[url] = (now, resp.content)
+    if len(_KEYS) > 300:
+        for stale in list(_KEYS)[:60]:
+            _KEYS.pop(stale, None)
+    return resp.content
+
+
+async def fetch_media_bytes(client, url: str, timeout: float = 15.0) -> bytes:
+    parsed = urllib.parse.urlparse(url)
+    resp = await client.get(url, timeout=timeout, headers={
+        "User-Agent": _UA,
+        "Referer": f"{parsed.scheme}://{parsed.netloc}/",
+    })
+    resp.raise_for_status()
+    return resp.content
+
+
+def decrypt_segment(data: bytes, key: bytes, iv: str) -> bytes | None:
+    if not _OPENSSL or len(key) != 16:
+        return None
+    iv_hex = (iv or "0" * 32).removeprefix("0x").ljust(32, "0")[:32]
+    try:
+        proc = subprocess.run(
+            [_OPENSSL, "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
+             "-iv", iv_hex],
+            input=data, capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
 
 
 def is_master(text: str) -> bool:
@@ -174,13 +241,32 @@ def pick_best_variant(text: str) -> str | None:
 
 
 def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
-                     variant_prefix: str = "", is_master: bool = False) -> str:
+                     variant_prefix: str = "", is_master: bool = False,
+                     decrypt_keys: bool = False) -> str:
     out = []
+    key_url = ""
+    key_iv = ""
+    seq = 0
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
             out.append(line)
             continue
+        if not is_master and stripped.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                seq = int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                seq = 0
+        if not is_master and decrypt_keys and stripped.startswith("#EXT-X-KEY"):
+            upper = stripped.upper()
+            uri = _URI_ATTR.search(stripped)
+            if "METHOD=AES-128" in upper and uri:
+                key_url = urllib.parse.urljoin(base_url, uri.group(1))
+                iv = re.search(r"IV=0x([0-9A-Fa-f]+)", stripped)
+                key_iv = iv.group(1) if iv else ""
+                continue
+            key_url = ""
+            key_iv = ""
         if stripped.startswith("#"):
             attr_target = variant_prefix if is_master else seg_prefix
 
@@ -191,7 +277,12 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
             continue
         target = variant_prefix if is_master else seg_prefix
         absolute = urllib.parse.urljoin(base_url, stripped)
-        out.append(f"{target}?u={encode_url(absolute)}")
+        if key_url:
+            iv = key_iv or f"{seq:032x}"
+            out.append(f"{target}?u={encode_seg(absolute, key_url, iv)}")
+        else:
+            out.append(f"{target}?u={encode_url(absolute)}")
+        seq += 1
     return "\n".join(out) + "\n"
 
 
@@ -224,8 +315,10 @@ async def fetch_playlist(client: httpx.AsyncClient, url: str,
 
 def playlist_response(text: str, base: str, seg_prefix: str,
                       variant_prefix: str = "",
-                      is_master: bool = False) -> Response:
-    return Response(rewrite_playlist(text, base, seg_prefix, variant_prefix, is_master),
+                      is_master: bool = False,
+                      decrypt_keys: bool = False) -> Response:
+    return Response(rewrite_playlist(text, base, seg_prefix, variant_prefix,
+                                     is_master, decrypt_keys),
                     media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
 
@@ -237,8 +330,9 @@ async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
         if key in request.headers:
             headers[key] = request.headers[key]
     parsed = urllib.parse.urlparse(url)
-    headers["Referer"] = request.headers.get("referer") or \
-        f"{parsed.scheme}://{parsed.netloc}/"
+    # 不能把播放器（我们自己的 NAS 地址）的 Referer 透传给源站，
+    # 分享页的密钥/分片服务器会因此返回无效内容。
+    headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
     resp = await client.send(client.build_request("GET", url, headers=headers),
                              stream=True)
     out_headers = {}

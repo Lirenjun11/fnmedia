@@ -68,7 +68,8 @@ async def lifespan(app: FastAPI):
     )
     app.state.store = cms.TitleStore()
     playstate.load()
-    runtime.log(f"service started, sources={len(config.enabled_sources())}")
+    runtime.log(f"service started, sources={len(config.enabled_sources())} "
+                f"aes_decrypt={'on' if hls.can_decrypt() else 'off'}")
     worker = asyncio.create_task(_auto_update_worker())
     try:
         yield
@@ -803,7 +804,8 @@ async def main_m3u8(mg: str, request: Request):
             text, base, meta = cached
             return hls.playlist_response(text, base, SEG_PREFIX,
                                          f"{ONLINE}/variant",
-                                         hls.is_master(text))
+                                         hls.is_master(text),
+                                         hls.can_decrypt())
     if auto_start and config.get().get("auto_best_source", True):
         winner = await _race_lines(request.app.state.src, brief, guid, index,
                                    line, 3.0)
@@ -817,7 +819,8 @@ async def main_m3u8(mg: str, request: Request):
                             f"line {line} -> {attempt}")
             return hls.playlist_response(text, base, SEG_PREFIX,
                                          f"{ONLINE}/variant",
-                                         hls.is_master(text))
+                                         hls.is_master(text),
+                                         hls.can_decrypt())
     last_error = ""
     tried = set()
     while len(tried) < 2:
@@ -853,7 +856,8 @@ async def main_m3u8(mg: str, request: Request):
                             f"line {line} -> {attempt} ({last_error})")
             return hls.playlist_response(text, base, SEG_PREFIX,
                                          f"{ONLINE}/variant",
-                                         hls.is_master(text))
+                                         hls.is_master(text),
+                                         hls.can_decrypt())
     if last_error:
         runtime.log(f"playback failed: {brief.get('title', '')[:40]} ({last_error})")
     return Response(status_code=502)
@@ -875,7 +879,8 @@ async def variant_playlist(request: Request):
         return Response(status_code=502)
     if hls.is_master(text):
         return Response(status_code=502)
-    return hls.playlist_response(text, base, SEG_PREFIX)
+    return hls.playlist_response(text, base, SEG_PREFIX,
+                                 decrypt_keys=hls.can_decrypt())
 
 
 @app.get(f"{ONLINE}/{{mg}}/direct")
@@ -905,13 +910,29 @@ async def direct_media(mg: str, request: Request):
 async def segment(request: Request):
     token = request.query_params.get("u", "")
     try:
-        url = hls.decode_url(token)
+        url, key_url, iv = hls.decode_seg(token)
     except Exception:  
         return Response(status_code=400)
+    if url.split("?", 1)[0].lower().endswith((".key", "/key")):
+        runtime.log(f"segment key: {url[:100]} ref={request.headers.get('referer', '')[:40]!r}")
     try:
         url = hls.ensure_public_target(url)
+        if key_url:
+            key_url = hls.ensure_public_target(key_url)
     except ValueError:
         return Response(status_code=400)
+    if key_url:
+        try:
+            key = await hls.fetch_key(request.app.state.src, key_url)
+            data = await hls.fetch_media_bytes(request.app.state.src, url)
+            plain = hls.decrypt_segment(data, key, iv)
+        except Exception as exc:
+            runtime.log(f"decrypt error: {type(exc).__name__}")
+            plain = None
+        if plain is not None:
+            return Response(plain, media_type="video/mp2t",
+                            headers={"Cache-Control": "public, max-age=3600"})
+        runtime.log(f"decrypt failed: {url[:100]}")
     return await hls.proxy_media(request, url, request.app.state.src)
 
 
@@ -956,6 +977,25 @@ async def poster(token: str, request: Request):
     except ValueError:
         return Response(status_code=400)
     return await hls.proxy_poster(url, request.app.state.poster)
+
+
+@app.post("/v/api/v1/media/p")
+async def media_p(request: Request):
+    """播放器换清晰度/退出时的控制请求，官方要求 data.result=succ。"""
+    body = await _body(request)
+    link = body.get("playLink") or body.get("play_link") or ""
+    req = str(body.get("req") or "")
+    try:
+        path = urlsplit(str(link)).path if isinstance(link, str) else ""
+    except ValueError:
+        path = ""
+    if path.startswith(ONLINE + "/"):
+        quality = body.get("quality") if isinstance(body.get("quality"), dict) else {}
+        runtime.log(f"media/p: req={req!r} bitrate={quality.get('bitrate')!r} "
+                    f"link={str(link)[:80]}")
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            "reqid": body.get("reqid", ""), "result": "succ"}})
+    return await _passthrough(request)
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE",

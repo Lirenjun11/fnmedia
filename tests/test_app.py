@@ -2,6 +2,7 @@ import _bootstrap
 import asyncio
 import json
 import os
+import subprocess
 import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -723,6 +724,77 @@ class AppContractTest(unittest.TestCase):
 
 
 class HlsTest(unittest.TestCase):
+    def test_segment_proxy_uses_source_referer(self):
+        token = hls.encode_url("https://cdn.invalid/a.ts")
+        seen = {}
+
+        def handler(request):
+            seen["ref"] = request.headers.get("referer")
+            return httpx.Response(200, content=b"\x47",
+                                  headers={"content-type": "video/mp2t"})
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            appmod.app.state.src = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler))
+            with patch.object(hls, "ensure_public_target", new=lambda u: u):
+                resp = client.get(
+                    f"/v/media/online/seg?u={token}",
+                    headers={"Referer": "https://nas.invalid/"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(seen["ref"], "https://cdn.invalid/")
+
+    def test_rewrite_decrypts_aes_playlist(self):
+        text = ("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n"
+                '#EXT-X-KEY:METHOD=AES-128,URI="enc.key",'
+                "IV=0x00000000000000000000000000000000\n"
+                "#EXTINF:1.0,\nseg1.ts\n#EXT-X-ENDLIST\n")
+        out = hls.rewrite_playlist(text, "https://cdn.invalid/p/index.m3u8",
+                                   "/v/media/online/seg", decrypt_keys=True)
+        self.assertNotIn("#EXT-X-KEY", out)
+        token = next(ln for ln in out.splitlines()
+                     if ln.startswith("/v/media/online/seg")).split("u=", 1)[1]
+        url, key, iv = hls.decode_seg(token)
+        self.assertEqual(url, "https://cdn.invalid/p/seg1.ts")
+        self.assertEqual(key, "https://cdn.invalid/p/enc.key")
+        self.assertEqual(iv, "0" * 32)
+
+    def test_segment_decrypts_aes(self):
+        if not hls.can_decrypt():
+            self.skipTest("openssl not available")
+        key = b"0123456789abcdef"
+        iv = "0" * 32
+        plain = b"G" + b"\x00" * 187
+        enc = subprocess.run(
+            ["openssl", "enc", "-aes-128-cbc", "-K", key.hex(), "-iv", iv],
+            input=plain, capture_output=True, check=True).stdout
+        token = hls.encode_seg("https://cdn.invalid/a.ts",
+                               "https://cdn.invalid/enc.key", iv)
+
+        def handler(request):
+            if str(request.url).endswith("enc.key"):
+                return httpx.Response(200, content=key)
+            return httpx.Response(200, content=enc,
+                                  headers={"content-type": "video/mp2t"})
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            appmod.app.state.src = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler))
+            with patch.object(hls, "ensure_public_target", new=lambda u: u):
+                resp = client.get(f"/v/media/online/seg?u={token}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, plain)
+
+    def test_media_p_acknowledges_online_link(self):
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            resp = client.post("/v/api/v1/media/p", json={
+                "req": "media.resetQuality", "reqid": "r-1",
+                "playLink": "/v/media/online/abc123/preset.m3u8?line=1",
+                "quality": {"bitrate": 123}})
+        data = resp.json()["data"]
+        self.assertEqual(data["result"], "succ")
+        self.assertEqual(data["reqid"], "r-1")
+
     def test_fetch_resolves_share_page_to_m3u8(self):
         def handler(request):
             url = str(request.url)
