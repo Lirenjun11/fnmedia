@@ -300,6 +300,101 @@ def stream_list(b: dict, mg: str, vg: str, meta: dict | None = None) -> dict:
     }
 
 
+_LINE_BR_BASE = 90_000_000
+_LINE_BR_OFFSET = 100_020
+_LINE_BR_STEP = 10_001
+_LINE_BR_SPAN = 800_000
+
+
+def line_code(name: str) -> int:
+    digest = hashlib.md5(str(name).encode("utf-8")).hexdigest()[:8]
+    return _LINE_BR_BASE + _LINE_BR_OFFSET + int(digest, 16) % _LINE_BR_SPAN
+
+
+def line_index(value, names: list[str]) -> int | None:
+    if not names:
+        return None
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        return None
+    legacy = re.fullmatch(r"L(\d+)", raw, re.I)
+    if legacy:
+        idx = int(legacy.group(1))
+        return idx if 0 <= idx < len(names) else None
+    try:
+        code = int(raw)
+    except ValueError:
+        try:
+            code = int(float(raw))
+        except ValueError:
+            return None
+    if _LINE_BR_BASE <= code < 91_000_000:
+        if code >= _LINE_BR_BASE + _LINE_BR_OFFSET:
+            for i, name in enumerate(names):
+                if line_code(name) == code:
+                    return i
+            return None
+        idx = (code - _LINE_BR_BASE) // _LINE_BR_STEP
+        return idx if 0 <= idx < len(names) else None
+    if 0 <= code < len(names):
+        return code
+    return None
+
+
+_LINE_LABELS = {
+    "lzm3u8": "量子", "tpm3u8": "淘片", "hhm3u8": "豪华",
+    "ffm3u8": "非凡", "wjm3u8": "无尽", "snm3u8": "丝诺",
+    "dyttm3u8": "电影天堂", "bfzym3u8": "暴风", "360zy": "360",
+}
+
+
+def line_label(name: str) -> str:
+    return _LINE_LABELS.get(str(name).lower(), str(name))
+
+
+def qualities(b: dict) -> list[dict]:
+    names = b.get("line_names") or []
+    if len(names) < 2:
+        return []
+    return [{"resolution": line_label(name), "bitrate": line_code(name),
+             "progressive": True, "is_m3u8": False} for name in names]
+
+
+def stream_list_payload(b: dict, mg: str, vg: str,
+                        meta: dict | None = None) -> dict:
+    data = stream_list(b, mg, vg, meta)
+    quals = qualities(b)
+    if quals:
+        data["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
+        data["video_streams"][0]["bps"] = quals[0]["bitrate"]
+    data["qualities"] = quals
+    data["cloud_storage_info"] = None
+    return data
+
+
+def stream_payload(b: dict, mg: str, vg: str, meta: dict | None = None,
+                   line: int = 0) -> dict:
+    data = stream_list(b, mg, vg, meta)
+    video = data["video_streams"][0]
+    quals = qualities(b)
+    if quals:
+        line = max(0, min(int(line or 0), len(quals) - 1))
+        video["resolution_type"] = quals[line]["resolution"]
+        video["bps"] = quals[line]["bitrate"]
+    else:
+        quals = [{
+            "resolution": video["resolution_type"] or "原画",
+            "bitrate": video["bps"],
+            "progressive": True,
+            "is_m3u8": False,
+        }]
+    return {
+        "file_stream": data["files"][0], "video_stream": video,
+        "audio_streams": [], "subtitle_streams": [],
+        "qualities": quals, "cloud_storage_info": None,
+    }
+
+
 def _split_person_names(value) -> list:
     return [n.strip() for n in re.split(r"[/、,，;；]", str(value or ""))
             if n.strip()][:30]

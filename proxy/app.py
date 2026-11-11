@@ -5,7 +5,6 @@ import asyncio
 import html as html_lib
 import json
 import os
-import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,7 +29,6 @@ import upstream
 STATIC = Path(__file__).resolve().parent / "static"
 ONLINE = "/v/media/online"
 SEG_PREFIX = f"{ONLINE}/seg"
-_BITRATE = re.compile(r"^L(\d+)$", re.I)
 
 
 async def _auto_update_worker() -> None:
@@ -334,6 +332,19 @@ async def episode_route(guid: str, request: Request):
 
 @app.get("/v/api/v1/stream/list/{guid}")
 async def stream_list_route(guid: str, request: Request):
+    return await _stream_list_impl(guid, request)
+
+
+@app.post("/v/api/v1/stream/list")
+async def stream_list_post(request: Request):
+    body = await _body(request)
+    guid = str(body.get("guid") or body.get("item_guid") or "")
+    if not guid:
+        return await _passthrough(request)
+    return await _stream_list_impl(guid, request)
+
+
+async def _stream_list_impl(guid: str, request: Request):
     store = request.app.state.store
     ep = store.resolve_episode(guid)
     if ep:
@@ -349,7 +360,8 @@ async def stream_list_route(guid: str, request: Request):
         return await _passthrough(request)
     ep_index = ep[1] if ep else 0
     meta = hls.get_playlist_meta((tv_guid, 0, ep_index))
-    return JSONResponse(fake.ok(fake.stream_list(brief, mg, vg, meta)))
+    return JSONResponse(fake.ok(
+        fake.stream_list_payload(brief, mg, vg, meta)))
 
 
 async def _body(request: Request) -> dict:
@@ -366,6 +378,31 @@ def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
     if store.get(guid):
         return guid, fake.media_guid(guid), fake.video_guid(guid)
     return None
+
+
+def _line_from_body(brief: dict, body: dict) -> int:
+    names = brief.get("line_names") or []
+    wanted = str(body.get("line") or "")
+    if wanted:
+        for i, name in enumerate(names):
+            if name == wanted:
+                return i
+    index = body.get("direct_link_quality_index")
+    if index is not None:
+        try:
+            number = int(index)
+        except (TypeError, ValueError):
+            number = -1
+        if 0 <= number < len(names):
+            return number
+    found = fake.line_index(body.get("bitrate"), names)
+    return found if found is not None else 0
+
+
+def _video_guid_for(guid: str, index: int, mg: str) -> str:
+    if mg in (fake.media_guid(guid), fake.video_guid(guid)):
+        return fake.video_guid(guid)
+    return fake.ep_video_guid(fake.episode_guid(guid, index))
 
 
 @app.post("/v/api/v1/play/info")
@@ -398,15 +435,15 @@ async def stream_post(request: Request):
     brief = store.get(guid)
     if not brief:
         return await _passthrough(request)
-    line = 0
-    bitrate = _BITRATE.match(str(body.get("bitrate") or ""))
-    if bitrate:
-        line = int(bitrate.group(1))
+    line = _line_from_body(brief, body)
     meta = hls.get_playlist_meta((guid, line, index))
-    data = fake.stream_list(brief, mg,
-                            body.get("video_guid") or fake.video_guid(guid), meta)
-    data["qualities"] = [{"bitrate": f"L{i}", "name": name, "index": i}
-                         for i, name in enumerate(brief.get("line_names") or [])]
+    data = fake.stream_payload(
+        brief, mg,
+        str(body.get("video_guid") or _video_guid_for(guid, index, mg)),
+        meta, line)
+    runtime.log(f"stream: {brief.get('title', '')[:30]} ep{index + 1} "
+                f"line={line}/{len(brief.get('line_names') or [])} "
+                f"bitrate={body.get('bitrate')!r}")
     return JSONResponse(fake.ok(data))
 
 
@@ -456,7 +493,7 @@ async def media_range_route(file_hash: str, request: Request):
     if is_hls:
         mg = fake.media_guid(guid)
         return Response(status_code=302, headers={
-            "Location": f"{ONLINE}/{mg}/main.m3u8?line=0&index={index}"})
+            "Location": f"{ONLINE}/{mg}/main.m3u8?line=0&index={index}&auto=1"})
     try:
         url = hls.ensure_public_target(url)
     except ValueError:
@@ -477,8 +514,9 @@ async def play_play(request: Request):
     brief = store.get(guid)
     if not brief:
         return await _passthrough(request)
-    match = _BITRATE.match(str(body.get("bitrate") or ""))
-    line = int(match.group(1)) if match else 0
+    explicit = any(body.get(k) for k in
+                   ("bitrate", "line", "direct_link_quality_index"))
+    line = _line_from_body(brief, body)
     bad = _bad_lines(guid)
     if line in bad:
         order = _ordered_lines(brief, line, bad)
@@ -491,9 +529,14 @@ async def play_play(request: Request):
     is_hls = ".m3u8" in url.lower()
     suffix = "main.m3u8" if is_hls else "direct"
     link = f"{ONLINE}/{mg}/{suffix}?line={line}&index={index}"
+    if not explicit:
+        link += "&auto=1"
+    runtime.log(f"play: {brief.get('title', '')[:30]} ep{index + 1} "
+                f"line={line}/{len(brief.get('line_names') or [])} "
+                f"bitrate={body.get('bitrate')!r} auto={not explicit}")
     return JSONResponse(fake.play_response(
-        mg, body.get("video_guid") or fake.video_guid(guid), link,
-        "HLS" if is_hls else "MP4"))
+        mg, str(body.get("video_guid") or _video_guid_for(guid, index, mg)),
+        link, "HLS" if is_hls else "MP4"))
 
 
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")
@@ -509,8 +552,8 @@ async def main_m3u8(mg: str, request: Request):
         line = int(request.query_params.get("line", 0))
     except ValueError:
         line = 0
-    attempts = _ordered_lines(brief, line, _bad_lines(guid))
-    if config.get().get("auto_best_source", True):
+    auto_start = request.query_params.get("auto") == "1"
+    if auto_start and config.get().get("auto_best_source", True):
         winner = await _race_lines(request.app.state.src, brief, guid, index,
                                    line, 3.0)
         if winner:
@@ -669,6 +712,7 @@ async def catch_all(full_path: str, request: Request):
                         break
             store = request.app.state.store
             if guid and (store.get(guid) or store.resolve_episode(guid)):
+                runtime.log(f"virtual noop {request.method} {full_path}")
                 return JSONResponse({"code": 0, "msg": "", "data": {}})
         except (ValueError, AttributeError):
             pass

@@ -139,10 +139,65 @@ class AppContractTest(unittest.TestCase):
             resp = client.post("/v/api/v1/stream", json={"media_guid": mg})
             self.assertEqual(resp.status_code, 200)
             data = resp.json()["data"]
-            video = data["video_streams"][0]
+            video = data["video_stream"]
             self.assertEqual(video["resolution_type"], "720p")
             self.assertEqual(video["bps"], 5000000)
+            self.assertEqual(data["file_stream"]["guid"], mg)
+            self.assertEqual(data["audio_streams"], [])
+            self.assertEqual(data["subtitle_streams"], [])
+            self.assertIsNone(data["cloud_storage_info"])
             self.assertEqual(len(data["qualities"]), 1)
+            self.assertEqual(data["qualities"][0]["resolution"], "720p")
+            self.assertEqual(data["qualities"][0]["bitrate"], 5000000)
+
+    def test_line_switch_contract(self):
+        import cms as cms_mod
+        import fake
+        title = cms_mod.OnlineTitle(
+            provider="s_1", vod_id="104", title="换线契约", type_name="电视剧",
+            lines={
+                "line-a": [cms_mod.Episode("第1集", "https://a.invalid/1.m3u8"),
+                           cms_mod.Episode("第2集", "https://a.invalid/2.m3u8")],
+                "line-b": [cms_mod.Episode("第1集", "https://b.invalid/1.m3u8"),
+                           cms_mod.Episode("第2集", "https://b.invalid/2.m3u8")],
+                "line-c": [cms_mod.Episode("第1集", "https://c.invalid/1.m3u8"),
+                           cms_mod.Episode("第2集", "https://c.invalid/2.m3u8")],
+            })
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            brief = appmod.app.state.store.remember([title])[0]
+            guid = brief["guid"]
+            eg = fake.episode_guid(guid, 1)
+            mg = fake.ep_media_guid(eg)
+            self.assertEqual(fake.line_index(fake.line_code("line-b"),
+                                             ["line-a", "line-b", "line-c"]), 1)
+            self.assertEqual(fake.line_index("L2",
+                                             ["line-a", "line-b", "line-c"]), 2)
+            self.assertIsNone(fake.line_index(fake.line_code("gone"),
+                                              ["line-a", "line-b"]))
+            sl = client.get(f"/v/api/v1/stream/list/{eg}").json()["data"]
+            self.assertEqual(len(sl["qualities"]), 3)
+            self.assertEqual(sl["qualities"][1]["resolution"], "line-b")
+            self.assertTrue(sl["qualities"][1]["progressive"])
+            self.assertFalse(sl["qualities"][1]["is_m3u8"])
+            code = sl["qualities"][1]["bitrate"]
+            posted = client.post("/v/api/v1/stream/list",
+                                 json={"item_guid": eg}).json()["data"]
+            self.assertEqual(len(posted["qualities"]), 3)
+            switched = client.post("/v/api/v1/stream", json={
+                "media_guid": mg, "bitrate": str(code)}).json()["data"]
+            self.assertEqual(switched["video_stream"]["bps"], code)
+            self.assertEqual(switched["video_stream"]["resolution_type"], "line-b")
+            legacy = client.post("/v/api/v1/stream", json={
+                "media_guid": mg, "bitrate": "L2"}).json()["data"]
+            self.assertEqual(legacy["video_stream"]["resolution_type"], "line-c")
+            played = client.post("/v/api/v1/play/play", json={
+                "media_guid": mg, "bitrate": code}).json()["data"]
+            self.assertIn("line=1", played["play_link"])
+            self.assertNotIn("auto=1", played["play_link"])
+            auto = client.post("/v/api/v1/play/play",
+                               json={"media_guid": mg}).json()["data"]
+            self.assertIn("auto=1", auto["play_link"])
 
     def test_probe_requires_keyword(self):
         with TestClient(appmod.app) as client:
@@ -447,7 +502,8 @@ class AppContractTest(unittest.TestCase):
             mg = fake.media_guid(brief["guid"])
             with patch.object(hls, "ensure_public_target", new=lambda u: u), \
                     patch.object(hls, "fetch_playlist", new=mock):
-                resp = client.get(f"/v/media/online/{mg}/main.m3u8?line=0&index=0")
+                resp = client.get(
+                    f"/v/media/online/{mg}/main.m3u8?line=0&index=0&auto=1")
             self.assertEqual(resp.status_code, 200)
         appmod._BAD_LINES.clear()
 
