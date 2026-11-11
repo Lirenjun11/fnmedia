@@ -68,10 +68,27 @@ class MediaRangeTest(unittest.TestCase):
                               follow_redirects=False)
         resp = self._run(_title("m3u8"), action)
         self.assertEqual(resp.status_code, 302)
-        mg = None
         self.assertIn("/v/media/online/", resp.headers["location"])
-        self.assertIn("main.m3u8", resp.headers["location"])
+        self.assertIn("preset.m3u8", resp.headers["location"])
         self.assertIn("line=0", resp.headers["location"])
+        self.assertIn("auto=1", resp.headers["location"])
+
+    def test_hls_redirect_honors_play_link_line(self):
+        title = cms.OnlineTitle(
+            provider="s_1", vod_id="903", title="原生切线", type_name="电影",
+            lines={"a": [cms.Episode("正片", "https://example.com/a.m3u8")],
+                   "b": [cms.Episode("正片", "https://example.com/b.m3u8")]})
+
+        def action(client, brief):
+            mg = fake.media_guid(brief["guid"])
+            link = f"/v/media/online/{mg}/preset.m3u8?line=1&index=0"
+            return client.get(f"/v/api/v1/media/range/{mg}",
+                              headers={"Play-Link": link},
+                              follow_redirects=False)
+        resp = self._run(title, action)
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("line=1", resp.headers["location"])
+        self.assertNotIn("auto=1", resp.headers["location"])
 
     def test_official_hash_passthrough(self):
         async def fake_forward(req, client_):

@@ -1,6 +1,6 @@
 {
   "name": "fnos-media-ext-admin",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "type": "module",
   "description": "fnos_media_ext 管理台静态前端",

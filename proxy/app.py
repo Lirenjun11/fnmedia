@@ -6,6 +6,7 @@ import html as html_lib
 import json
 import os
 import time
+from urllib.parse import parse_qs, urlsplit
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -198,6 +199,9 @@ async def _race_lines(client, brief: dict, guid: str, index: int,
             text, base, meta = task.result()
             winner = (line, text, base, meta)
             break
+    for task in tasks:
+        if task.done() and not task.cancelled():
+            task.exception()
     for task in pending:
         task.cancel()
     if pending:
@@ -380,13 +384,26 @@ def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _clamp_line(value: str, names: list[str]) -> int | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        number = int(raw)
+        return number if 0 <= number < len(names) else None
+    for i, name in enumerate(names):
+        if name == raw or fake.line_label(name) == raw:
+            return i
+    return None
+
+
 def _line_from_body(brief: dict, body: dict) -> int:
     names = brief.get("line_names") or []
     wanted = str(body.get("line") or "")
     if wanted:
-        for i, name in enumerate(names):
-            if name == wanted:
-                return i
+        found = _clamp_line(wanted, names)
+        if found is not None:
+            return found
     index = body.get("direct_link_quality_index")
     if index is not None:
         try:
@@ -403,6 +420,38 @@ def _video_guid_for(guid: str, index: int, mg: str) -> str:
     if mg in (fake.media_guid(guid), fake.video_guid(guid)):
         return fake.video_guid(guid)
     return fake.ep_video_guid(fake.episode_guid(guid, index))
+
+
+def _range_selection(request: Request, brief: dict) -> tuple[int, bool]:
+    """原生播放器切清晰度会带 Play-Link 或 line/bitrate 回到 Range 接口。"""
+    names = brief.get("line_names") or []
+    link = request.query_params.get("playlink") or \
+        request.headers.get("Play-Link", "")
+    params = dict(request.query_params)
+    if link:
+        try:
+            parsed = parse_qs(urlsplit(link).query)
+        except ValueError:
+            parsed = {}
+        for key in ("line", "bitrate", "direct_link_quality_index"):
+            if key in parsed and key not in params:
+                params[key] = parsed[key][0]
+    if params.get("line"):
+        found = _clamp_line(params["line"], names)
+        if found is not None:
+            return found, True
+    index = params.get("direct_link_quality_index")
+    if index not in (None, ""):
+        try:
+            number = int(index)
+        except (TypeError, ValueError):
+            number = -1
+        if 0 <= number < len(names):
+            return number, True
+    found = fake.line_index(params.get("bitrate"), names)
+    if found is not None:
+        return found, True
+    return 0, False
 
 
 @app.post("/v/api/v1/play/info")
@@ -426,7 +475,8 @@ async def play_info_route(request: Request):
 @app.post("/v/api/v1/stream")
 async def stream_post(request: Request):
     body = await _body(request)
-    mg = str(body.get("media_guid") or "")
+    mg = str(body.get("media_guid") or body.get("video_guid")
+             or body.get("guid") or "")
     store = request.app.state.store
     resolved = store.resolve_media(mg)
     if not resolved:
@@ -473,31 +523,35 @@ async def media_range_route(file_hash: str, request: Request):
     Range 代理（支持拖动），HLS 源重定向到本模块 m3u8 播放链路；官方真实
     文件的 hash 永远透传，不受影响。"""
     store = request.app.state.store
+    mg = file_hash
     resolved = store.resolve_media(file_hash)
     if not resolved:
         ep = store.resolve_episode(file_hash)
-        resolved = (ep[0], ep[1]) if ep else None
-    if not resolved:
-        return await _passthrough(request)
+        if not ep:
+            return await _passthrough(request)
+        resolved = ep
+        mg = fake.ep_media_guid(file_hash)
     guid, index = resolved
     brief = store.get(guid)
     if not brief:
         return await _passthrough(request)
-    picked = _pick(brief, 0, index)
+    line, explicit = _range_selection(request, brief)
+    picked = _pick(brief, line, index)
     if not picked:
         return Response(status_code=404)
     url = picked[0]
     is_hls = ".m3u8" in url.lower()
     runtime.log(f"media/range takeover: {brief.get('title', '')[:30]} "
-                f"ep{index + 1} -> {'hls' if is_hls else 'direct'}")
+                f"ep{index + 1} line{line} -> {'hls' if is_hls else 'direct'}")
     if is_hls:
-        mg = fake.media_guid(guid)
+        auto = "" if explicit else "&auto=1"
         return Response(status_code=302, headers={
-            "Location": f"{ONLINE}/{mg}/main.m3u8?line=0&index={index}&auto=1"})
+            "Location": f"{ONLINE}/{mg}/preset.m3u8?line={line}"
+                        f"&index={index}{auto}"})
     try:
         url = hls.ensure_public_target(url)
     except ValueError:
-        _mark_bad_line(guid, 0)
+        _mark_bad_line(guid, line)
         return Response(status_code=404)
     return await hls.proxy_media(request, url, request.app.state.src)
 
@@ -505,7 +559,8 @@ async def media_range_route(file_hash: str, request: Request):
 @app.post("/v/api/v1/play/play")
 async def play_play(request: Request):
     body = await _body(request)
-    mg = str(body.get("media_guid") or "")
+    mg = str(body.get("media_guid") or body.get("video_guid")
+             or body.get("guid") or "")
     store = request.app.state.store
     resolved = store.resolve_media(mg)
     if not resolved:
@@ -527,7 +582,7 @@ async def play_play(request: Request):
         return _err("该片暂无可用播放线路", 404)
     url, _ = picked
     is_hls = ".m3u8" in url.lower()
-    suffix = "main.m3u8" if is_hls else "direct"
+    suffix = "preset.m3u8" if is_hls else "direct"
     link = f"{ONLINE}/{mg}/{suffix}?line={line}&index={index}"
     if not explicit:
         link += "&auto=1"
@@ -537,6 +592,40 @@ async def play_play(request: Request):
     return JSONResponse(fake.play_response(
         mg, str(body.get("video_guid") or _video_guid_for(guid, index, mg)),
         link, "HLS" if is_hls else "MP4"))
+
+
+@app.get(f"{ONLINE}/{{mg}}/preset.m3u8")
+async def preset_m3u8(mg: str, request: Request):
+    """播放入口清单：官方播放器要求 play_link 是 master，哪怕只有一条变体。"""
+    resolved = request.app.state.store.resolve_media(mg)
+    if not resolved:
+        return Response(status_code=404)
+    guid, index = resolved
+    brief = request.app.state.store.get(guid)
+    if not brief:
+        return Response(status_code=404)
+    line, _ = _range_selection(request, brief)
+    names = brief.get("line_names") or []
+    if request.query_params.get("auto") == "1" \
+            and config.get().get("auto_best_source", True):
+        winner = await _race_lines(request.app.state.src, brief, guid, index,
+                                   line, 3.0)
+        if winner:
+            line = winner[0]
+            hls.remember_playlist_meta((guid, line, index), winner[3])
+    # 多线路 master：飞牛播放器的清晰度/线路切换依赖多播放源，单变体会切不动。
+    order = [line] + [i for i in range(len(names)) if i != line]
+    out = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    for rank, no in enumerate(order):
+        label = (fake.line_label(names[no]) if names else "原画").replace('"', "")
+        bw = 9_000_000 - rank if no == line else 2_000_000 + rank
+        out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},PROGRAM-ID=1,'
+                   f'NAME="{label}"')
+        out.append(f"main.m3u8?line={no}&index={index}")
+    text = "\n".join(out) + "\n"
+    return Response(text, media_type="application/vnd.apple.mpegurl",
+                    headers={"Access-Control-Allow-Origin": "*",
+                             "Cache-Control": "no-store"})
 
 
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")

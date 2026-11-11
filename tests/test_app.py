@@ -193,8 +193,16 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(legacy["video_stream"]["resolution_type"], "line-c")
             played = client.post("/v/api/v1/play/play", json={
                 "media_guid": mg, "bitrate": code}).json()["data"]
+            self.assertIn("preset.m3u8", played["play_link"])
             self.assertIn("line=1", played["play_link"])
             self.assertNotIn("auto=1", played["play_link"])
+            master = client.get(played["play_link"])
+            self.assertEqual(master.status_code, 200)
+            self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 3)
+            self.assertIn('NAME="line-b"', master.text)
+            self.assertIn("main.m3u8?line=1&index=1", master.text)
+            self.assertTrue(master.text.split('NAME="line-b"')[0]
+                            .endswith("BANDWIDTH=9000000,PROGRAM-ID=1,"))
             auto = client.post("/v/api/v1/play/play",
                                json={"media_guid": mg}).json()["data"]
             self.assertIn("auto=1", auto["play_link"])
