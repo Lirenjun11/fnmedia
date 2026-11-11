@@ -9,7 +9,7 @@ import httpx
 
 _API = "https://api.github.com/repos/{repo}/releases/latest"
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
 _DEFAULT_REPO = "Lirenjun11/fnmedia"
 _OK_TTL = 21600.0
 _FAIL_TTL = 600.0
@@ -24,7 +24,10 @@ _cache: dict = {}
 
 def _parse(tag) -> tuple | None:
     match = _TAG_RE.match(str(tag or "").strip())
-    return tuple(int(part) for part in match.groups()) if match else None
+    if not match:
+        return None
+    parts = [int(part) for part in match.groups() if part is not None]
+    return tuple(parts + [0] * (4 - len(parts)))
 
 
 def is_newer(current, latest) -> bool:

@@ -219,6 +219,102 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(auto_master.text.count("#EXT-X-STREAM-INF"), 1)
             self.assertIn("main.m3u8?line=0&index=1&auto=1", auto_master.text)
 
+    def test_episode_detail_and_play_info(self):
+        import cms as cms_mod
+        import fake
+        title = cms_mod.OnlineTitle(
+            provider="s_1", vod_id="106", title="单集详情", type_name="电视剧",
+            lines={"lz": [cms_mod.Episode("第1集", "https://a.invalid/1.m3u8"),
+                          cms_mod.Episode("第2集", "https://a.invalid/2.m3u8")]})
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            brief = appmod.app.state.store.remember([title])[0]
+            guid = brief["guid"]
+            eg = fake.episode_guid(guid, 1)
+            sg = fake.season_guid(guid)
+            season = client.get(f"/v/api/v1/item/{sg}").json()["data"]
+            self.assertEqual(season["type"], "Season")
+            episode = client.get(f"/v/api/v1/item/{eg}").json()["data"]
+            self.assertEqual(episode["type"], "Episode")
+            self.assertEqual(episode["guid"], eg)
+            self.assertEqual(episode["parent_guid"], sg)
+            self.assertEqual(episode["episode_number"], 2)
+            self.assertEqual(episode["media_guid"], fake.ep_media_guid(eg))
+            query = client.get(
+                f"/v/api/v1/item/detail?guid={eg}").json()["data"]
+            self.assertEqual(query["guid"], eg)
+            listed = client.post("/v/api/v1/item/list", json={
+                "parent_guid": sg}).json()["data"]
+            self.assertEqual(listed["total"], 2)
+            self.assertEqual(listed["list"][1]["guid"], eg)
+            by_media = client.get(
+                f"/v/api/v1/episode/list/{fake.ep_media_guid(eg)}").json()["data"]
+            self.assertEqual(len(by_media), 2)
+            title_by_media = client.get(
+                f"/v/api/v1/item/{fake.media_guid(guid)}").json()["data"]
+            self.assertEqual(title_by_media["guid"], guid)
+            self.assertEqual(title_by_media["type"], "TV")
+            info = client.post("/v/api/v1/play/info",
+                               json={"item_guid": eg}).json()["data"]
+            self.assertEqual(info["type"], "Episode")
+            self.assertEqual(info["guid"], eg)
+            self.assertEqual(info["parent_guid"], sg)
+            self.assertEqual(info["item"]["guid"], eg)
+            self.assertEqual(info["media_guid"], fake.ep_media_guid(eg))
+            self.assertEqual(info["video_guid"], fake.ep_video_guid(eg))
+
+    def test_web_and_mobile_payload_compatibility(self):
+        import cms as cms_mod
+        import fake
+        title = cms_mod.OnlineTitle(
+            provider="s_1", vod_id="107", title="双端兼容", type_name="电视剧",
+            provider_name="本地",
+            lines={"lz": [cms_mod.Episode("第1集", "https://a.invalid/1.m3u8"),
+                          cms_mod.Episode("第2集", "https://a.invalid/2.m3u8")],
+                   "tp": [cms_mod.Episode("第1集", "https://b.invalid/1.m3u8"),
+                          cms_mod.Episode("第2集", "https://b.invalid/2.m3u8")]})
+        agents = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36",
+            "fnos-media/1.8.0 (Android 14; Phone) okhttp/4.12.0",
+            "1.5.2 (com.trim.tv; build:1) okHttp/4.9.0",
+        )
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            brief = appmod.app.state.store.remember([title])[0]
+            guid = brief["guid"]
+            eg = fake.episode_guid(guid, 0)
+            mg = fake.ep_media_guid(eg)
+            for ua in agents:
+                headers = {"User-Agent": ua}
+                detail = client.get(f"/v/api/v1/item/{eg}",
+                                    headers=headers).json()["data"]
+                for key in ("guid", "type", "parent_guid", "season_number",
+                            "episode_number", "media_guid", "video_guid",
+                            "can_play", "play_item_guid"):
+                    self.assertIn(key, detail, f"{ua}: {key}")
+                self.assertEqual(detail["type"], "Episode")
+                info = client.post("/v/api/v1/play/info",
+                                   json={"item_guid": eg},
+                                   headers=headers).json()["data"]
+                self.assertEqual(info["type"], "Episode")
+                self.assertEqual(info["item"]["guid"], eg)
+                episodes = client.get(f"/v/api/v1/episode/list/{eg}",
+                                      headers=headers).json()["data"]
+                self.assertEqual(len(episodes), 2)
+                self.assertEqual(episodes[0]["guid"], eg)
+                for key in ("parent_guid", "season_number", "episode_number",
+                            "media_guid", "video_guid", "can_play",
+                            "play_item_guid"):
+                    self.assertIn(key, episodes[0], f"{ua}: episode {key}")
+                played = client.post("/v/api/v1/play/play",
+                                     json={"media_guid": mg,
+                                           "bitrate": fake.line_code("lz")},
+                                     headers=headers).json()["data"]
+                master = client.get(played["play_link"], headers=headers)
+                self.assertEqual(master.status_code, 200)
+                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 1)
+                self.assertIn('NAME="本地：lz"', master.text)
+
     def test_probe_requires_keyword(self):
         with TestClient(appmod.app) as client:
             client.get("/v/online-admin")

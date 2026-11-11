@@ -46,9 +46,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.1.6"
+        return version_file.read_text(encoding="utf-8").strip() or "0.1.6.1"
     except OSError:
-        return "0.1.6"
+        return "0.1.6.1"
 
 
 def _public_config() -> dict:

@@ -229,24 +229,37 @@ def season_list(b: dict) -> list[dict]:
     )]
 
 
+def _episode_row(b: dict, eps: list, index: int) -> dict:
+    ep = eps[index] if 0 <= index < len(eps) else {}
+    eg = episode_guid(b["guid"], index)
+    return _base_item(
+        guid=eg, type="Episode", title=ep.get("title") or f"第{index + 1}集",
+        parent_guid=season_guid(b["guid"]), parent_title="第 1 季",
+        tv_title=b["title"], season_number=1, episode_number=index + 1,
+        can_play=1, play_item_guid=eg, play_error="",
+        poster=poster_path(b.get("poster", "")),
+        media_guid=ep_media_guid(eg), video_guid=ep_video_guid(eg),
+        audio_guid="", subtitle_guid="",
+    )
+
+
+def episode_item(b: dict, index: int) -> dict:
+    names = b.get("line_names") or []
+    eps = b["lines"].get(names[0], []) if names else []
+    return _episode_row(b, eps, index)
+
+
+def season_item(b: dict) -> dict:
+    rows = season_list(b)
+    return rows[0] if rows else {}
+
+
 def episode_list(b: dict) -> list[dict]:
     if not b.get("is_tv"):
         return []
     names = b.get("line_names") or []
     eps = b["lines"].get(names[0], []) if names else []
-    out = []
-    for i, ep in enumerate(eps):
-        eg = episode_guid(b["guid"], i)
-        out.append(_base_item(
-            guid=eg, type="Episode", title=ep.get("title") or f"第{i + 1}集",
-            parent_guid=season_guid(b["guid"]), parent_title="第 1 季",
-            tv_title=b["title"], season_number=1, episode_number=i + 1,
-            can_play=1, play_item_guid=eg,
-            poster=poster_path(b.get("poster", "")),
-            media_guid=ep_media_guid(eg), video_guid=ep_video_guid(eg),
-            audio_guid="", subtitle_guid="",
-        ))
-    return out
+    return [_episode_row(b, eps, i) for i in range(len(eps))]
 
 
 _TIERS = ((2160, "4k"), (1440, "2k"), (1080, "1080p"), (720, "720p"),
@@ -436,6 +449,17 @@ def play_info(b: dict, mg: str, vg: str, guid: str) -> dict:
         "type": "TV" if b.get("is_tv") else "Movie",
         "video_guid": vg, "audio_guid": "", "subtitle_guid": "",
         "media_guid": mg, "item": detail_item(b),
+        "direct_link_audio_index": -1,
+    }
+
+
+def episode_play_info(b: dict, index: int, guid: str) -> dict:
+    return {
+        "grand_guid": "", "guid": guid,
+        "parent_guid": season_guid(b["guid"]),
+        "play_config": None, "ts": 0, "type": "Episode",
+        "video_guid": ep_video_guid(guid), "audio_guid": "", "subtitle_guid": "",
+        "media_guid": ep_media_guid(guid), "item": episode_item(b, index),
         "direct_link_audio_index": -1,
     }
 

@@ -36,6 +36,10 @@ class UpcheckTest(unittest.TestCase):
         self.assertFalse(upcheck.is_newer("0.2.0", "v0.1.9"))
         self.assertFalse(upcheck.is_newer("0.1.0", "v0.1.1-beta1"))
         self.assertTrue(upcheck.is_newer("", "v0.1.0"))
+        self.assertTrue(upcheck.is_newer("0.1.6", "v0.1.6.1"))
+        self.assertFalse(upcheck.is_newer("0.1.6.1", "v0.1.6.1"))
+        self.assertTrue(upcheck.is_newer("0.1.6.1", "v0.1.7"))
+        self.assertFalse(upcheck.is_newer("0.1.7", "v0.1.6.1"))
 
     def test_safe_repo(self):
         self.assertEqual(upcheck.safe_repo("owner/repo"), "owner/repo")

@@ -289,11 +289,50 @@ async def search_list(request: Request):
                         headers={"Content-Type": "application/json; charset=utf-8"})
 
 
+@app.get("/v/api/v1/item/detail")
+async def item_detail_query(request: Request):
+    guid = str(request.query_params.get("guid") or
+               request.query_params.get("item_guid") or "")
+    if not guid:
+        return await _passthrough(request)
+    return await item_detail(guid, request)
+
+
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
-    brief = request.app.state.store.get(guid)
+    store = request.app.state.store
+    ep = store.resolve_episode(guid)
+    if ep:
+        brief = store.get(ep[0])
+        if not brief:
+            return await _passthrough(request)
+        row = playstate.apply(fake.episode_item(brief, ep[1]), guid)
+        return JSONResponse(fake.ok(fake.normalize_detail(row, _ua(request))))
+    tv_guid = store.resolve_season(guid)
+    if tv_guid:
+        brief = store.get(tv_guid)
+        if not brief:
+            return await _passthrough(request)
+        row = playstate.apply(fake.season_item(brief), guid)
+        return JSONResponse(fake.ok(fake.normalize_detail(row, _ua(request))))
+    if not store.get(guid):
+        resolved = store.resolve_media(guid)
+        if resolved:
+            tv_guid, index = resolved
+            brief = store.get(tv_guid)
+            if brief:
+                if guid in (fake.media_guid(tv_guid), fake.video_guid(tv_guid)):
+                    return await _item_title_detail(brief, tv_guid, request)
+                row = playstate.apply(fake.episode_item(brief, index), guid)
+                return JSONResponse(fake.ok(
+                    fake.normalize_detail(row, _ua(request))))
+    brief = store.get(guid)
     if not brief:
         return await _passthrough(request)
+    return await _item_title_detail(brief, guid, request)
+
+
+async def _item_title_detail(brief: dict, guid: str, request: Request):
     detail = fake.detail_item(brief)
     borrowed = False
     if config.get().get("borrow_official", True):
@@ -316,22 +355,59 @@ async def item_detail(guid: str, request: Request):
 
 @app.get("/v/api/v1/season/list/{guid}")
 async def season_route(guid: str, request: Request):
-    brief = request.app.state.store.get(guid)
+    store = request.app.state.store
+    tv_guid = _tv_guid_of(store, guid)
+    brief = store.get(tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
     return JSONResponse(fake.ok(fake.normalize_cards(
         fake.season_list(brief), _ua(request))))
 
 
+@app.post("/v/api/v1/season/list/{guid}")
+async def season_route_post(guid: str, request: Request):
+    return await season_route(guid, request)
+
+
 @app.get("/v/api/v1/episode/list/{guid}")
 async def episode_route(guid: str, request: Request):
     store = request.app.state.store
-    tv_guid = store.resolve_season(guid) or (guid if store.get(guid) else None)
+    tv_guid = _tv_guid_of(store, guid)
     brief = store.get(tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
     return JSONResponse(fake.ok(fake.normalize_cards(
         fake.episode_list(brief), _ua(request))))
+
+
+@app.post("/v/api/v1/episode/list/{guid}")
+async def episode_route_post(guid: str, request: Request):
+    return await episode_route(guid, request)
+
+
+def _listing(rows: list) -> dict:
+    return {"mdb_name": "", "mdb_category": "", "top_dir": "", "dir": "",
+            "total": len(rows), "list": rows, "jump_list": None}
+
+
+@app.post("/v/api/v1/item/list")
+async def item_list_route(request: Request):
+    """部分客户端用 item/list + parent_guid 拉取季/集子项。"""
+    body = await _body(request)
+    store = request.app.state.store
+    parent = str(body.get("parent_guid") or body.get("ancestor_guid") or "")
+    if not parent:
+        return await _passthrough(request)
+    brief = store.get(parent)
+    if brief and brief.get("is_tv"):
+        rows = fake.normalize_cards(fake.season_list(brief), _ua(request))
+        return JSONResponse(fake.ok(_listing(rows)))
+    tv_guid = store.resolve_season(parent)
+    brief = store.get(tv_guid) if tv_guid else None
+    if brief:
+        rows = fake.normalize_cards(fake.episode_list(brief), _ua(request))
+        return JSONResponse(fake.ok(_listing(rows)))
+    return await _passthrough(request)
 
 
 @app.get("/v/api/v1/stream/list/{guid}")
@@ -373,6 +449,19 @@ async def _body(request: Request) -> dict:
         return json.loads(await request.body() or b"{}")
     except ValueError:
         return {}
+
+
+def _tv_guid_of(store: cms.TitleStore, guid: str) -> str | None:
+    ep = store.resolve_episode(guid)
+    if ep:
+        return ep[0]
+    resolved = store.resolve_media(guid)
+    if resolved:
+        return resolved[0]
+    season = store.resolve_season(guid)
+    if season:
+        return season
+    return guid if store.get(guid) else None
 
 
 def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
@@ -465,11 +554,19 @@ async def play_info_route(request: Request):
     if not identity:
         return await _passthrough(request)
     _, mg, vg = identity
-    brief = store.get(guid) or store.get((store.resolve_episode(guid) or ("",))[0])
-    if not brief:
-        return await _passthrough(request)
-    info = fake.play_info(brief, mg, vg, guid)
-    canonical = (store.resolve_episode(guid) or (guid,))[0]
+    ep = store.resolve_episode(guid)
+    if ep:
+        brief = store.get(ep[0])
+        if not brief:
+            return await _passthrough(request)
+        info = fake.episode_play_info(brief, ep[1], guid)
+        canonical = ep[0]
+    else:
+        brief = store.get(guid)
+        if not brief:
+            return await _passthrough(request)
+        info = fake.play_info(brief, mg, vg, guid)
+        canonical = guid
     info["ts"] = playstate.ts_for(canonical)
     return JSONResponse(fake.ok(fake.normalize_detail(info, _ua(request))))
 
@@ -502,9 +599,8 @@ async def stream_post(request: Request):
 @app.post("/v/api/v1/person/list/{guid}")
 async def person_list_route(guid: str, request: Request):
     store = request.app.state.store
-    ep = store.resolve_episode(guid)
-    target = ep[0] if ep else guid
-    brief = store.get(target)
+    target = _tv_guid_of(store, guid)
+    brief = store.get(target) if target else None
     if not brief:
         return await _passthrough(request)
     people = None
