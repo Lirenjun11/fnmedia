@@ -1,0 +1,14 @@
+appname               = fnos-media-ext
+version               = @VERSION@
+display_name          = 飞牛影视扩展
+desc                  = 零内置源的飞牛影视扩展：可逆接管官方入口，支持聚合源订阅、原生搜索注入与完整 Web 配置页。未配置源时为纯透传，官方影视功能不受影响。
+platform              = all
+source                = thirdparty
+maintainer            = fnos_media_ext
+maintainer_url        = https://github.com/Lirenjun11/fnmedia
+os_min_version        = 1.2.0
+install_dep_apps      = trim.media
+desktop_uidir         = ui
+desktop_applaunchname = fnos-media-ext.main
+checkport             = false
+micro_app             = true

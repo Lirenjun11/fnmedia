@@ -1,0 +1,22 @@
+{
+    ".url": {
+        "fnos-media-ext.main": {
+            "title": "飞牛影视扩展",
+            "desc": "聚合源订阅 / 在线搜索 / Web 配置",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "",
+            "url": "/app/fnos-media-ext/",
+            "allUsers": false,
+            "gatewaySocket": "fnos-media-ext.sock",
+            "gatewayPrefix": "/app/fnos-media-ext",
+            "control": {
+                "accessPerm": "readonly",
+                "portPerm": "hidden",
+                "pathPerm": "hidden",
+                "fullUrlPerm": "hidden"
+            }
+        }
+    }
+}

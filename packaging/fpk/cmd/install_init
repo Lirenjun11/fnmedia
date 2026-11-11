@@ -1,0 +1,10 @@
+#!/bin/bash
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+agree_raw="${wizard_agree_terms:-}"
+case "${agree_raw}" in
+    *agree*|*true*|1|yes|on) ;;
+    *) fnos_fail "请先阅读并勾选同意《免责声明》后再安装。本扩展不内置任何资源站。" ;;
+esac
+[ -S /var/run/trim_media.sock ] || fnos_fail "未检测到官方飞牛影视：请先安装并启动「影视」应用"
+command -v python3 >/dev/null 2>&1 || fnos_fail "需要 python3 运行环境"
+exit 0

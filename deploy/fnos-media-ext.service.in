@@ -1,0 +1,19 @@
+[Unit]
+Description=fnos_media_ext 飞牛影视扩展（trim_media.sock 可逆接管）
+After=network.target
+After=trim-media.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@ROOT@/proxy
+ExecStart=@ROOT@/.venv/bin/python supervise.py
+KillMode=mixed
+TimeoutStopSec=25
+Restart=no
+UMask=0022
+Environment=PYTHONUNBUFFERED=1
+Environment=FNOS_MEDIA_UPSTREAM_SOCK=/var/run/trim_media_upstream.sock
+
+[Install]
+WantedBy=multi-user.target

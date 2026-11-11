@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+web/.vite/
+web/dist/
+proxy/static/
+state/
+dist/
+.tools/
+packaging/fpk/.build/
+.DS_Store

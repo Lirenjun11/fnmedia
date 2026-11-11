@@ -1,0 +1,11 @@
+#!/bin/bash
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+if [ -n "${REPO_DIR}" ]; then
+    bash "${REPO_DIR}/deploy/uninstall.sh" >>"${LOG}" 2>&1 || true
+else
+    systemctl stop fnos-media-ext.service 2>/dev/null || true
+    systemctl disable fnos-media-ext.service 2>/dev/null || true
+    rm -f /etc/systemd/system/fnos-media-ext.service
+    systemctl daemon-reload 2>/dev/null || true
+fi
+exit 0

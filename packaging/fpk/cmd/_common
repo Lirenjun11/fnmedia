@@ -1,0 +1,18 @@
+#!/bin/bash
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_ROOT="$(cd "${SELF_DIR}/.." && pwd)"
+REPO_DIR=""
+for _cand in "${TRIM_APPDEST:-}/repo" "${APP_ROOT}/target/repo" "${APP_ROOT}/repo"; do
+    if [ -n "${_cand}" ] && [ -f "${_cand}/deploy/install.sh" ]; then
+        REPO_DIR="$(cd "${_cand}" && pwd)"
+        break
+    fi
+done
+unset _cand
+LOG="${TRIM_PKGVAR:-/tmp}/fnos-media-app.log"
+mkdir -p "$(dirname "${LOG}")" 2>/dev/null || true
+fnos_fail() {
+    [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "$1" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
+    echo "[fnos_media_ext] $1" >&2
+    exit 1
+}

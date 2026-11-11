@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Build admin web
+        run: |
+          cd web
+          npm ci
+          npm run build
+          cd ..
+          mkdir -p proxy/static
+          cp -a web/dist/. proxy/static/
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Python compile check
+        run: python -m compileall -q proxy tests tools
+
+      - name: Shell script syntax check
+        run: |
+          git ls-files -z '*.sh' | xargs -0 -n1 bash -n
+          git ls-files -z 'packaging/fpk/cmd/*' | xargs -0 -n1 bash -n
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck
+        run: |
+          git ls-files -z '*.sh' | xargs -0 shellcheck -S error
+          git ls-files -z 'packaging/fpk/cmd/*' | xargs -0 shellcheck -S error
+
+  fpk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build admin web
+        run: |
+          cd web
+          npm ci
+          npm run build
+          cd ..
+          mkdir -p proxy/static
+          cp -a web/dist/. proxy/static/
+
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          chmod +x fnpack && sudo mv fnpack /usr/local/bin/fnpack
+        env:
+          FNPACK_VERSION: "1.2.3"
+
+      - name: Build fpk package
+        run: bash packaging/fpk/build.sh
+
+      - name: Verify package artifact
+        run: |
+          fpk_file="$(ls dist/fnos_media_ext-*.fpk)"
+          test -s "$fpk_file"
+          test -s "${fpk_file}.sha256"
+          ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
+          for path in app.tgz cmd/main manifest wizard/install \
+            ICON.PNG ICON_256.PNG; do
+            tar -tzf "$fpk_file" | grep -qx "$path" || {
+              echo "ERROR: fpk missing $path" >&2; exit 1; }
+          done
+          app_tmp="$(mktemp -d)"
+          trap 'rm -rf "$app_tmp"' EXIT
+          tar -xzf "$fpk_file" -C "$app_tmp" app.tgz
+          for path in ui/config repo/proxy/app.py repo/proxy/static/index.html \
+            repo/deploy/db_probe.py repo/requirements.txt; do
+            tar -tzf "$app_tmp/app.tgz" | grep -qx "$path" || {
+              echo "ERROR: app.tgz missing $path" >&2; exit 1; }
+          done
+
+      - name: Upload fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnos_media_ext-fpk
+          path: |
+            dist/*.fpk
+            dist/*.sha256
+          retention-days: 14

@@ -1,0 +1,15 @@
+#!/bin/bash
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+[ -n "${REPO_DIR}" ] || fnos_fail "应用文件缺失（deploy/install.sh 不存在）"
+BACKUP_DIR="${TRIM_PKGVAR:-/tmp}/fnos-media-upgrade"
+if [ -f "${BACKUP_DIR}/state.tar.gz" ]; then
+    tar -xzf "${BACKUP_DIR}/state.tar.gz" -C "${REPO_DIR}" >>"${LOG}" 2>&1 \
+        || fnos_fail "恢复 state/config.json 失败"
+fi
+cd "${REPO_DIR}" || fnos_fail "无法进入应用目录"
+if [ ! -x ".venv/bin/python" ] || ! .venv/bin/python -c 'import fastapi,uvicorn,httpx' >/dev/null 2>&1; then
+    bash deploy/bootstrap_deps.sh >>"${LOG}" 2>&1 || fnos_fail "Python 运行环境准备失败，详见 ${LOG}"
+fi
+bash deploy/install.sh >>"${LOG}" 2>&1 || fnos_fail "升级后接管服务启动失败，详见 ${LOG}"
+rm -rf "${BACKUP_DIR}"
+exit 0

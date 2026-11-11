@@ -1,0 +1,17 @@
+#!/bin/bash
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+[ -n "${REPO_DIR}" ] || fnos_fail "应用文件缺失（deploy/install.sh 不存在）"
+cd "${REPO_DIR}" || fnos_fail "无法进入应用目录"
+if [ -x ".venv/bin/python" ] && .venv/bin/python -c 'import fastapi,uvicorn,httpx' >/dev/null 2>&1; then
+    :
+else
+    bash deploy/bootstrap_deps.sh >>"${LOG}" 2>&1 || {
+        tail -n 12 "${LOG}" >&2 2>/dev/null || true
+        fnos_fail "Python 运行环境准备失败，详见 ${LOG}"
+    }
+fi
+bash deploy/install.sh >>"${LOG}" 2>&1 || {
+    tail -n 12 "${LOG}" >&2 2>/dev/null || true
+    fnos_fail "接管服务启动失败，详见 ${LOG}"
+}
+exit 0

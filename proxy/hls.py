@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import base64
+import re
+import time
+import urllib.parse
+
+import httpx
+from fastapi import Request
+from fastapi.responses import Response, StreamingResponse
+
+import config
+import netguard
+
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+_URI_ATTR = re.compile(r'URI="([^"]+)"')
+
+
+def encode_url(url: str) -> str:
+    return base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+
+
+def decode_url(token: str) -> str:
+    padded = token + "=" * (-len(token) % 4)
+    return base64.urlsafe_b64decode(padded).decode()
+
+
+def is_master(text: str) -> bool:
+    return "#EXT-X-STREAM-INF" in text
+
+
+def ensure_public_target(url: str) -> str:
+    """分片、图片与直链代理的目标校验。
+
+    默认允许局域网 / 回环地址以内网自建源；可在设置中关闭
+    allow_intranet 恢复仅公网目标。链路本地与保留地址始终拦截。
+    """
+    allow_intranet = bool(config.get().get("allow_intranet", True))
+    return netguard.validate_target(url, allow_intranet=allow_intranet,
+                                    label="媒体地址")
+
+
+def parse_stream_inf(text: str) -> list[dict]:
+    out = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("#EXT-X-STREAM-INF"):
+            continue
+        attrs = {}
+        for match in re.finditer(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', stripped):
+            attrs[match.group(1)] = match.group(2).strip('"')
+        uri = ""
+        for nxt in lines[i + 1:]:
+            candidate = nxt.strip()
+            if not candidate:
+                continue
+            if not candidate.startswith("#"):
+                uri = candidate
+            break
+        width = height = 0
+        res = attrs.get("RESOLUTION", "")
+        if "x" in res:
+            try:
+                width, height = int(res.split("x", 1)[0]), int(res.split("x", 1)[1])
+            except ValueError:
+                width = height = 0
+        try:
+            bandwidth = int(attrs.get("BANDWIDTH", "0") or 0)
+        except ValueError:
+            bandwidth = 0
+        out.append({"uri": uri, "bandwidth": bandwidth,
+                    "width": width, "height": height})
+    return out
+
+
+def build_playlist_meta(text: str, child: dict | None = None) -> dict:
+    meta = {"width": 0, "height": 0, "bandwidth": 0, "variant_count": 0,
+            "duration": 0.0, "has_endlist": True}
+    meta.update({k: v for k, v in (child or {}).items() if v is not None})
+    if is_master(text):
+        variants = parse_stream_inf(text)
+        meta["variant_count"] = len(variants)
+        best = max(variants, key=lambda v: v["bandwidth"], default=None)
+        if best:
+            meta["bandwidth"] = best["bandwidth"]
+            if best["width"] and best["height"]:
+                meta["width"] = max(best["width"], best["height"])
+                meta["height"] = min(best["width"], best["height"])
+    else:
+        duration = 0.0
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#EXTINF:"):
+                try:
+                    duration += float(stripped[8:].split(",")[0])
+                except ValueError:
+                    pass
+        meta["duration"] = duration
+        meta["has_endlist"] = "#EXT-X-ENDLIST" in text
+    return meta
+
+
+_META: dict = {}
+_META_TTL = 120.0
+
+
+def remember_playlist_meta(key: tuple, meta: dict) -> None:
+    _META[key] = (time.monotonic(), meta)
+    if len(_META) > 500:
+        for stale in list(_META)[:100]:
+            _META.pop(stale, None)
+
+
+def get_playlist_meta(key: tuple) -> dict | None:
+    hit = _META.get(key)
+    if not hit:
+        return None
+    ts, meta = hit
+    if time.monotonic() - ts > _META_TTL:
+        _META.pop(key, None)
+        return None
+    return meta
+
+
+def pick_best_variant(text: str) -> str | None:
+    variants = [v for v in parse_stream_inf(text) if v["uri"]]
+    if not variants:
+        return None
+    return max(variants, key=lambda v: v["bandwidth"])["uri"]
+
+
+def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
+                     variant_prefix: str = "", is_master: bool = False) -> str:
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        if stripped.startswith("#"):
+            attr_target = variant_prefix if is_master else seg_prefix
+
+            def sub(match):
+                absolute = urllib.parse.urljoin(base_url, match.group(1))
+                return f'URI="{attr_target}?u={encode_url(absolute)}"'
+            out.append(_URI_ATTR.sub(sub, line))
+            continue
+        target = variant_prefix if is_master else seg_prefix
+        absolute = urllib.parse.urljoin(base_url, stripped)
+        out.append(f"{target}?u={encode_url(absolute)}")
+    return "\n".join(out) + "\n"
+
+
+async def fetch_playlist(client: httpx.AsyncClient, url: str,
+                         timeout: float = 3.0,
+                         depth: int = 0) -> tuple[str, str, dict]:
+    parsed = urllib.parse.urlparse(url)
+    headers = {"User-Agent": _UA,
+               "Referer": f"{parsed.scheme}://{parsed.netloc}/"}
+    resp = await client.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    text = resp.text
+    base = str(resp.url)
+    if is_master(text) and depth < 2:
+        best = pick_best_variant(text)
+        if best:
+            child_text, child_base, child_meta = await fetch_playlist(
+                client, urllib.parse.urljoin(base, best), timeout, depth + 1)
+            return child_text, child_base, build_playlist_meta(text, child_meta)
+    return text, base, build_playlist_meta(text)
+
+
+def playlist_response(text: str, base: str, seg_prefix: str,
+                      variant_prefix: str = "",
+                      is_master: bool = False) -> Response:
+    return Response(rewrite_playlist(text, base, seg_prefix, variant_prefix, is_master),
+                    media_type="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-store"})
+
+
+async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
+                      timeout: float = 8.0) -> StreamingResponse | Response:
+    headers = {"User-Agent": _UA}
+    for key in ("range", "if-range", "if-none-match"):
+        if key in request.headers:
+            headers[key] = request.headers[key]
+    parsed = urllib.parse.urlparse(url)
+    headers["Referer"] = request.headers.get("referer") or \
+        f"{parsed.scheme}://{parsed.netloc}/"
+    resp = await client.send(client.build_request("GET", url, headers=headers),
+                             stream=True)
+    out_headers = {}
+    for key in ("content-type", "content-range", "accept-ranges", "etag"):
+        if key in resp.headers:
+            out_headers[key] = resp.headers[key]
+    out_headers["Cache-Control"] = "public, max-age=3600"
+    status = resp.status_code
+    if status >= 400:
+        await resp.aclose()
+        return Response(status_code=status, headers=out_headers)
+
+    async def chunks():
+        try:
+            async for block in resp.aiter_bytes(65536):
+                yield block
+        finally:
+            await resp.aclose()
+
+    return StreamingResponse(chunks(), status_code=status, headers=out_headers,
+                             media_type=out_headers.get("content-type"))
+
+
+def _poster_fallback() -> Response:
+    svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="2" height="3">'
+           b'<rect width="2" height="3" fill="#1b2130"/></svg>')
+    return Response(svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=600"})
+
+
+async def proxy_poster(url: str, client: httpx.AsyncClient) -> Response:
+    parsed = urllib.parse.urlparse(url)
+    headers = {"User-Agent": _UA}
+    host = parsed.netloc.lower()
+    if host.endswith("doubanio.com") or host.endswith("douban.com"):
+        headers["Referer"] = "https://movie.douban.com/"
+    else:
+        headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+    try:
+        resp = await client.get(url, headers=headers, timeout=5.0)
+        if resp.status_code != 200 or not resp.content:
+            return _poster_fallback()
+        head = resp.content[:12]
+        if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+            ctype = "image/webp"
+        elif head[:8] == b"\x89PNG\r\n\x1a\n":
+            ctype = "image/png"
+        elif head[:3] == b"\xff\xd8\xff":
+            ctype = "image/jpeg"
+        elif head[:6] in (b"GIF87a", b"GIF89a"):
+            ctype = "image/gif"
+        else:
+            declared = (resp.headers.get("content-type") or "").lower()
+            ctype = declared if declared.startswith("image/") else "image/jpeg"
+        return Response(resp.content, media_type=ctype,
+                        headers={"Cache-Control": "public, max-age=86400",
+                                 "Access-Control-Allow-Origin": "*"})
+    except Exception:
+        return _poster_fallback()
