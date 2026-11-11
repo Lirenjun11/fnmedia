@@ -672,9 +672,10 @@ async def media_range_route(file_hash: str, request: Request):
     runtime.log(f"media/range takeover: {brief.get('title', '')[:30]} "
                 f"ep{index + 1} line{line} -> {'hls' if is_hls else 'direct'}")
     if is_hls:
-        auto = "" if explicit else "&auto=1"
+        # 原生播放器走 Range：直接给媒体清单，避免多包一层 master 等待。
+        auto = "&auto=1" if not explicit else ""
         return Response(status_code=302, headers={
-            "Location": f"{ONLINE}/{mg}/preset.m3u8?line={line}"
+            "Location": f"{ONLINE}/{mg}/main.m3u8?line={line}"
                         f"&index={index}{auto}"})
     try:
         url = hls.ensure_public_target(url)
@@ -746,7 +747,8 @@ async def _warm_line(client, brief: dict, guid: str, index: int,
 
 @app.get(f"{ONLINE}/{{mg}}/preset.m3u8")
 async def preset_m3u8(mg: str, request: Request):
-    """播放 master：列出全部可用线路，网页可切 level，手机预取命中缓存。"""
+    """播放 master：只列当前线路。手机端会逐条预取 master 的所有变体，
+    多变体会把它拖到超时；换线由 qualities -> play/play 重新下发单变体。"""
     resolved = request.app.state.store.resolve_media(mg)
     if not resolved:
         return Response(status_code=404)
@@ -762,37 +764,20 @@ async def preset_m3u8(mg: str, request: Request):
         return Response(status_code=302, headers={
             "Location": f"{ONLINE}/{mg}/direct?line={line}&index={index}"})
 
-    def _hls_line(no: int) -> bool:
-        picked = _pick(brief, no, index)
-        return bool(picked) and not _is_direct_media(picked[0])
-
-    order = [line] + [i for i in range(len(names))
-                      if i != line and _hls_line(i)]
-    # 当前线路必须就绪；其余线路后台并发预热。手机端会对每个变体串行取
-    # main.m3u8，预热后大部分命中缓存，避免累计成起播超时。
-    tasks = {no: asyncio.create_task(
-        _warm_line(request.app.state.src, brief, guid, index, no))
-        for no in order}
-    selected = tasks.get(line)
-    if selected is not None:
-        try:
-            await asyncio.wait_for(asyncio.shield(selected),
-                                   timeout=min(float(config.get().get(
-                                       "play_timeout", 8.0)), 2.0))
-        except asyncio.TimeoutError:
-            pass
-    rest = [task for no, task in tasks.items() if no != line]
-    if rest:
-        await asyncio.wait(rest, timeout=0.5)
-    out = ["#EXTM3U", "#EXT-X-VERSION:3"]
-    for rank, no in enumerate(order):
-        label = (fake.line_display(brief, names[no]) if names
-                 else "原画").replace('"', "")
-        bw = 9_000_000 - rank if no == line else 2_000_000 + rank
-        out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},PROGRAM-ID=1,'
-                   f'NAME="{label}"')
-        out.append(f"main.m3u8?line={no}&index={index}")
-    text = "\n".join(out) + "\n"
+    # 当前线路先就绪并缓存，播放器随后取 main.m3u8 直接命中。
+    selected = asyncio.create_task(
+        _warm_line(request.app.state.src, brief, guid, index, line))
+    try:
+        await asyncio.wait_for(asyncio.shield(selected),
+                               timeout=min(float(config.get().get(
+                                   "play_timeout", 8.0)), 2.0))
+    except asyncio.TimeoutError:
+        pass
+    label = (fake.line_display(brief, names[line]) if names
+             else "原画").replace('"', "")
+    text = ("#EXTM3U\n#EXT-X-VERSION:3\n"
+            f'#EXT-X-STREAM-INF:BANDWIDTH=2000000,PROGRAM-ID=1,NAME="{label}"\n'
+            f"main.m3u8?line={line}&index={index}\n")
     return Response(text, media_type="application/vnd.apple.mpegurl",
                     headers={"Access-Control-Allow-Origin": "*",
                              "Cache-Control": "no-store"})

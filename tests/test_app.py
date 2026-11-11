@@ -216,16 +216,17 @@ class AppContractTest(unittest.TestCase):
                     patch.object(hls, "fetch_playlist", new=fake_fetch):
                 master = client.get(played["play_link"])
                 self.assertEqual(master.status_code, 200)
-                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 3)
+                # 手机端会逐条预取 master 变体，必须只下发当前线路一条
+                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 1)
                 self.assertIn('NAME="本地：line-b"', master.text)
                 self.assertIn("main.m3u8?line=1&index=1", master.text)
                 self.assertTrue(master.text.split('NAME="本地：line-b"')[0]
-                                .endswith("BANDWIDTH=9000000,PROGRAM-ID=1,"))
+                                .endswith("BANDWIDTH=2000000,PROGRAM-ID=1,"))
                 auto = client.post("/v/api/v1/play/play",
                                    json={"media_guid": mg}).json()["data"]
                 self.assertIn("auto=1", auto["play_link"])
                 auto_master = client.get(auto["play_link"])
-            self.assertEqual(auto_master.text.count("#EXT-X-STREAM-INF"), 3)
+            self.assertEqual(auto_master.text.count("#EXT-X-STREAM-INF"), 1)
             self.assertIn("main.m3u8?line=0&index=1", auto_master.text)
 
     def test_share_page_treated_as_hls(self):
@@ -250,7 +251,7 @@ class AppContractTest(unittest.TestCase):
             range_resp = client.get(f"/v/api/v1/media/range/{mg}",
                                     follow_redirects=False)
             self.assertEqual(range_resp.status_code, 302)
-            self.assertIn("preset.m3u8", range_resp.headers["location"])
+            self.assertIn("main.m3u8", range_resp.headers["location"])
 
     def test_episode_detail_and_play_info(self):
         import cms as cms_mod
@@ -363,7 +364,7 @@ class AppContractTest(unittest.TestCase):
                         patch.object(hls, "fetch_playlist", new=fake_fetch):
                     master = client.get(played["play_link"], headers=headers)
                 self.assertEqual(master.status_code, 200)
-                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 2)
+                self.assertEqual(master.text.count("#EXT-X-STREAM-INF"), 1)
                 self.assertIn('NAME="本地：lz"', master.text)
 
     def test_probe_requires_keyword(self):

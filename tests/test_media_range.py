@@ -69,7 +69,7 @@ class MediaRangeTest(unittest.TestCase):
         resp = self._run(_title("m3u8"), action)
         self.assertEqual(resp.status_code, 302)
         self.assertIn("/v/media/online/", resp.headers["location"])
-        self.assertIn("preset.m3u8", resp.headers["location"])
+        self.assertIn("main.m3u8", resp.headers["location"])
         self.assertIn("line=0", resp.headers["location"])
         self.assertIn("auto=1", resp.headers["location"])
 
