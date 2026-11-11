@@ -56,8 +56,7 @@ def poster_path(url: str) -> str:
     if not url or not url.startswith("http"):
         return ""
     token = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-    # 官方图片均为相对路径，客户端统一拼 /v/api/v1/sys/img 前缀。
-    return f"online/{token}.jpg"
+    return f"/online/{token}.jpg"
 
 
 def is_tv_client(ua: str) -> bool:
@@ -187,6 +186,7 @@ def detail_item(b: dict) -> dict:
     return {
         "guid": b["guid"], "imdb_id": "", "trim_id": "", "tv_title": "",
         "parent_title": "", "title": b["title"], "logos": "",
+        "poster": poster,
         "original_title": "", "backdrops": poster, "posters": poster,
         "poster_width": 0, "poster_height": 0,
         "vote_average": str(b.get("score") or "0"), "genres": [],

@@ -224,6 +224,15 @@ def _pick(brief: dict, line: int, index: int) -> tuple[str, str] | None:
     return eps[idx].get("url", ""), names[li]
 
 
+_DIRECT_EXT = (".mp4", ".mkv", ".flv", ".mov", ".m4v", ".webm", ".avi")
+
+
+def _is_direct_media(url: str) -> bool:
+    """只有明确是视频文件才是直链；分享页/未知地址按 HLS 处理。"""
+    path = str(url or "").split("?", 1)[0].lower()
+    return ".m3u8" not in path and path.endswith(_DIRECT_EXT)
+
+
 def _err(msg: str, status: int = 404) -> JSONResponse:
     return JSONResponse({"code": -1, "msg": msg, "data": None}, status_code=status)
 
@@ -659,7 +668,7 @@ async def media_range_route(file_hash: str, request: Request):
     if not picked:
         return Response(status_code=404)
     url = picked[0]
-    is_hls = ".m3u8" in url.lower()
+    is_hls = not _is_direct_media(url)
     runtime.log(f"media/range takeover: {brief.get('title', '')[:30]} "
                 f"ep{index + 1} line{line} -> {'hls' if is_hls else 'direct'}")
     if is_hls:
@@ -700,7 +709,7 @@ async def play_play(request: Request):
     if not picked:
         return _err("该片暂无可用播放线路", 404)
     url, _ = picked
-    is_hls = ".m3u8" in url.lower()
+    is_hls = not _is_direct_media(url)
     suffix = "preset.m3u8" if is_hls else "direct"
     link = f"{ONLINE}/{mg}/{suffix}?line={line}&index={index}"
     if not explicit:
@@ -721,7 +730,7 @@ async def _warm_line(client, brief: dict, guid: str, index: int,
     if hit:
         return (no,) + hit
     picked = _pick(brief, no, index)
-    if not picked:
+    if not picked or _is_direct_media(picked[0]):
         return None
     try:
         url = hls.ensure_public_target(picked[0])
@@ -748,8 +757,17 @@ async def preset_m3u8(mg: str, request: Request):
     line, _ = _range_selection(request, brief)
     names = brief.get("line_names") or []
     line = max(0, min(line, len(names) - 1)) if names else 0
-    order = [line] + [i for i in range(len(names)) if i != line and
-                      _pick(brief, i, index)]
+    selected_pick = _pick(brief, line, index)
+    if selected_pick and _is_direct_media(selected_pick[0]):
+        return Response(status_code=302, headers={
+            "Location": f"{ONLINE}/{mg}/direct?line={line}&index={index}"})
+
+    def _hls_line(no: int) -> bool:
+        picked = _pick(brief, no, index)
+        return bool(picked) and not _is_direct_media(picked[0])
+
+    order = [line] + [i for i in range(len(names))
+                      if i != line and _hls_line(i)]
     # 当前线路必须就绪；其余线路后台并发预热。手机端会对每个变体串行取
     # main.m3u8，预热后大部分命中缓存，避免累计成起播超时。
     tasks = {no: asyncio.create_task(

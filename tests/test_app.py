@@ -228,6 +228,30 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(auto_master.text.count("#EXT-X-STREAM-INF"), 3)
             self.assertIn("main.m3u8?line=0&index=1", auto_master.text)
 
+    def test_share_page_treated_as_hls(self):
+        import cms as cms_mod
+        import fake
+        self.assertFalse(appmod._is_direct_media("https://v.x/share/abc"))
+        self.assertFalse(appmod._is_direct_media("https://v.x/a.m3u8?sign=1"))
+        self.assertTrue(appmod._is_direct_media("https://v.x/a.mp4?x=1"))
+        title = cms_mod.OnlineTitle(
+            provider="s_1", vod_id="108", title="分享页线路", type_name="电影",
+            lines={"lz": [cms_mod.Episode("正片", "https://v.x/share/abc")],
+                   "tp": [cms_mod.Episode("正片", "https://v.x/a.m3u8")]})
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            brief = appmod.app.state.store.remember([title])[0]
+            guid = brief["guid"]
+            mg = fake.media_guid(guid)
+            data = client.post("/v/api/v1/play/play",
+                               json={"media_guid": mg}).json()["data"]
+            self.assertIn("preset.m3u8", data["play_link"])
+            self.assertEqual(data["wrapper"], "HLS")
+            range_resp = client.get(f"/v/api/v1/media/range/{mg}",
+                                    follow_redirects=False)
+            self.assertEqual(range_resp.status_code, 302)
+            self.assertIn("preset.m3u8", range_resp.headers["location"])
+
     def test_episode_detail_and_play_info(self):
         import cms as cms_mod
         import fake
@@ -250,7 +274,7 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(episode["parent_guid"], sg)
             self.assertEqual(episode["episode_number"], 2)
             self.assertEqual(episode["media_guid"], fake.ep_media_guid(eg))
-            self.assertTrue(episode["posters"].startswith("online/"))
+            self.assertTrue(episode["posters"].startswith("/online/"))
             self.assertEqual(episode["backdrops"], episode["posters"])
             phone = {"User-Agent": "fnos-media/1.8.0 (Android 14; Phone)"}
             mobile_seasons = client.get(f"/v/api/v1/season/list/{guid}",
