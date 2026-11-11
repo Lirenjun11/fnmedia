@@ -25,6 +25,7 @@ DEFAULTS = {
     "search_concurrency": 5,
     "play_timeout": 8.0,
     "online_first": True,
+    "merge_sources": True,
     "borrow_official": True,
     "auto_best_source": True,
     "allow_intranet": True,
@@ -107,6 +108,7 @@ def save(cfg: dict) -> dict:
         clean[key] = int(max(lo, min(hi, value))) if key in _INTEGERS \
             else round(max(lo, min(hi, value)), 2)
     clean["online_first"] = bool(clean["online_first"])
+    clean["merge_sources"] = bool(clean["merge_sources"])
     clean["allow_intranet"] = bool(clean["allow_intranet"])
     clean["sources"] = [s for s in clean["sources"] if isinstance(s, dict) and s.get("api")]
     clean["subscriptions"] = [s for s in clean["subscriptions"]

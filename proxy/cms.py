@@ -6,9 +6,10 @@ import hashlib
 import html as html_lib
 import re
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import httpx
 
@@ -165,6 +166,66 @@ def map_vod(v: dict, source: dict) -> OnlineTitle | None:
         updated=str(v.get("vod_time") or v.get("vod_time_add") or ""),
         lines=lines,
     )
+
+
+_NORM_RE = re.compile(r"[\s·・:：,，。.．\-—_（）()\[\]【】'\"!！?？~～]+")
+
+
+def _norm_title(text) -> str:
+    s = unicodedata.normalize("NFKC", str(text or "")).lower()
+    return _NORM_RE.sub("", s)
+
+
+def _year4(t: OnlineTitle) -> str:
+    value = str(t.year or "")[:4]
+    return value if value.isdigit() else ""
+
+
+def _merge_bucket(bucket: list[OnlineTitle]) -> list[OnlineTitle]:
+    first_by_provider: dict[str, OnlineTitle] = {}
+    extra: list[OnlineTitle] = []
+    for t in bucket:
+        if t.provider in first_by_provider:
+            extra.append(t)
+        else:
+            first_by_provider[t.provider] = t
+    if len(first_by_provider) <= 1:
+        return bucket
+    ordered = sorted(first_by_provider.values(), key=lambda x: x.provider)
+    primary = ordered[0]
+    lines: dict[str, list] = {}
+    for t in ordered:
+        prefix = str(t.provider_name or t.provider).strip()
+        for name, eps in t.lines.items():
+            key = name if t is primary else f"{prefix}：{name}"
+            n = 2
+            while key in lines:
+                key = f"{prefix}：{name}·{n}"
+                n += 1
+            lines[key] = eps
+    return [replace(primary, lines=lines)] + extra
+
+
+def merge_titles(titles: list[OnlineTitle]) -> list[OnlineTitle]:
+    """同名影片跨源合并为一张卡，线路名带上来源前缀。"""
+    groups: dict[str, list[OnlineTitle]] = {}
+    for t in titles:
+        groups.setdefault(_norm_title(t.title), []).append(t)
+    out: list[OnlineTitle] = []
+    for group in groups.values():
+        by_year: dict[str, list[OnlineTitle]] = {}
+        for t in group:
+            by_year.setdefault(_year4(t), []).append(t)
+        years = [year for year in by_year if year]
+        if len(years) > 1:
+            buckets = list(by_year.values())
+        elif len(years) == 1 and "" in by_year:
+            buckets = [by_year[years[0]] + by_year[""]]
+        else:
+            buckets = [group]
+        for bucket in buckets:
+            out.extend(_merge_bucket(bucket))
+    return out
 
 
 async def search_source(client: httpx.AsyncClient, source: dict,

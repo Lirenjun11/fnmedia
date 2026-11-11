@@ -224,6 +224,7 @@ class AppContractTest(unittest.TestCase):
         import fake
         title = cms_mod.OnlineTitle(
             provider="s_1", vod_id="106", title="单集详情", type_name="电视剧",
+            poster="https://img.invalid/p.jpg",
             lines={"lz": [cms_mod.Episode("第1集", "https://a.invalid/1.m3u8"),
                           cms_mod.Episode("第2集", "https://a.invalid/2.m3u8")]})
         with TestClient(appmod.app) as client:
@@ -240,6 +241,17 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(episode["parent_guid"], sg)
             self.assertEqual(episode["episode_number"], 2)
             self.assertEqual(episode["media_guid"], fake.ep_media_guid(eg))
+            self.assertTrue(episode["posters"].startswith("/online/"))
+            self.assertEqual(episode["backdrops"], episode["posters"])
+            phone = {"User-Agent": "fnos-media/1.8.0 (Android 14; Phone)"}
+            mobile_seasons = client.get(f"/v/api/v1/season/list/{guid}",
+                                        headers=phone).json()["data"]
+            self.assertEqual(mobile_seasons[0]["number_of_episodes"], 2)
+            web_seasons = client.get(
+                f"/v/api/v1/season/list/{guid}",
+                headers={"User-Agent": "Mozilla/5.0 Chrome/124.0 Safari/537.36"},
+            ).json()["data"]
+            self.assertEqual(web_seasons[0]["number_of_episodes"], 0)
             query = client.get(
                 f"/v/api/v1/item/detail?guid={eg}").json()["data"]
             self.assertEqual(query["guid"], eg)
@@ -483,6 +495,51 @@ class AppContractTest(unittest.TestCase):
                 "update_interval_hours": 24})
 
 
+    def test_search_merges_same_title_across_sources(self):
+        import cms
+        import cms as cms_mod
+        import config as cfg_mod
+        import fake
+
+        def make(provider, name, line):
+            return cms_mod.OnlineTitle(
+                provider=provider, provider_name=name, vod_id="1",
+                title="聚合剧", year="2025", type_name="电视剧",
+                lines={line: [
+                    cms_mod.Episode("第1集", f"https://{provider}.invalid/1.m3u8"),
+                    cms_mod.Episode("第2集", f"https://{provider}.invalid/2.m3u8")]})
+
+        titles = [make("p_a", "本地", "lz"), make("p_b", "网络", "tp")]
+        cfg = {**cfg_mod.DEFAULTS, "merge_sources": True, "online_first": True,
+               "sources": [{"id": "p_a", "name": "本地", "enabled": True,
+                            "api": "https://a.invalid/api.php/provide/vod"}]}
+
+        async def fake_search(*_args, **_kwargs):
+            return titles
+
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            with patch.object(config, "get", return_value=cfg), \
+                    patch.object(config, "enabled_sources",
+                                 return_value=cfg["sources"]), \
+                    patch.object(cms, "search_all", new=fake_search):
+                merged = client.get(
+                    "/v/api/v1/search/list?q=聚合剧").json()["data"]
+                merged = [c for c in merged
+                          if str(c.get("title", "")).startswith("【在线】聚合剧")]
+                self.assertEqual(len(merged), 1)
+                brief = appmod.app.state.store.get(merged[0]["guid"])
+                self.assertEqual(brief["line_names"], ["lz", "网络：tp"])
+                labels = [q["resolution"] for q in fake.qualities(brief)]
+                self.assertEqual(labels, ["本地：lz", "网络：tp"])
+
+                cfg["merge_sources"] = False
+                split = client.get(
+                    "/v/api/v1/search/list?q=聚合剧").json()["data"]
+                split = [c for c in split
+                         if str(c.get("title", "")).startswith("【在线】聚合剧")]
+                self.assertEqual(len(split), 2)
+
     def test_poster_routes_all_prefixes(self):
         from fastapi.responses import Response
         token = hls.encode_url("https://img.invalid/p.jpg")
@@ -495,6 +552,7 @@ class AppContractTest(unittest.TestCase):
                     patch.object(hls, "proxy_poster", new=fake_poster):
                 for path in (f"/online/{token}.jpg",
                              f"/v/api/v1/sys/img/online/{token}.jpg",
+                             f"/v/api/v1/sys/img//online/{token}.jpg",
                              f"/v/media/online/poster/{token}.jpg"):
                     self.assertEqual(client.get(path).status_code, 200, path)
 

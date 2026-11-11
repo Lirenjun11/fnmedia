@@ -24,6 +24,7 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
         search_concurrency: Number(form.search_concurrency),
         play_timeout: Number(form.play_timeout),
         online_first: Boolean(form.online_first),
+        merge_sources: Boolean(form.merge_sources),
         auto_best_source: Boolean(form.auto_best_source),
       });
       await refresh();
@@ -68,6 +69,15 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
         </div>
         <div className="divider" />
         <label className="row" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.merge_sources}
+            onChange={(e) => set('merge_sources', e.target.checked)}
+          />
+          <span>
+            跨源聚合搜索：同名影片合并为一张卡，换线菜单显示“源名称：线路名”
+          </span>
+        </label>
+        <label className="row mt" style={{ cursor: 'pointer' }}>
           <input
             className="check" type="checkbox" checked={!!form.online_first}
             onChange={(e) => set('online_first', e.target.checked)}

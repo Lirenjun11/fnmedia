@@ -30,6 +30,7 @@ export interface Config {
   search_concurrency: number;
   play_timeout: number;
   online_first: boolean;
+  merge_sources: boolean;
   borrow_official: boolean;
   auto_best_source: boolean;
   allow_intranet: boolean;

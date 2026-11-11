@@ -280,6 +280,8 @@ async def search_list(request: Request):
     except Exception as exc:  
         runtime.log(f"search error: {type(exc).__name__}")
         titles = []
+    if cfg.get("merge_sources", True):
+        titles = cms.merge_titles(titles)
     briefs = request.app.state.store.remember(titles)
     cards = fake.normalize_cards(
         [playstate.apply(fake.search_card(b), b["guid"]) for b in briefs],
@@ -360,8 +362,15 @@ async def season_route(guid: str, request: Request):
     brief = store.get(tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
-    return JSONResponse(fake.ok(fake.normalize_cards(
-        fake.season_list(brief), _ua(request))))
+    rows = fake.season_list(brief)
+    ua = _ua(request)
+    if not fake.is_browser_client(ua):
+        # 手机播放器用季卡上的集数显示“共 N”；飞牛 Web 会把带集数的合成季
+        # 当成真实季而隐藏选集入口，所以浏览器端保持 0。
+        total = len(fake.episode_list(brief))
+        for row in rows:
+            row["number_of_episodes"] = total
+    return JSONResponse(fake.ok(fake.normalize_cards(rows, ua)))
 
 
 @app.post("/v/api/v1/season/list/{guid}")
@@ -440,6 +449,9 @@ async def _stream_list_impl(guid: str, request: Request):
         return await _passthrough(request)
     ep_index = ep[1] if ep else 0
     meta = hls.get_playlist_meta((tv_guid, 0, ep_index))
+    runtime.log(f"stream/list: {brief.get('title', '')[:30]} ep{ep_index + 1} "
+                f"lines={len(brief.get('line_names') or [])} "
+                f"ua={_ua(request)[:40]!r}")
     return JSONResponse(fake.ok(
         fake.stream_list_payload(brief, mg, vg, meta)))
 
@@ -592,7 +604,7 @@ async def stream_post(request: Request):
         meta, line)
     runtime.log(f"stream: {brief.get('title', '')[:30]} ep{index + 1} "
                 f"line={line}/{len(brief.get('line_names') or [])} "
-                f"bitrate={body.get('bitrate')!r}")
+                f"bitrate={body.get('bitrate')!r} ua={_ua(request)[:40]!r}")
     return JSONResponse(fake.ok(data))
 
 
@@ -686,7 +698,8 @@ async def play_play(request: Request):
         link += "&auto=1"
     runtime.log(f"play: {brief.get('title', '')[:30]} ep{index + 1} "
                 f"line={line}/{len(brief.get('line_names') or [])} "
-                f"bitrate={body.get('bitrate')!r} auto={not explicit}")
+                f"bitrate={body.get('bitrate')!r} auto={not explicit} "
+                f"ua={_ua(request)[:40]!r}")
     return JSONResponse(fake.play_response(
         mg, str(body.get("video_guid") or _video_guid_for(guid, index, mg)),
         link, "HLS" if is_hls else "MP4"))
@@ -867,6 +880,14 @@ async def online_poster(tok_path: str, request: Request):
     return await _serve_online_poster(tok_path, request)
 
 
+@app.get("/v/api/v1/sys/img/{tok_path:path}")
+async def sys_img_any(tok_path: str, request: Request):
+    # 客户端拼前缀时可能出现 “sys/img//online/...”，统一在这里兜住。
+    if "online/" in tok_path:
+        return await _serve_online_poster(tok_path, request)
+    return await _passthrough(request)
+
+
 @app.get(f"{ONLINE}/poster/{{token}}")
 async def poster(token: str, request: Request):
     try:
@@ -891,7 +912,9 @@ async def catch_all(full_path: str, request: Request):
                         break
             store = request.app.state.store
             if guid and (store.get(guid) or store.resolve_episode(guid)):
-                runtime.log(f"virtual noop {request.method} {full_path}")
+                runtime.log(f"virtual noop {request.method} {full_path} "
+                            f"keys={list(parsed)[:8]} "
+                            f"bitrate={parsed.get('bitrate')!r}")
                 return JSONResponse({"code": 0, "msg": "", "data": {}})
         except (ValueError, AttributeError):
             pass

@@ -64,6 +64,15 @@ def is_tv_client(ua: str) -> bool:
     return "com.trim.tv" in low or "trim.tv" in low
 
 
+def is_browser_client(ua: str) -> bool:
+    low = (ua or "").lower()
+    if any(m in low for m in ("com.trim", "fnos", "okhttp", "cfnetwork",
+                              "dart", "exoplayer", "ijkplayer", "mediaplayer")):
+        return False
+    return any(m in low for m in ("mozilla", "applewebkit", "safari",
+                                  "chrome", "firefox", "edg/"))
+
+
 def _date(v) -> str:
     s = str(v if v is not None else "").strip()
     if not s or s.lower() in ("0", "none", "null", "-", "nan"):
@@ -232,12 +241,17 @@ def season_list(b: dict) -> list[dict]:
 def _episode_row(b: dict, eps: list, index: int) -> dict:
     ep = eps[index] if 0 <= index < len(eps) else {}
     eg = episode_guid(b["guid"], index)
+    poster = poster_path(b.get("poster", ""))
+    year = b.get("year") or ""
     return _base_item(
         guid=eg, type="Episode", title=ep.get("title") or f"第{index + 1}集",
         parent_guid=season_guid(b["guid"]), parent_title="第 1 季",
         tv_title=b["title"], season_number=1, episode_number=index + 1,
-        can_play=1, play_item_guid=eg, play_error="",
-        poster=poster_path(b.get("poster", "")),
+        number_of_seasons=1, can_play=1, play_item_guid=eg, play_error="",
+        overview=str(b.get("overview") or "")[:1000],
+        release_date=year, air_date=year,
+        vote_average=str(b.get("score") or "0"),
+        poster=poster, posters=poster, backdrops=poster,
         media_guid=ep_media_guid(eg), video_guid=ep_video_guid(eg),
         audio_guid="", subtitle_guid="",
     )
@@ -367,7 +381,11 @@ def line_label(name: str) -> str:
 
 
 def line_display(b: dict, name: str) -> str:
-    label = line_label(name)
+    raw = str(name or "")
+    if "：" in raw:
+        prefix, _, suffix = raw.partition("：")
+        return f"{prefix}：{line_label(suffix)}"
+    label = line_label(raw)
     provider = str(b.get("provider_name") or b.get("provider") or "").strip()
     return f"{provider}：{label}" if provider else label
 

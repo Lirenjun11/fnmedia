@@ -57,6 +57,34 @@ class CmsTest(unittest.TestCase):
         unnamed = cms.map_vod(row, {"id": "s_2", "api": api})
         self.assertEqual(unnamed.provider_name, "s_2")
 
+    def test_merge_titles_across_sources(self):
+        def title(provider, name, line, year="2025"):
+            return cms.OnlineTitle(
+                provider=provider, provider_name=name, vod_id="1",
+                title="谷雨", year=year, type_name="电视剧",
+                lines={line: [cms.Episode("第1集",
+                                          f"https://{provider}.invalid/1.m3u8")]})
+        merged = cms.merge_titles([title("p_b", "网络", "lz"),
+                                   title("p_a", "本地", "tp")])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].provider, "p_a")
+        self.assertEqual(list(merged[0].lines), ["tp", "网络：lz"])
+        self.assertEqual(len(cms.line_names(merged[0])), 2)
+
+    def test_merge_titles_keeps_different_years_and_same_provider(self):
+        def title(provider, name, line, year="2025", vod="1"):
+            return cms.OnlineTitle(
+                provider=provider, provider_name=name, vod_id=vod,
+                title="同名片", year=year, type_name="电影",
+                lines={line: [cms.Episode("正片",
+                                          f"https://{provider}.invalid/1.m3u8")]})
+        self.assertEqual(len(cms.merge_titles([
+            title("p_a", "本地", "a", "2024"),
+            title("p_b", "网络", "b", "2025")])), 2)
+        self.assertEqual(len(cms.merge_titles([
+            title("p_a", "本地", "a", "2025", "1"),
+            title("p_a", "本地", "b", "2025", "2")])), 2)
+
     def test_xml_response(self):
         xml = ('<rss><list><video><id>3</id><name>XML片</name><type>电影</type>'
                '<dl><dd flag="m3u8"><![CDATA[正片$https://a.invalid/x.m3u8]]></dd></dl>'
@@ -156,6 +184,13 @@ class FakeTest(unittest.TestCase):
         self.assertEqual(video["bps"], 0)
         self.assertEqual(video["codec_name"], "h264")
 
+
+    def test_line_display_uses_source_prefix(self):
+        self.assertEqual(fake.line_display({"provider_name": "本地"}, "lzm3u8"),
+                         "本地：量子")
+        self.assertEqual(
+            fake.line_display({"provider_name": "本地"}, "网络：lzm3u8"),
+            "网络：量子")
 
     def test_poster_path_uses_short_prefix(self):
         path = fake.poster_path("https://img.invalid/p.jpg")
