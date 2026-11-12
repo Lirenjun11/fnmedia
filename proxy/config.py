@@ -23,6 +23,7 @@ DEFAULTS = {
     "enabled_limit": 200,
     "search_timeout": 2.5,
     "search_concurrency": 5,
+    "search_debounce_ms": 200,
     "play_timeout": 8.0,
     "online_first": True,
     "merge_sources": True,
@@ -44,8 +45,10 @@ DEFAULTS = {
 
 _NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 10.0),
             "search_concurrency": (1, 16), "play_timeout": (2.0, 30.0),
-            "update_interval_hours": (1, 168), "adfilter_head_skip": (0.0, 120.0)}
-_INTEGERS = ("enabled_limit", "search_concurrency", "update_interval_hours")
+            "update_interval_hours": (1, 168), "adfilter_head_skip": (0.0, 120.0),
+            "search_debounce_ms": (0, 1000)}
+_INTEGERS = ("enabled_limit", "search_concurrency", "update_interval_hours",
+             "search_debounce_ms")
 _LOCK = threading.RLock()
 _cache: dict | None = None
 _mtime = 0.0

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html as html_lib
 import json
 import os
@@ -269,12 +270,43 @@ app.include_router(admin_api.router)
 app.include_router(playstate_api.router)
 
 
+_SEARCH_LATEST: dict[str, float] = {}
+
+
+def _search_session(request: Request) -> str:
+    """Group rapid searches by client session; never log the raw credential."""
+    raw = (request.headers.get("authorization")
+           or request.headers.get("cookie") or "")
+    if not raw:
+        host = request.client.host if request.client else ""
+        raw = host + "|" + _ua(request)
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+async def _search_is_latest(request: Request, debounce_ms: int) -> bool:
+    """Server-side debounce: only the last query in a burst reaches the CMS."""
+    session = _search_session(request)
+    token = time.monotonic()
+    _SEARCH_LATEST[session] = token
+    await asyncio.sleep(debounce_ms / 1000.0)
+    if _SEARCH_LATEST.get(session) != token:
+        return False
+    _SEARCH_LATEST.pop(session, None)
+    return True
+
+
 @app.get("/v/api/v1/search/list")
 async def search_list(request: Request):
     local = await _passthrough(request)
     sources = config.enabled_sources()
     keyword = request.query_params.get("q", "").strip()
     if not sources or not keyword:
+        return local
+    cfg = config.get()
+    debounce_ms = int(cfg.get("search_debounce_ms", 200))
+    if debounce_ms > 0 and not await _search_is_latest(request, debounce_ms):
+        # A newer query arrived while waiting: return official local results
+        # only. The last request of the burst is the one that queries sources.
         return local
     try:
         data = json.loads(local.body)
@@ -283,7 +315,6 @@ async def search_list(request: Request):
     if not isinstance(data, dict):
         return local
     items = data.get("data") if isinstance(data.get("data"), list) else []
-    cfg = config.get()
     try:
         titles = await cms.search_all(
             request.app.state.src, sources, keyword,

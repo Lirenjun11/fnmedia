@@ -22,6 +22,7 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
         enabled_limit: Number(form.enabled_limit),
         search_timeout: Number(form.search_timeout),
         search_concurrency: Number(form.search_concurrency),
+        search_debounce_ms: Number(form.search_debounce_ms),
         play_timeout: Number(form.play_timeout),
         online_first: Boolean(form.online_first),
         merge_sources: Boolean(form.merge_sources),
@@ -44,7 +45,11 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
       </div>
       <section className="card">
         <div className="card-title">搜索</div>
-        <p className="card-sub">所有启用的源并行搜索，到点即返回已有结果并取消慢源。</p>
+        <p className="card-sub">
+          所有启用的源并行搜索，到点即返回已有结果并取消慢源。
+          输入防抖在扩展侧按会话合并连续搜索：录入过程中的中间词只返回官方本地结果，
+          仅最后一次查询在线源，飞牛客户端的请求时机与官方结果不受影响。
+        </p>
         <div className="grid">
           <div>
             <label className="field">总预算（秒，0.5 – 10）</label>
@@ -60,6 +65,12 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
             <label className="field">参与搜索源上限（1 – 200）</label>
             <input type="number" min="1" max="200" value={form.enabled_limit}
                    onChange={(e) => set('enabled_limit', Number(e.target.value))} />
+          </div>
+          <div>
+            <label className="field">输入防抖（毫秒，0 关闭，最多 1000）</label>
+            <input type="number" min="0" max="1000" step="50"
+                   value={form.search_debounce_ms}
+                   onChange={(e) => set('search_debounce_ms', Number(e.target.value))} />
           </div>
           <div>
             <label className="field">播放清单超时（秒）</label>

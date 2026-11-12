@@ -28,6 +28,7 @@ export interface Config {
   enabled_limit: number;
   search_timeout: number;
   search_concurrency: number;
+  search_debounce_ms: number;
   play_timeout: number;
   online_first: boolean;
   merge_sources: boolean;
