@@ -46,6 +46,8 @@ class AclTest(unittest.TestCase):
             "acl_subjects": list(cfg.get("acl_subjects") or []),
             "acl_grants": dict(cfg.get("acl_grants") or {}),
             "acl_devices": dict(cfg.get("acl_devices") or {}),
+            "acl_default_visible": cfg.get("acl_default_visible"),
+            "acl_default_online": cfg.get("acl_default_online"),
         }
         cfg.update({
             "sources": [
@@ -61,6 +63,8 @@ class AclTest(unittest.TestCase):
             "acl_subjects": [{"id": "u1", "name": "客厅", "source": "manual"}],
             "acl_grants": {},
             "acl_devices": {},
+            "acl_default_visible": True,
+            "acl_default_online": True,
         })
         config.save(cfg)
         acl.invalidate()
@@ -71,11 +75,13 @@ class AclTest(unittest.TestCase):
         config.save(cfg)
         acl.invalidate()
 
-    def enable(self, grants=None, devices=None):
+    def enable(self, grants=None, devices=None, visible=True, online=True):
         cfg = config.get()
         cfg["acl_enabled"] = True
         cfg["acl_grants"] = grants or {}
         cfg["acl_devices"] = devices or {}
+        cfg["acl_default_visible"] = visible
+        cfg["acl_default_online"] = online
         config.save(cfg)
         acl.invalidate()
 
@@ -90,13 +96,55 @@ class AclTest(unittest.TestCase):
         self.assertIsNone(acl.filter_brief(dead))
         self.assertEqual(len(acl.sources()), 2)
 
-    def test_unauthorized_account_sees_nothing(self):
+    def test_default_allow_keeps_everything_visible(self):
+        """默认策略放行：开启总开关不会让任何账号瞬间失去内容。"""
         self.enable(grants={})
+        token = self.as_user("u1")
+        try:
+            self.assertIsNotNone(acl.filter_brief(brief_of(provider="s_1")))
+            self.assertEqual(len(acl.sources()), 2)
+            self.assertTrue(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+    def test_default_deny_hides_everything(self):
+        self.enable(grants={}, visible=False, online=False)
         token = self.as_user("u1")
         try:
             self.assertIsNone(acl.filter_brief(brief_of(provider="s_1")))
             self.assertEqual(acl.sources(), [])
             self.assertFalse(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+    def test_empty_libs_means_none(self):
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_1"]}})
+        token = self.as_user("u1")
+        try:
+            self.assertFalse(acl.lib_allowed("chart:movie"))
+            self.assertIsNotNone(acl.filter_brief(brief_of(provider="s_1")))
+        finally:
+            acl.reset(token)
+
+    def test_online_off_blocks_all_sources(self):
+        self.enable(grants={"u1": {"online": False, "libs": ["chart:movie"],
+                                   "sources": ["s_1"]}})
+        token = self.as_user("u1")
+        try:
+            self.assertEqual(acl.sources(), [])
+            self.assertIsNone(acl.filter_brief(brief_of(provider="s_1")))
+            self.assertTrue(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+    def test_unconfigured_account_uses_defaults(self):
+        self.enable(grants={"u1": {"libs": [], "sources": []}},
+                    visible=True, online=True)
+        token = self.as_user("u2")
+        try:
+            # u2 没配过 -> 按默认放行；u1 明确配成「都不给」。
+            self.assertTrue(acl.lib_allowed("chart:movie"))
+            self.assertEqual(len(acl.sources()), 2)
         finally:
             acl.reset(token)
 
@@ -161,7 +209,8 @@ class AclTest(unittest.TestCase):
         self.assertEqual((ident.uid, ident.via), ("u1", "device"))
 
     def test_unknown_without_credentials(self):
-        self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": []}})
+        self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": []}},
+                    visible=False, online=False)
         ident = acl.identify(FakeRequest({}))
         self.assertFalse(ident.known)
         self.assertEqual(ident.reason, "no_credential")
@@ -272,14 +321,60 @@ class AclTest(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             self.assertTrue(resp.json()["data"]["bound"])
 
-    def test_enable_requires_grant(self):
+    def test_enable_requires_grant_when_defaults_deny(self):
+        """默认全禁 + 一条授权都没有 = 开启即全员无内容，必须拦住。"""
+        cfg = config.get()
+        cfg["acl_default_visible"] = False
+        cfg["acl_default_online"] = False
+        config.save(cfg)
         token = config.token()
         with TestClient(appmod.app) as client:
             resp = client.patch("/v/api/ext/acl/config",
                                 headers={"x-admin-token": token},
                                 json={"enabled": True})
         self.assertEqual(resp.status_code, 400)
-        self.assertIn("至少一个账号", resp.json()["msg"])
+        self.assertIn("默认策略是全禁", resp.json()["msg"])
+
+    def test_enable_is_allowed_when_defaults_allow(self):
+        token = config.token()
+        with TestClient(appmod.app) as client:
+            resp = client.patch("/v/api/ext/acl/config",
+                                headers={"x-admin-token": token},
+                                json={"enabled": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["data"]["enabled"])
+
+    def test_enable_accepts_both_field_names(self):
+        """管理页发 enabled、配置键叫 acl_enabled，两种都得能开。"""
+        self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": []}})
+        cfg = config.get()
+        cfg["acl_enabled"] = False
+        config.save(cfg)
+        token = config.token()
+        with TestClient(appmod.app) as client:
+            for body in ({"enabled": True}, {"acl_enabled": True}):
+                cfg = config.get()
+                cfg["acl_enabled"] = False
+                config.save(cfg)
+                resp = client.patch("/v/api/ext/acl/config",
+                                    headers={"x-admin-token": token},
+                                    json=body)
+                self.assertEqual(resp.status_code, 200, body)
+                self.assertTrue(resp.json()["data"]["enabled"], body)
+
+    def test_delete_subject_also_drops_grants_and_devices(self):
+        self.enable(devices={"fp1234567890": {"uid": "u1", "ua": "ua", "ts": 1}},
+                    grants={"u1": {"libs": ["chart:movie"], "sources": ["s_1"]}})
+        token = config.token()
+        with TestClient(appmod.app) as client:
+            resp = client.delete("/v/api/ext/acl/subjects/u1",
+                                 headers={"x-admin-token": token})
+            data = resp.json()["data"]
+        self.assertEqual(resp.status_code, 200)
+        # 只删 acl_subjects 会被「仍有授权的 uid」重新补回清单，必须连带清掉。
+        self.assertNotIn("u1", [s["id"] for s in data["subjects"]])
+        self.assertNotIn("u1", data["grants"])
+        self.assertEqual(data["devices"], [])
 
     def test_export_omits_device_bindings(self):
         self.enable(devices={"fp1234567890": {"uid": "u1", "ua": "ua", "ts": 1}})
@@ -385,6 +480,7 @@ class OfficialSchemaTest(unittest.TestCase):
             "INSERT INTO user VALUES"
             " ('u-guid-1', '爸爸', 1, 1),"
             " ('u-guid-2', '妈妈', 0, 1),"
+            " ('u-guid-3', 'hyh_deleted_1773485874', 0, 1),"
             " ('default-user-template', '模板', 0, 1);"
         )
         med.commit()
@@ -431,8 +527,9 @@ class OfficialSchemaTest(unittest.TestCase):
         ids = [row["id"] for row in report["users"]]
         self.assertIn("u-guid-1", ids)
         self.assertIn("u-guid-2", ids)
-        # 占位账号不该出现在可授权清单里。
+        # 占位账号与该被删除的账号（官方改名为 xxx_deleted_<ts>）都不该出现。
         self.assertNotIn("default-user-template", ids)
+        self.assertNotIn("u-guid-3", ids)
         # 管理员排最前，管理页第一眼就是自己。
         self.assertEqual(report["users"][0]["id"], "u-guid-1")
         self.assertTrue(report["users"][0]["is_admin"])

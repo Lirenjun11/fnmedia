@@ -47,12 +47,19 @@ DEFAULTS = {
     "vlib_refresh_hours": 6,
     # ---- 账号权限（默认关闭；关闭时全链路短路，行为与旧版一致）----
     # acl_subjects: [{id,name,source}] 授权主体（fnOS 账号）
-    # acl_grants:   {uid: {libs: ["chart:movie"], sources: [sid]}}
-    # acl_devices:  {fingerprint: {uid,ua,ts}} 设备凭证绑定
+    # acl_grants:   {uid: {libs: ["chart:movie"], sources: [sid], online: bool}}
+    #   - 键不存在 = 该账号未单独配置，按下面的默认策略处理
+    #   - libs 存在且为空 = 一个虚拟库都看不到
+    #   - sources 存在且为空 = 一条在线片源都不能用
+    # acl_devices:  {fingerprint: {uid,ua,ts}} 设备凭证绑定（自动识别不出来时的兜底）
     "acl_enabled": False,
     "acl_subjects": [],
     "acl_grants": {},
     "acl_devices": {},
+    # 默认策略：未单独配置的账号怎么算。默认放行，和参考项目一致 —— 开启
+    # 账号权限不会让任何账号瞬间失去内容，要限制谁再去单独取消勾选。
+    "acl_default_visible": True,
+    "acl_default_online": True,
 }
 
 _NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 10.0),
@@ -87,7 +94,12 @@ def _clean_subjects(raw) -> list[dict]:
 
 
 def _clean_grants(raw) -> dict:
-    """主体授权：{uid: {libs: [key], sources: [sid]}}，统一去重并限量。"""
+    """主体授权：{uid: {libs?: [key], sources?: [sid], online?: bool}}。
+
+    **保留「键是否存在」的语义**：没有 libs 键 = 未单独配置（走默认策略），
+    libs 为空数组 = 明确不允许任何虚拟库。旧实现无条件补成空数组，会把
+    「没配」误判成「全禁」，一开启就让人看不到东西。
+    """
     out: dict = {}
     if not isinstance(raw, dict):
         return out
@@ -95,18 +107,19 @@ def _clean_grants(raw) -> dict:
         uid = str(uid or "").strip()[:64]
         if not uid or not isinstance(value, dict):
             continue
+        item: dict = {}
+        if "online" in value:
+            item["online"] = bool(value.get("online"))
         libs = value.get("libs")
-        if not isinstance(libs, list):
-            libs = []
+        if isinstance(libs, list):
+            item["libs"] = sorted({str(x).strip()[:40] for x in libs[:64]
+                                   if str(x).strip()})
         sources = value.get("sources")
-        if not isinstance(sources, list):
-            sources = []
-        out[uid] = {
-            "libs": sorted({str(x).strip()[:40] for x in libs[:64]
-                            if str(x).strip()}),
-            "sources": sorted({str(x).strip()[:40] for x in sources[:400]
-                               if str(x).strip()}),
-        }
+        if isinstance(sources, list):
+            item["sources"] = sorted({str(x).strip()[:40] for x in sources[:400]
+                                      if str(x).strip()})
+        if item:
+            out[uid] = item
     return out
 
 
@@ -207,6 +220,8 @@ def save(cfg: dict) -> dict:
     clean["acl_subjects"] = _clean_subjects(clean["acl_subjects"])
     clean["acl_grants"] = _clean_grants(clean["acl_grants"])
     clean["acl_devices"] = _clean_devices(clean["acl_devices"])
+    clean["acl_default_visible"] = bool(clean["acl_default_visible"])
+    clean["acl_default_online"] = bool(clean["acl_default_online"])
     raw_keywords = clean["adfilter_keywords"]
     if not isinstance(raw_keywords, list):
         raw_keywords = []

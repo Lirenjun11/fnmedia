@@ -348,12 +348,17 @@ def discover(force: bool = False) -> dict:
                         f'SELECT {cols} FROM "{table}" LIMIT 200').fetchall()
                     for row in rows:
                         uid = str(row[0] if row[0] is not None else "").strip()
-                        # 官方会放一个占位账号，它不是真实用户。
-                        if not uid or uid == "default-user-template":
+                        name = str(row[1] or "").strip()
+                        # 官方会放一个占位账号；删除账号会改名为
+                        # ``<用户名>_deleted_<时间戳>``，这些都不该出现在
+                        # 授权清单里（否则删了以后还挂在列表上）。
+                        low = f"{uid}\n{name}".lower()
+                        if (not uid or uid == "default-user-template"
+                                or "_deleted_" in low):
                             continue
                         item = {
                             "id": uid[:64],
-                            "name": str(row[1] or uid).strip()[:60] or uid,
+                            "name": name[:60] or uid,
                             "source": "auto",
                         }
                         if "is_admin" in extra:
@@ -532,29 +537,56 @@ def invalidate(uid: str = "") -> None:
 
 # --------------------------------------------------------------- 授权判定
 
-def _grant(uid: str) -> dict:
+def _grant(uid: str) -> dict | None:
+    """该账号的显式配置；``None`` 表示「未单独配置」，按默认策略处理。
+
+    这层区分是关键：``libs: []`` 是「一个都不给」，而完全没有 ``libs``
+    键是「没配过、按默认放行」。旧实现把两者混成一个空数组，等于一开启
+    就把没配过的账号全禁了。
+    """
     if not uid:
-        return {}
+        return None
     value = (config.get().get("acl_grants") or {}).get(uid)
-    return value if isinstance(value, dict) else {}
+    if isinstance(value, dict) and value:
+        return value
+    return None
 
 
-def granted_sources(uid: str) -> set[str]:
-    value = _grant(uid).get("sources")
-    if not isinstance(value, list):
+def default_visible() -> bool:
+    """未单独配置的账号默认是否可见虚拟库（默认放行，同参考项目）。"""
+    return bool(config.get().get("acl_default_visible", True))
+
+
+def default_online() -> bool:
+    """未单独配置的账号默认是否可用在线搜索/播放。"""
+    return bool(config.get().get("acl_default_online", True))
+
+
+def granted_sources(uid: str) -> set[str] | None:
+    """``None`` = 不限（全部启用源可用）；空集合 = 一条都不许。"""
+    if not enabled():
+        return None
+    grant = _grant(uid) or {}
+    if grant.get("online") is False:
         return set()
-    return {str(x) for x in value if str(x).strip()}
-
-
-def granted_libs(uid: str) -> set[str]:
-    value = _grant(uid).get("libs")
-    if not isinstance(value, list):
+    if isinstance(grant.get("sources"), list):
+        return {str(x) for x in grant["sources"] if str(x).strip()}
+    if not default_online():
         return set()
-    return {str(x) for x in value if str(x).strip()}
+    return None
+
+
+def granted_libs(uid: str) -> set[str] | None:
+    """``None`` = 按默认策略；空集合 = 一个虚拟库都看不到。"""
+    grant = _grant(uid) or {}
+    libs = grant.get("libs")
+    if not isinstance(libs, list):
+        return None
+    return {str(x) for x in libs if str(x).strip()}
 
 
 def sources(ignore_acl: bool = False) -> list[dict]:
-    """当前主体可用于搜索/播放的源（ACL 关闭时等于全部启用源）。
+    """当前主体可用于搜索/播放的源（ACL 关闭或「不限」时等于全部启用源）。
 
     ``ignore_acl=True`` 只给媒体分片链路用：播放器拉 m3u8/分片时不一定带
     登录凭证，按身份裁剪会把整条播放打断。媒体 URL 的可播放性由入口
@@ -563,12 +595,14 @@ def sources(ignore_acl: bool = False) -> list[dict]:
     pool = config.enabled_sources()
     if ignore_acl or not enabled():
         return pool
-    allowed = granted_sources(current().uid)
-    return [s for s in pool if str(s.get("id") or "") in allowed]
+    allow = granted_sources(current().uid)
+    if allow is None:
+        return pool
+    return [s for s in pool if str(s.get("id") or "") in allow]
 
 
 def provider_allowed(pid: str) -> bool:
-    """单条线路的来源是否可用：全局启用 + 当前主体已授权。"""
+    """单条线路的来源是否可用：全局启用 + 当前主体策略允许。"""
     pid = str(pid or "")
     if not config.source_live(pid):
         return False
@@ -576,7 +610,8 @@ def provider_allowed(pid: str) -> bool:
         return True
     if not pid:
         return False
-    return pid in granted_sources(current().uid)
+    allow = granted_sources(current().uid)
+    return allow is None or pid in allow
 
 
 def lib_allowed(key: str) -> bool:
@@ -586,6 +621,8 @@ def lib_allowed(key: str) -> bool:
     if not key:
         return False
     libs = granted_libs(current().uid)
+    if libs is None:
+        return default_visible()
     return "*" in libs or key in libs
 
 
@@ -601,7 +638,7 @@ def filter_brief(brief: dict | None, enforce: bool = True) -> dict | None:
         return None
     if not enabled() or not enforce:
         return brief if config.source_live(brief.get("provider")) else None
-    allowed = granted_sources(current().uid)
+    allow = granted_sources(current().uid)
     mapping = brief.get("line_sources")
     if not isinstance(mapping, dict):
         mapping = {}
@@ -612,7 +649,7 @@ def filter_brief(brief: dict | None, enforce: bool = True) -> dict | None:
         src = str(mapping.get(name) or brief.get("provider") or "")
         if not config.source_live(src):
             continue
-        if not src or src not in allowed:
+        if allow is not None and src not in allow:
             continue
         if not lines.get(name):
             continue
@@ -676,12 +713,16 @@ def status() -> dict:
         if isinstance(value, dict):
             granted_any |= {str(x) for x in (value.get("sources") or [])}
     enabled_ids = [str(s.get("id") or "") for s in config.enabled_sources()]
-    unassigned_sources = [sid for sid in enabled_ids if sid not in granted_any]
-    unassigned_subjects = [row["id"] for row in subjects_list
-                           if not (grants.get(row["id"]) or {}).get("libs")
-                           and not (grants.get(row["id"]) or {}).get("sources")]
+    # 默认放行时「没配过」≠「不能用」，不该提示成缺口。
+    unassigned_sources = ([] if default_online() else
+                          [sid for sid in enabled_ids if sid not in granted_any])
+    unassigned_subjects = ([] if (default_visible() and default_online()) else
+                           [row["id"] for row in subjects_list
+                            if not grants.get(row["id"])])
     return {
         "enabled": enabled(),
+        "defaults": {"visible": default_visible(),
+                     "online": default_online()},
         "subjects": subjects_list,
         "grants": grants,
         "devices": [

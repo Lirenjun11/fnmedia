@@ -10,22 +10,22 @@
 
 ---
 
-## 实施状态（0.0.1.12：账号识别改为「官方库自动」）
+## 实施状态（0.0.1.13：对齐参考项目的「库可见 + 在线开关 + 默认放行」模型）
 
 本文件下半部分是最初的可行性方案，**以下为实际实现与差异**，冲突时以本节为准。
 
 | 项 | 实现 |
 |---|---|
 | 总开关 | `acl_enabled`，默认 `false`；关闭时全链路短路，行为与旧版一致 |
-| 授权数据 | `acl_grants = {uid: {libs:[key], sources:[sid]}}`，独立键，订阅刷新不会覆盖 |
-| 主体清单 | **官方库自动读取**（`trimmedia.db` 的 `user` 表，含管理员标记，排除 `default-user-template`）；`acl_subjects` 仅作手动兜底 |
+| 默认策略 | `acl_default_visible` / `acl_default_online`，**默认都为 `true`（放行）**：未单独配置的账号、以及暂时识别不出身份的客户端照常看得到内容，所以打开总开关不会让任何人瞬间失联 |
+| 账号配置 | `acl_grants = {uid: {libs?: [key], sources?: [sid], online?: bool}}`。**键不存在 = 未单独配置（走默认）**；`libs: []` = 一个虚拟库都不给；`sources: []` = 一条在线片源都不给；`online: false` = 该账号禁用在线搜索与播放 |
+| 主体清单 | **官方库自动读取**（`trimmedia.db` 的 `user` 表，含管理员标记；排除 `default-user-template` 与已删除账号 `*_deleted_*`）；`acl_subjects` 仅作手动兜底 |
 | 身份来源 | ① 请求头（`x-user-id` 等 10 个候选）→ ② **官方登录 token 自动反查**（`Authorization` / `Trim-MC-token` → `trimactivity.db.user_token` → `user_guid`）→ ③ 管理页「绑定当前设备」兜底 |
-| 授权粒度 | **合并为一档**「该源可用」（搜索 + 播放），对应 §10 未决项 1 的取舍；库授权用稳定键 `chart:movie` / `catalog:tv` |
-| 拦截点 | 搜索源集、虚拟库列表/详情/条目、合并卡线路裁剪、详情/选集/播放四入口、`preset/main/direct` 媒体入口 |
-| 可观测 | 管理页横幅（未识别 / N 个账号无授权 / N 个源未授权）+ 自检接口（凭证候选、Cookie 键、官方库表发现、会话映射表）+ 分类日志 |
+| 拦截点 | 搜索源集、虚拟库列表/详情/条目（库根节点）、合并卡线路裁剪、详情/选集/播放四入口、`preset/main/direct` 媒体入口 |
+| 可观测 | 管理页「当前身份」+ 默认策略 + 账号摘要（默认/已配 N 库/在线禁用）+ 自检接口（凭证候选、Cookie 键、官方库表发现、会话映射表）+ 分类日志 |
 | 逃生通道 | 管理页与 `/v/api/ext/*` 永不参与 ACL；根用户改 `state/config.json` 的 `acl_enabled=false` 即恢复 |
-| 导出 | 不含 `acl_devices`（设备绑定不跨机迁移）；`acl_subjects` / `acl_grants` 保留 |
-| **未做** | **媒体 URL 票据化**：已下发的 m3u8 / 分片 URL 在授权撤销后仍可播放，直到缓存过期（阶段 2） |
+| 导出 | 不含 `acl_devices`（设备绑定不跨机迁移）；`acl_subjects` / `acl_grants` / 默认策略保留 |
+| **未做** | **媒体 URL 票据化**：已下发的 m3u8 / 分片 URL 在授权撤销后仍可播放，直到缓存过期（阶段 2）；**播放历史与续播未按账号隔离**（参考项目 v0.2.48 已做，本项目仍全局共享） |
 
 **官方库位置与表结构**（只读，`mode=ro`；插件以 root 运行，权限足够）：
 
@@ -33,9 +33,15 @@
 - `trimmedia.db` → `user(guid, username, is_admin, status)`：账号清单与展示名。
 - `trimactivity.db` → `user_token(token, user_guid, status, update_time)`：token 到账号的映射，取 `status=1` 且最新的一条。
 
-**0.0.1.11 的缺陷（0.0.1.12 修正）**：探测逻辑只认 `uid` / `user_id` 列名，而官方用的是 `guid` / `user_guid`，导致「自动发现账号」和「自动识别身份」同时失效 —— 管理页只能手工填账号、每个客户端还要手工绑定一次。现在列名按 `guid → user_guid → uid → user_id` 优先级匹配，并优先读标准表名（`user` / `users` / `account`），官方改表名时仍能自动跟上。
+**与参考项目（yujian0815/fnmedia-ext）的对齐情况**：数据模型与默认策略完全对齐 —— 它的 `lib_acl` / `acl_default_visible` / `acl_default_online` 对应这里的 `acl_grants[*].libs` / `acl_default_visible` / `acl_default_online`，语义一致（键不存在=未配置、空列表=都不给、默认放行）。**唯一的扩展**是允许把「在线」再细化到具体源（`sources` 非空时按源限制），参考项目只有账号级开关。
 
-**「绑定当前设备」现在的定位**：仅当前两步都识别不出来时（例如某个播放器进程不发送登录 token）才需要，不再是启用前的必经步骤。
+**两个已修的回归（0.0.1.12 / 0.0.1.13）**：
+
+1. 0.0.1.11 只认 `uid` / `user_id` 列，官方用的是 `guid` / `user_guid`，导致账号自动读取与身份自动识别同时失效 → 现在按 `guid → user_guid → uid → user_id` 匹配，表名优先标准名。
+2. 0.0.1.12 管理页总开关发的是 `acl_enabled`，后端只认 `enabled`，接口回 200 但配置没变，表现为「勾了又弹回」→ 现在后端两种字段都接受，前端以后端返回值为准并做失配提示。
+
+**「绑定当前设备」的定位**：仅当前两步都识别不出来时（例如某个播放器进程不发送登录 token）才需要，不再是启用前的必经步骤。
+
 
 **已知限制（UI 与文档同时说明）**：
 

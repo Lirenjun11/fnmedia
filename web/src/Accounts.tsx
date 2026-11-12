@@ -37,6 +37,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
   const [active, setActive] = useState('');
   const [libs, setLibs] = useState<string[]>([]);
   const [sources, setSources] = useState<string[]>([]);
+  const [online, setOnline] = useState(true);
   const [busy, setBusy] = useState('');
   const [probe, setProbe] = useState<AclProbe | null>(null);
   const [bindUid, setBindUid] = useState('');
@@ -53,11 +54,14 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
     });
   }, []);
 
-  // 选中账号或授权数据变化时，把编辑区同步到已保存状态。
+  // 选中账号或授权数据变化时，把编辑区同步到「生效值」：未单独配置的账号
+  // 显示默认策略的结果，管理员看到的就是这个账号当前实际能看到的内容。
   useEffect(() => {
-    const grant = status?.grants[active] || { libs: [], sources: [] };
-    setLibs([...(grant.libs || [])]);
-    setSources([...(grant.sources || [])]);
+    const grant = status?.grants[active];
+    const d = status?.defaults || { visible: true, online: true };
+    setLibs(grant?.libs ?? (d.visible ? (status?.libs || []).map((l) => l.key) : []));
+    setSources(grant?.sources ?? (d.online ? (status?.sources || []).map((s) => s.id) : []));
+    setOnline(grant?.online ?? d.online);
   }, [active, status]);
 
   const load = useCallback(async () => {
@@ -83,10 +87,25 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
 
   const toggleEnabled = (value: boolean) => run(
     'enabled',
-    () => api.aclConfig({ acl_enabled: value }),
+    async () => {
+      const next = await api.aclConfig({ enabled: value });
+      if (next.enabled !== value) return next;
+      // 身份是在请求开始时解析的：开关刚打开时，同一次请求里的 me 还是
+      // 「未启用」，这里再取一次状态，页面才不会显示成没生效的样子。
+      try {
+        return await api.aclStatus();
+      } catch {
+        return next;
+      }
+    },
     (next) => {
       apply(next);
-      notify(value ? '账号权限已开启：未授权的账号看不到在线内容' : '账号权限已关闭', 'ok');
+      // 以后端返回的状态为准：字段名对不上时接口也回 200，不能只看请求参数。
+      if (next.enabled === value) {
+        notify(value ? '账号权限已开启：未授权的账号看不到在线内容' : '账号权限已关闭', 'ok');
+      } else {
+        notify('开关没有生效，请刷新页面后重试', 'err');
+      }
       void refresh();
     },
   );
@@ -94,7 +113,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
   const saveGrant = () => {
     if (!active) return;
     const subject = status?.subjects.find((s) => s.id === active);
-    return run('grant', () => api.aclGrant(active, libs, sources, subject?.name),
+    return run('grant', () => api.aclGrant(active, libs, sources, subject?.name, online),
       (next) => {
         apply(next, active);
         notify('授权已保存并即时生效', 'ok');
@@ -105,9 +124,20 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
     if (!active) return;
     return run('revoke', () => api.aclRevoke(active), (next) => {
       apply(next, active);
-      notify('已清空该账号的全部授权', 'ok');
+      notify('已恢复默认策略（不再单独限制该账号）', 'ok');
     });
   };
+
+  const saveDefaults = (key: 'visible' | 'online', value: boolean) => run(
+    'defaults',
+    () => api.aclConfig(key === 'visible'
+      ? { acl_default_visible: value }
+      : { acl_default_online: value }),
+    (next) => {
+      apply(next, active);
+      notify('默认策略已保存', 'ok');
+    },
+  );
 
   const bind = () => {
     if (!bindUid) return;
@@ -136,7 +166,11 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
 
   const removeSubject = (uid: string) => run('del', () => api.aclDelSubject(uid), (next) => {
     apply(next);
-    notify('已从清单移除（授权记录保留，重新添加即可恢复）', 'ok');
+    const still = next.subjects.some((s) => s.id === uid);
+    notify(still
+      ? '这是官方媒体库里的账号，不能删除；如需限制请取消它的全部授权'
+      : '已删除该账号，并清掉了它的授权与设备绑定',
+    still ? 'err' : 'ok');
   });
 
   const discover = () => run('discover', async () => {
@@ -150,7 +184,8 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
 
   const enabled = !!status?.enabled;
   const subject = status?.subjects.find((s) => s.id === active);
-  const grant = status?.grants[active] || { libs: [], sources: [] };
+  const grant = status?.grants[active];
+  const configured = !!grant;
   const boundHere = status?.me.fp
     ? status.devices.some((d) => d.fp === status.me.fp)
     : false;
@@ -160,8 +195,9 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
       <div className="page-head">
         <h1>账号权限</h1>
         <p className="page-desc">
-          按飞牛影视账号控制「能看到哪些虚拟媒体库」和「能搜索/播放哪些片源」。
-          开启后未授权的账号看不到对应内容；官方本地媒体库不受影响。
+          按飞牛影视账号控制「能看到哪些虚拟媒体库」和「能不能用在线搜索/播放」。
+          账号自动读取、身份自动识别；没单独配置的账号按下方「默认策略」处理。
+          官方本地媒体库不受影响。
         </p>
       </div>
 
@@ -170,21 +206,21 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
           <div className="row">
             <span className="badge">未启用</span>
             <span className="small">
-              当前所有账号看到相同的在线内容。开启前请先在下方给账号勾选授权，
-              否则开启瞬间所有账号（含管理员）的在线内容都会消失。
+              当前所有账号看到相同的在线内容。默认策略是「放行」，所以随时可以
+              打开总开关，不会让任何人瞬间看不到东西；要限制谁，再去单独取消勾选。
             </span>
           </div>
         </section>
       )}
 
-      {status && enabled && !status.me.known && (
+      {status && enabled && !status.me.known && status.subjects.length === 0 && (
         <section className="card">
           <div className="row">
-            <span className="badge danger">当前设备未识别</span>
+            <span className="badge danger">没有读到官方账号</span>
             <span className="small">
-              {REASON_TEXT[status.me.reason] || '当前设备没有被识别'}。
-              在线内容已隐藏。请在下方「当前设备绑定」里把本设备绑定到一个账号，
-              或先关闭账号权限。
+              {REASON_TEXT[status.me.reason] || '官方库不可读'}。
+              请确认已安装飞牛影视并登录过，然后点「重新自检」。此时各客户端都会
+              被当作未授权，看不到在线内容。
             </span>
           </div>
         </section>
@@ -212,6 +248,12 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
             重新自检
           </button>
         </div>
+        {status && enabled && !status.me.known && (
+          <div className="small mt">
+            这只是「当前浏览器」的身份 —— 管理页本身不带影视登录凭证，属正常。
+            飞牛影视 App / TV 端按各自的登录凭证自动识别，不受这里影响。
+          </div>
+        )}
         {probe && (
           <div className="stack mt">
             <div className="small">
@@ -248,6 +290,33 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
       </section>
 
       <section className="card">
+        <div className="card-title">默认策略</div>
+        <p className="card-sub">
+          没有单独配置的账号（包括暂时没识别出身份的客户端）按这里处理。
+          默认全放行，所以开总开关是安全的；想默认收紧就取消勾选，再给需要的
+          账号单独放开。
+        </p>
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox"
+            checked={!!status?.defaults.visible}
+            disabled={busy === 'defaults'}
+            onChange={(e) => void saveDefaults('visible', e.target.checked)}
+          />
+          <span>默认可看虚拟媒体库</span>
+        </label>
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox"
+            checked={!!status?.defaults.online}
+            disabled={busy === 'defaults'}
+            onChange={(e) => void saveDefaults('online', e.target.checked)}
+          />
+          <span>默认可在线搜索与播放</span>
+        </label>
+      </section>
+
+      <section className="card">
         <div className="card-title">
           账号授权
           {status && <span className="small" style={{ marginLeft: 8, fontWeight: 400 }}>
@@ -255,9 +324,9 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
           </span>}
         </div>
         <p className="card-sub">
-          账号由飞牛影视媒体库自动读取（含管理员标记），无需手工添加；
-          勾选某个账号可看的虚拟库、可用的片源。未勾选 = 看不到、搜不到、
-          播不了；片源还要求全局处于启用状态。
+          账号由飞牛影视媒体库自动读取（含管理员标记），无需手工添加。给某个账号
+          勾选可看的虚拟库、可用的片源并保存，就是给它单独配置；点「恢复默认策略」
+          回到上面的默认处理。官方本地媒体库始终不受限制。
         </p>
         {status && (status.unassigned_subjects > 0 || status.unassigned_sources > 0) && (
           <div className="pill-row mb">
@@ -288,7 +357,9 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
             )}
             {status?.subjects.map((item) => {
               const g = status.grants[item.id];
-              const count = (g?.libs?.length || 0) + (g?.sources?.length || 0);
+              const summary = !g ? '默认'
+                : g.online === false ? '在线禁用'
+                  : `${g.libs?.length ?? '默认'}库`;
               return (
                 <div key={item.id} className="row" style={{ gap: 6 }}>
                   <button
@@ -304,6 +375,11 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                           管理员
                         </span>
                       )}
+                      {item.source !== 'manual' && (
+                        <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.8 }}>
+                          官方
+                        </span>
+                      )}
                       {item.source === 'manual' && (
                         <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.8 }}>
                           手动
@@ -311,7 +387,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                       )}
                     </span>
                     <span style={{ fontSize: 12, opacity: 0.95, fontWeight: 400 }}>
-                      {count ? `${g?.libs?.length || 0}库/${g?.sources?.length || 0}源` : '未授权'}
+                      {summary}
                     </span>
                   </button>
                   {item.source === 'manual' && (
@@ -356,9 +432,9 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                   <strong>{subject.name}</strong>
                   <span className="small">id: {subject.id}</span>
                   <span className="small">
-                    {grant.libs.length || grant.sources.length
-                      ? `当前已授权 ${grant.libs.length} 库 / ${grant.sources.length} 源`
-                      : '当前没有任何授权'}
+                    {configured
+                      ? `已单独配置：${libs.length} 库 / ${online ? `${sources.length} 源` : '在线已禁用'}`
+                      : '未单独配置，按默认策略'}
                   </span>
                 </div>
 
@@ -412,6 +488,18 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                 </div>
 
                 <div className="divider" />
+                <label className="row" style={{ cursor: 'pointer' }}>
+                  <input
+                    className="check" type="checkbox" checked={online}
+                    onChange={(e) => setOnline(e.target.checked)}
+                  />
+                  <span>允许该账号在线搜索与播放</span>
+                  <span className="small">
+                    关掉后该账号只能用官方本地媒体库，看不到也搜不到在线内容
+                  </span>
+                </label>
+
+                <div className="divider" />
                 <div className="row">
                   <label className="field" style={{ margin: 0 }}>片源</label>
                   <button className="btn sm ghost" onClick={() => setSources(
@@ -419,7 +507,11 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                       : (status?.sources.map((s) => s.id) || []))}>
                     {sources.length === (status?.sources.length || 0) ? '全不选' : '全选'}
                   </button>
-                  <span className="small">未勾选的源：搜索结果不出现，也不能播放</span>
+                  <span className="small">
+                    {online
+                      ? '未勾选的源：搜索结果不出现，也不能播放'
+                      : '在线已禁用，下面的源暂不生效'}
+                  </span>
                 </div>
                 <div className="stack">
                   {status?.sources.map((src) => (
@@ -427,6 +519,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                       <input
                         className="check" type="checkbox"
                         checked={sources.includes(src.id)}
+                        disabled={!online}
                         onChange={(e) => setSources((cur) => e.target.checked
                           ? [...new Set([...cur, src.id])]
                           : cur.filter((id) => id !== src.id))}
@@ -440,7 +533,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
 
                 <div className="row end mt">
                   <button className="btn sm danger" disabled={busy === 'revoke'}
-                          onClick={() => void revoke()}>清空授权</button>
+                          onClick={() => void revoke()}>恢复默认策略</button>
                   <button className="btn primary" disabled={busy === 'grant'}
                           onClick={() => void saveGrant()}>
                     {busy === 'grant' ? '保存中…' : '保存授权'}

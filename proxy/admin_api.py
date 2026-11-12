@@ -51,9 +51,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.12"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.13"
     except OSError:
-        return "0.0.1.12"
+        return "0.0.1.13"
 
 
 def _public_config() -> dict:
@@ -421,17 +421,30 @@ async def acl_config(request: Request):
     guard(request)
     body = await body_json(request)
     cfg = config.get()
-    turning_on = bool(body.get("enabled")) and not cfg.get("acl_enabled")
-    if turning_on:
-        # 冷启动死锁防护：没有任何授权就开启，等于所有账号（含管理员）在线
-        # 内容瞬间全部消失，且很难自救。
-        grants = cfg.get("acl_grants") or {}
-        if not any((g or {}).get("libs") or (g or {}).get("sources")
-                   for g in grants.values()):
-            return fail("请先给至少一个账号勾选媒体库或片源，再开启账号权限")
+    # 兼容两种字段名：管理页发 enabled，配置键叫 acl_enabled。只认其中一种
+    # 会导致「勾了总开关又弹回未勾选」，而且因为返回 200 连报错都没有。
     if "enabled" in body:
-        cfg["acl_enabled"] = bool(body["enabled"])
-    for key in ("acl_subjects", "acl_grants", "acl_devices"):
+        wanted = bool(body.get("enabled"))
+    elif "acl_enabled" in body:
+        wanted = bool(body.get("acl_enabled"))
+    else:
+        wanted = None
+    turning_on = bool(wanted) and not cfg.get("acl_enabled")
+    if turning_on:
+        # 只有「默认全禁 + 一条授权都没有」才会出现瞬间全员无内容、
+        # 连管理员也救不回来的死锁；默认放行时开启是安全的，不拦。
+        grants = cfg.get("acl_grants") or {}
+        defaults_deny = (not cfg.get("acl_default_visible", True)
+                         and not cfg.get("acl_default_online", True))
+        if defaults_deny and not any(
+                (g or {}).get("libs") or (g or {}).get("sources")
+                for g in grants.values()):
+            return fail("默认策略是全禁，请先给至少一个账号勾选媒体库或片源，"
+                        "或把默认策略改成放行，再开启账号权限")
+    if wanted is not None:
+        cfg["acl_enabled"] = wanted
+    for key in ("acl_subjects", "acl_grants", "acl_devices",
+                "acl_default_visible", "acl_default_online"):
         if key in body:
             cfg[key] = body[key]
     config.save(cfg)
@@ -451,8 +464,14 @@ async def acl_grant(request: Request):
         return fail("请先选择账号")
     cfg = config.get()
     grants = dict(cfg.get("acl_grants") or {})
-    grants[uid] = {"libs": body.get("libs") or [],
-                   "sources": body.get("sources") or []}
+    entry: dict = {}
+    if "libs" in body:
+        entry["libs"] = body.get("libs") or []
+    if "sources" in body:
+        entry["sources"] = body.get("sources") or []
+    if "online" in body:
+        entry["online"] = bool(body.get("online"))
+    grants[uid] = entry
     cfg["acl_grants"] = grants
     if body.get("name"):
         subjects = [dict(s) for s in (cfg.get("acl_subjects") or [])]
@@ -496,11 +515,28 @@ async def acl_add_subject(request: Request):
 
 @router.delete("/acl/subjects/{uid}")
 async def acl_del_subject(uid: str, request: Request):
+    """从清单移除账号，并连带清掉它的授权与设备绑定。
+
+    只删 ``acl_subjects`` 是不够的：``acl.subjects()`` 会把「仍有授权」或
+    「仍有设备绑定」的 uid 重新补回清单，表现就是「删了还在」。显式删除
+    视为彻底移除；授权需要保留时请用「清空授权」而不是删账号。
+    """
     guard(request)
     cfg = config.get()
+    before = dict(cfg.get("acl_grants") or {})
     cfg["acl_subjects"] = [s for s in (cfg.get("acl_subjects") or [])
                            if str(s.get("id")) != uid]
+    grants = dict(before)
+    dropped = grants.pop(uid, None) is not None
+    cfg["acl_grants"] = grants
+    devices = {fp: rec for fp, rec in (cfg.get("acl_devices") or {}).items()
+               if str((rec or {}).get("uid") or "") != uid}
+    unbind = len(devices) != len(cfg.get("acl_devices") or {})
+    cfg["acl_devices"] = devices
     config.save(cfg)
+    acl.invalidate(uid)
+    runtime.log(f"acl: del subject {uid} grants={'yes' if dropped else 'no'} "
+                f"devices={'yes' if unbind else 'no'}")
     return ok(_acl_payload())
 
 

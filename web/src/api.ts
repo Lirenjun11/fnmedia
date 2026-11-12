@@ -61,8 +61,10 @@ export interface AclSubject {
 }
 
 export interface AclGrant {
-  libs: string[];
-  sources: string[];
+  // 键不存在 = 该账号未单独配置（按默认策略）；空数组 = 明确一个都不给。
+  libs?: string[];
+  sources?: string[];
+  online?: boolean;
 }
 
 export interface AclLib {
@@ -89,6 +91,7 @@ export interface AclMe {
 
 export interface AclStatus {
   enabled: boolean;
+  defaults: { visible: boolean; online: boolean };
   subjects: AclSubject[];
   grants: Record<string, AclGrant>;
   devices: { fp: string; uid: string; ua: string; ts: number }[];
@@ -302,10 +305,17 @@ export const api = {
   vlibClear: () => request<VlibStatus>('/v/api/ext/vlib/cache', { method: 'DELETE' }),
   aclStatus: () => request<AclStatus>('/v/api/ext/acl/status'),
   aclProbe: () => request<AclProbe>('/v/api/ext/acl/probe'),
-  aclConfig: (value: Partial<Pick<Config, 'acl_enabled' | 'acl_subjects' | 'acl_grants'>>) =>
+  // 后端 PATCH /acl/config 的开关字段叫 enabled（配置键是 acl_enabled）。
+  // 之前这里发 acl_enabled 会被后端忽略，接口仍回 200，表现是「勾了又弹回」。
+  aclConfig: (value: {
+    enabled?: boolean; acl_subjects?: unknown; acl_grants?: unknown;
+    acl_default_visible?: boolean; acl_default_online?: boolean;
+  }) =>
     request<AclStatus>('/v/api/ext/acl/config', json('PATCH', value)),
-  aclGrant: (uid: string, libs: string[], sources: string[], name?: string) =>
-    request<AclStatus>('/v/api/ext/acl/grant', json('POST', { uid, libs, sources, name })),
+  aclGrant: (uid: string, libs: string[], sources: string[], name?: string,
+    online = true) =>
+    request<AclStatus>('/v/api/ext/acl/grant',
+      json('POST', { uid, libs, sources, name, online })),
   aclRevoke: (uid: string) =>
     request<AclStatus>(`/v/api/ext/acl/grant/${encodeURIComponent(uid)}`, { method: 'DELETE' }),
   aclAddSubject: (id: string, name: string) =>
