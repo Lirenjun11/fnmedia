@@ -41,6 +41,7 @@ export interface Config {
   adfilter_head_skip: number;
   adfilter_head_guard: boolean;
   adfilter_breaks: boolean;
+  adfilter_strong: boolean;
 }
 
 export interface Bootstrap {
@@ -94,6 +95,7 @@ export interface AdPreview {
   by_tiny: number;
   by_minority: number;
   groups: { group: number; count: number; duration: number }[];
+  disc_cleaned: number;
   guard: string;
   guard_kept: number;
   sample: string;

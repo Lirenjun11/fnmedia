@@ -263,7 +263,7 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
     if not keyword or not sources:
         return []
     hit = _CACHE.get(keyword)
-    if hit and time.monotonic() - hit[0] < _CACHE_TTL:
+    if hit and hit[1] and time.monotonic() - hit[0] < _CACHE_TTL:
         return hit[1]
     task = _INFLIGHT.get(keyword)
     if task and not task.done():
@@ -288,7 +288,7 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
                 try:
                     found.extend(await asyncio.wait_for(fut, timeout=remain))
                 except Exception:  
-                    break
+                    continue
                 if len(found) >= enough:
                     break
         finally:
@@ -301,9 +301,10 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
             if key not in seen:
                 seen.add(key)
                 dedup.append(item)
-        if len(_CACHE) > 200:
-            _CACHE.clear()
-        _CACHE[keyword] = (time.monotonic(), dedup)
+        if dedup:
+            if len(_CACHE) > 200:
+                _CACHE.clear()
+            _CACHE[keyword] = (time.monotonic(), dedup)
         return dedup
 
     task = asyncio.create_task(run())

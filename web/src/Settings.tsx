@@ -147,6 +147,7 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
         adfilter_head_skip: Number(form.adfilter_head_skip),
         adfilter_head_guard: Boolean(form.adfilter_head_guard),
         adfilter_breaks: Boolean(form.adfilter_breaks),
+        adfilter_strong: Boolean(form.adfilter_strong),
         adfilter_keywords: keywords
           .split(/[\n,]/)
           .map((word) => word.trim())
@@ -203,10 +204,19 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
           />
           <span>识别 DISCONTINUITY 分隔的短广告段（主流播放器做法）</span>
         </label>
+        <label className="row mt" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.adfilter_strong}
+            onChange={(e) => set('adfilter_strong', e.target.checked)}
+          />
+          <span>强证据识别：重复分片 / 极短追踪分片 / 少数派域名</span>
+        </label>
         <p className="hint mt">
           分段识别按 DISCONTINUITY 把清单切组，仅当某组 3–15 片、3–120 秒、
           且不足最长组 5% 时才判为广告；单组或分组过密的清单不处理。
-          另含重复分片、极短追踪分片、长清单中的少数派域名三类强证据。
+          强证据为无条件自动推断，误判风险同源，故与分段识别分开独立开关；
+          若某源会循环复用正片分片，单独关掉它即可。
+          删除广告段后清理其出口处残留的 DISCONTINUITY 标签，正片内部合法切换保留。
           一次删除超过 20%（分段规则）或半数时长、或会删空清单时，整次过滤自动回退。
         </p>
         <div className="grid mt">
@@ -267,7 +277,7 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
                   <span className="small">
                     命中：标记 {item.by_marker} / 关键字 {item.by_keyword} / 片头 {item.by_head} /
                     分段 {item.by_break} / 重复 {item.by_duplicate} / 极短 {item.by_tiny} /
-                    少数域名 {item.by_minority}
+                    少数域名 {item.by_minority} / 清理标记 {item.disc_cleaned}
                   </span>
                 </div>
                 {(item.groups || []).length > 1 && (

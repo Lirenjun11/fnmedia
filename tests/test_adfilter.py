@@ -85,7 +85,8 @@ def reset(**overrides):
     cfg = config.get()
     cfg.update({"adfilter_enabled": False, "adfilter_markers": True,
                 "adfilter_keywords": [], "adfilter_head_skip": 0.0,
-                "adfilter_head_guard": True, "adfilter_breaks": True})
+                "adfilter_head_guard": True, "adfilter_breaks": True,
+                "adfilter_strong": True})
     cfg.update(overrides)
     config.save(cfg)
 
@@ -391,6 +392,69 @@ class AdFilterTest(unittest.TestCase):
         self.assertEqual(item["by_break"], 3)
         self.assertEqual(len(item["groups"]), 3)
         self.assertEqual(item["dropped"][0]["reason"], "break")
+
+
+    def test_strong_switch_disables_three_evidence_rules(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0,
+              adfilter_breaks=True, adfilter_strong=False)
+        playlist = PLAYLIST.replace(
+            "https://cdn.example.com/vod/part2.ts",
+            "https://cdn.example.com/vod/part1.ts")
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 0)
+        self.assertEqual(stats["by_duplicate"], 0)
+
+    def test_breaks_switch_does_not_disable_strong_rules(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0,
+              adfilter_breaks=False, adfilter_strong=True)
+        playlist = PLAYLIST.replace(
+            "https://cdn.example.com/vod/part2.ts",
+            "https://cdn.example.com/vod/part1.ts")
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_duplicate"], 1)
+        self.assertEqual(stats["by_break"], 0)
+
+    def test_ad_exit_discontinuity_cleaned_content_switch_kept(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=["/ad/"], adfilter_head_skip=0.0,
+              adfilter_breaks=False, adfilter_strong=False)
+        playlist = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:10.0,
+https://cdn.example.com/vod/c1.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:10.0,
+https://cdn.example.com/vod/c2.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:5.0,
+https://cdn.example.com/ad/a1.ts
+#EXTINF:5.0,
+https://cdn.example.com/ad/a2.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:10.0,
+https://cdn.example.com/vod/c3.ts
+#EXT-X-ENDLIST
+"""
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 2)
+        self.assertEqual(stats["disc_cleaned"], 1)
+        self.assertEqual(text.count("#EXT-X-DISCONTINUITY"), 1)
+        self.assertNotIn("ad/a1.ts", text)
+        self.assertIn("vod/c3.ts", text)
+
+    def test_no_discontinuity_cleaned_without_deletion(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0,
+              adfilter_breaks=False, adfilter_strong=False)
+        playlist = build_playlist([CONTENT, CONTENT])
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 0)
+        self.assertEqual(stats["disc_cleaned"], 0)
+        self.assertEqual(text.count("#EXT-X-DISCONTINUITY"), 1)
 
 
 if __name__ == "__main__":

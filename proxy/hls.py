@@ -69,13 +69,14 @@ def ad_rules() -> dict:
         "head_skip": max(0.0, min(120.0, head_skip)),
         "head_guard": bool(cfg.get("adfilter_head_guard", True)),
         "breaks": bool(cfg.get("adfilter_breaks", True)),
+        "strong": bool(cfg.get("adfilter_strong", True)),
     }
 
 
 def ad_rules_active(rules: dict) -> bool:
     return bool(rules["enabled"] and (
         rules["markers"] or rules["keywords"] or rules["head_skip"] > 0
-        or rules["breaks"]))
+        or rules["breaks"] or rules["strong"]))
 
 
 def _same_stream(left: str, right: str) -> bool:
@@ -127,7 +128,7 @@ def strip_ads(text: str, base_url: str = "",
              "total_duration": 0.0, "by_marker": 0, "by_keyword": 0,
              "by_head": 0, "by_break": 0, "by_duplicate": 0, "by_tiny": 0,
              "by_minority": 0, "guard_kept": 0, "guard": "", "sample": "",
-             "dropped": [], "groups": []}
+             "dropped": [], "groups": [], "disc_cleaned": 0}
     lines = text.splitlines()
     total_duration = sum(_extinf_duration(row) for row in lines)
     stats["total_duration"] = total_duration
@@ -181,29 +182,30 @@ def strip_ads(text: str, base_url: str = "",
         marker_hit = False
     tail = pending
 
-    # Duplicate URIs and sub-half-second tracking segments are strong,
-    # request-free signals used by mainstream CMS ad filters.
-    seen: set[str] = set()
-    for rec in records:
-        if rec["reason"]:
-            continue
-        if rec["abs"] in seen:
-            rec["reason"] = "duplicate"
-        elif _is_tracking_segment(rec["abs"], rec["duration"]):
-            rec["reason"] = "tiny"
-        seen.add(rec["abs"])
+    # Strong evidence rules share one switch: all three are unconditional
+    # inferences with the same false-positive risk, separate from grouping.
+    if rules["strong"]:
+        seen: set[str] = set()
+        for rec in records:
+            if rec["reason"]:
+                continue
+            if rec["abs"] in seen:
+                rec["reason"] = "duplicate"
+            elif _is_tracking_segment(rec["abs"], rec["duration"]):
+                rec["reason"] = "tiny"
+            seen.add(rec["abs"])
 
-    # A host appearing at most twice in a long playlist is usually an
-    # injected ad server, not a CDN mirror.
-    if len(records) >= 20:
-        counts: dict[str, int] = {}
-        for rec in records:
-            counts[rec["host"]] = counts.get(rec["host"], 0) + 1
-        main_host = max(counts, key=counts.get) if counts else ""
-        for rec in records:
-            if (not rec["reason"] and rec["host"] != main_host
-                    and counts[rec["host"]] <= 2):
-                rec["reason"] = "minority"
+        # A host appearing at most twice in a long playlist is usually an
+        # injected ad server, not a CDN mirror.
+        if len(records) >= 20:
+            counts: dict[str, int] = {}
+            for rec in records:
+                counts[rec["host"]] = counts.get(rec["host"], 0) + 1
+            main_host = max(counts, key=counts.get) if counts else ""
+            for rec in records:
+                if (not rec["reason"] and rec["host"] != main_host
+                        and counts[rec["host"]] <= 2):
+                    rec["reason"] = "minority"
 
     # Conservative discontinuity-group heuristic: only short groups next to
     # much longer content groups, with several conditions all true.
@@ -268,7 +270,7 @@ def strip_ads(text: str, base_url: str = "",
         return text, stats
 
     out: list[str] = []
-    for rec in records:
+    for index, rec in enumerate(records):
         if rec["reason"]:
             stats["removed"] += 1
             stats["removed_duration"] += rec["duration"]
@@ -287,9 +289,19 @@ def strip_ads(text: str, base_url: str = "",
             out.append(_AD_PLACEHOLDER)
         else:
             stats["kept_duration"] += rec["duration"]
-            tags = [row for row in rec["tags"]
-                    if not (row.strip().upper().startswith("#EXT-X-CUE-")
-                            or row.strip().upper().startswith("#EXT-X-DATERANGE"))]
+            prev_removed = index > 0 and bool(records[index - 1]["reason"])
+            tags = []
+            for row in rec["tags"]:
+                upper = row.strip().upper()
+                if (upper.startswith("#EXT-X-CUE-")
+                        or upper.startswith("#EXT-X-DATERANGE")):
+                    continue
+                # A discontinuity right after a removed ad group is an ad
+                # exit marker; keeping it makes players re-init decoders.
+                if upper == "#EXT-X-DISCONTINUITY" and prev_removed:
+                    stats["disc_cleaned"] += 1
+                    continue
+                tags.append(row)
             out.extend(tags)
             out.append(rec["uri"])
     out.extend(tail)
@@ -533,6 +545,7 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                 f"o{ad_stats['by_minority']} "
                 f"guard={ad_stats['guard'] or '-'} "
                 f"guarded={ad_stats['guard_kept']} "
+                f"disc={ad_stats['disc_cleaned']} "
                 f"sample={ad_stats['sample'][:80]}")
             _AD_PREVIEWS.append({
                 "ts": time.time(),
@@ -548,6 +561,7 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                 "by_tiny": ad_stats["by_tiny"],
                 "by_minority": ad_stats["by_minority"],
                 "groups": ad_stats["groups"],
+                "disc_cleaned": ad_stats["disc_cleaned"],
                 "guard": ad_stats["guard"],
                 "guard_kept": ad_stats["guard_kept"],
                 "sample": ad_stats["sample"],
