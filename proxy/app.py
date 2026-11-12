@@ -384,6 +384,11 @@ async def item_detail_query(request: Request):
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
     store = request.app.state.store
+    lib_item = vlib.library_item(guid)
+    if lib_item:
+        # 进入媒体库先要库根节点；透传会拿到官方 -6「此媒体库不存在」。
+        return JSONResponse(fake.ok(
+            fake.normalize_detail(lib_item, _ua(request))))
     if charts.chart_cache.is_chart_guid(guid):
         row = await vlib.detail(store, request.app.state.src, guid)
         if row:

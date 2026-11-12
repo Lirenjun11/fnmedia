@@ -149,6 +149,38 @@ def library_detail(guid: str) -> dict | None:
     }
 
 
+def library_item(guid: str) -> dict | None:
+    """``GET /v/api/v1/item/{库guid}`` 的库根节点；非虚拟库返回 None。
+
+    官方 Web/App 进入媒体库时先请求 item/<库guid>，透传给官方后端会拿到
+    ``code=-6“此媒体库不存在”``，页面直接报错——必须在透传前拦截，
+    返回 type=MediaDB 的库根节点，客户端才会接着调 item/list 出海报墙。
+    """
+    detail = library_detail(guid)
+    if detail is None:
+        return None
+    row = _blank_card(guid, detail["name"])
+    total = sum_counts().get(guid, 0)
+    row.update({
+        "type": "MediaDB",
+        "poster": detail.get("poster") or "",
+        "posters": list(detail.get("posters") or []),
+        "backdrops": detail.get("poster") or "",
+        "category": detail.get("category") or "",
+        "can_play": 1,
+        "play_item_guid": "",
+        "play_error": "",
+        "number_of_episodes": total,
+        "local_number_of_episodes": total,
+        "ancestor_guid": "",
+        "ancestor_name": "",
+        "ancestor_category": "",
+        "logic_type": 0,
+        "status": "在线",
+    })
+    return row
+
+
 def sum_counts() -> dict[str, int]:
     counts: dict[str, int] = {}
     if charts_enabled():

@@ -150,6 +150,35 @@ class VlibTest(unittest.TestCase):
         self.assertEqual(summary[vlib.CHART_LIB_GUIDS["tv"]], 3)
         self.assertEqual(summary["total"], 10 + 10)
 
+    def test_library_root_item_is_mediadb(self):
+        """进入媒体库先请求 item/<库guid>，必须回 MediaDB 根节点而不是透传。"""
+        upstream = JSONResponse({"code": -6, "msg": "此媒体库不存在",
+                                 "data": None})
+        with patch("app._passthrough", AsyncMock(return_value=upstream)):
+            with TestClient(appmod.app) as client:
+                for cat, count in (("movie", 4), ("tv", 3)):
+                    payload = client.get(
+                        f"/v/api/v1/item/{vlib.CHART_LIB_GUIDS[cat]}").json()
+                    self.assertEqual(payload["code"], 0)
+                    row = payload["data"]
+                    self.assertEqual(row["type"], "MediaDB")
+                    self.assertEqual(row["number_of_episodes"], count)
+                    self.assertEqual(row["play_item_guid"], "")
+                    self.assertEqual(row["ancestor_guid"], "")
+                    self.assertIn("热门", row["title"])
+
+    def test_disabled_library_root_falls_through(self):
+        cfg = config.get()
+        cfg.update({"vlib_charts": False})
+        config.save(cfg)
+        upstream = JSONResponse({"code": -6, "msg": "此媒体库不存在",
+                                 "data": None})
+        with patch("app._passthrough", AsyncMock(return_value=upstream)):
+            with TestClient(appmod.app) as client:
+                payload = client.get(
+                    f"/v/api/v1/item/{vlib.CHART_LIB_GUIDS['movie']}").json()
+        self.assertEqual(payload["code"], -6)
+
     # ---------------------------------------------------------- 榜单分页
     def test_chart_item_list_pages(self):
         with TestClient(appmod.app) as client:
