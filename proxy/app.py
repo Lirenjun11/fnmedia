@@ -447,6 +447,9 @@ async def _item_title_detail(brief: dict, guid: str, request: Request):
                 brief.get("title"), brief.get("year"))
         except Exception as exc:
             runtime.log(f"douban enrich error: {type(exc).__name__}")
+    # 豆瓣补图与官方库借用的海报都是外链，必须转成本站代理，否则客户端
+    # 直连图床被防盗链拦掉，详情页顶部背景只剩黑色。
+    detail = fake.adopt_images(detail)
     detail = playstate.apply(detail, guid)
     runtime.log(f"detail poster: {str(detail.get('posters'))[:100]!r} "
                 f"backdrops={str(detail.get('backdrops'))[:100]!r}")

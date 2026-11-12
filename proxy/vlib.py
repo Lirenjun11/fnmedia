@@ -549,7 +549,7 @@ async def detail(store: cms.TitleStore, client, guid: str) -> dict | None:
     chart_meta = brief.get("chart") or {}
     if chart_meta.get("desc"):
         data["overview"] = chart_meta["desc"]
-    return playstate.apply(data, guid)
+    return playstate.apply(fake.adopt_images(data), guid)
 
 
 # 供后台刷新使用的最新请求客户端（app 启动时注册，避免模块循环导入）。

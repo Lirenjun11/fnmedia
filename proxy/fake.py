@@ -59,6 +59,55 @@ def poster_path(url: str) -> str:
     return f"/online/{token}.jpg"
 
 
+# 卡片/详情里所有图片字段都必须走本站代理：豆瓣、TMDB 等图床都有 Referer
+# 防盗链，客户端直连只会拿到 403，详情页顶部背景就是一片黑。
+IMAGE_FIELDS = ("poster", "backdrops", "posters", "logos")
+_URL_RE = re.compile(r"https?://[^\s,\[\]\"'<>]+")
+_PROXY_RE = re.compile(r"/online/[A-Za-z0-9_\-]+\.jpg")
+
+
+def adopt_images(row: dict) -> dict:
+    """把图片字段统一成客户端可访问的地址。
+
+    1. 外链（豆瓣 / TMDB / 官方图床）换成 /online/<token>.jpg，由本站带
+       Referer 取图，绕开防盗链；
+    2. 既不是外链、也不是以 / 开头的相对路径（官方库里常见的图片 ID 或
+       hash），客户端拼出来必然是 404，直接退回 CMS 海报；
+    3. poster 字段本身始终是我们生成的代理地址，可作为最终兜底。
+    """
+    for key in IMAGE_FIELDS:
+        value = row.get(key)
+        if isinstance(value, str):
+            if "http" not in value:
+                continue
+            row[key] = _URL_RE.sub(lambda m: poster_path(m.group(0)), value)
+        elif isinstance(value, list):
+            row[key] = [poster_path(v) if isinstance(v, str) and
+                        v.startswith("http") else v for v in value]
+    fallback = str(row.get("poster") or "")
+    if not fallback:
+        backdrops = row.get("backdrops")
+        if isinstance(backdrops, str):
+            # CMS 没给海报、但借到了外链剧照：取第一张反哺海报位
+            # （backdrops 可能是 JSON 数组字符串，不能整段塞进 poster）。
+            hit = _PROXY_RE.search(backdrops)
+            if hit:
+                row["poster"] = hit.group(0)
+                fallback = hit.group(0)
+    for key in ("backdrops", "posters"):
+        value = row.get(key)
+        if isinstance(value, list):
+            if not any(str(v or "").strip() for v in value):
+                row[key] = fallback
+            continue
+        text = str(value or "").strip()
+        if not text:
+            row[key] = fallback
+        elif not text.startswith("/") and "/online/" not in text:
+            row[key] = fallback
+    return row
+
+
 def is_tv_client(ua: str) -> bool:
     low = (ua or "").lower()
     return "com.trim.tv" in low or "trim.tv" in low
