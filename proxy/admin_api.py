@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 import cms
 import config
+import hls
 import runtime
 import subscription
 import upcheck
@@ -46,9 +47,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.2"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.3"
     except OSError:
-        return "0.0.1.2"
+        return "0.0.1.3"
 
 
 def _public_config() -> dict:
@@ -362,6 +363,12 @@ async def clear_cache(request: Request):
 @router.get("/logs")
 async def logs(request: Request):
     return ok({"logs": runtime.recent(int(request.query_params.get("limit", 100)))})
+
+
+@router.get("/adfilter/preview")
+async def adfilter_preview(request: Request):
+    guard(request)
+    return ok({"previews": hls.recent_ad_previews(3)})
 
 
 @router.get("/export")

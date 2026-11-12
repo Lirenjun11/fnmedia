@@ -37,6 +37,8 @@ DEFAULTS = {
     "adfilter_markers": True,
     "adfilter_keywords": [],
     "adfilter_head_skip": 0.0,
+    "adfilter_head_guard": True,
+    "adfilter_breaks": True,
 }
 
 _NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 10.0),
@@ -116,6 +118,8 @@ def save(cfg: dict) -> dict:
     clean["allow_intranet"] = bool(clean["allow_intranet"])
     clean["adfilter_enabled"] = bool(clean["adfilter_enabled"])
     clean["adfilter_markers"] = bool(clean["adfilter_markers"])
+    clean["adfilter_head_guard"] = bool(clean["adfilter_head_guard"])
+    clean["adfilter_breaks"] = bool(clean["adfilter_breaks"])
     raw_keywords = clean["adfilter_keywords"]
     if not isinstance(raw_keywords, list):
         raw_keywords = []

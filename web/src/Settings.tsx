@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, type Bootstrap, type Config, type UpdateInfo } from './api';
+import { api, type AdPreview, type Bootstrap, type Config, type UpdateInfo } from './api';
 import type { Notify } from './App';
 
 interface Props {
@@ -118,9 +118,25 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
     (boot.config.adfilter_keywords || []).join('\n'),
   );
   const [saving, setSaving] = useState(false);
+  const [previews, setPreviews] = useState<AdPreview[]>([]);
+  const [loadingPreview, setLoadingPreview] = useState(false);
 
   const set = (key: keyof Config, value: number | boolean) =>
     setForm((current) => ({ ...current, [key]: value }));
+
+  const loadPreview = useCallback(async () => {
+    setLoadingPreview(true);
+    try {
+      const data = await api.adfilterPreview();
+      setPreviews(data.previews);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '读取诊断失败', 'err');
+    } finally {
+      setLoadingPreview(false);
+    }
+  }, [notify]);
+
+  useEffect(() => { void loadPreview(); }, [loadPreview]);
 
   async function save() {
     setSaving(true);
@@ -129,6 +145,8 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
         adfilter_enabled: Boolean(form.adfilter_enabled),
         adfilter_markers: Boolean(form.adfilter_markers),
         adfilter_head_skip: Number(form.adfilter_head_skip),
+        adfilter_head_guard: Boolean(form.adfilter_head_guard),
+        adfilter_breaks: Boolean(form.adfilter_breaks),
         adfilter_keywords: keywords
           .split(/[\n,]/)
           .map((word) => word.trim())
@@ -171,6 +189,26 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
           />
           <span>识别显式广告标记（CUE-OUT / CUE-IN、广告 DATERANGE）</span>
         </label>
+        <label className="row mt" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.adfilter_head_guard}
+            onChange={(e) => set('adfilter_head_guard', e.target.checked)}
+          />
+          <span>片头跳过时保护疑似正片分片（推荐开启）</span>
+        </label>
+        <label className="row mt" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.adfilter_breaks}
+            onChange={(e) => set('adfilter_breaks', e.target.checked)}
+          />
+          <span>识别 DISCONTINUITY 分隔的短广告段（主流播放器做法）</span>
+        </label>
+        <p className="hint mt">
+          分段识别按 DISCONTINUITY 把清单切组，仅当某组 3–15 片、3–120 秒、
+          且不足最长组 5% 时才判为广告；单组或分组过密的清单不处理。
+          另含重复分片、极短追踪分片、长清单中的少数派域名三类强证据。
+          一次删除超过 20%（分段规则）或半数时长、或会删空清单时，整次过滤自动回退。
+        </p>
         <div className="grid mt">
           <div>
             <label className="field">片头跳过（秒，0 关闭，最多 120）</label>
@@ -194,6 +232,71 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
             {saving ? '保存中…' : '保存设置'}
           </button>
         </div>
+      </section>
+      <section className="card">
+        <div className="card-title">最近清单诊断</div>
+        <p className="card-sub">
+          进程内保留最近 5 次清单改写记录，不落盘。这里能看到每个被删分片的地址、时长与命中原因。
+        </p>
+        <div className="row mb">
+          <button className="btn sm" disabled={loadingPreview}
+                  onClick={() => void loadPreview()}>
+            {loadingPreview ? '读取中…' : '刷新记录'}
+          </button>
+          <span className="small">仅在启用过滤后出现记录</span>
+        </div>
+        {previews.length === 0 ? (
+          <p className="hint">暂无记录。启用过滤并播放一个订阅源条目后再刷新。</p>
+        ) : (
+          <div className="stack">
+            {previews.slice().reverse().map((item, i) => (
+              <div className="card" key={`${item.ts}-${i}`}>
+                <div className="row">
+                  <span className="small">
+                    {new Date(item.ts * 1000).toLocaleTimeString()}
+                  </span>
+                  <span className="badge">
+                    删除 {item.removed} 片 / {item.removed_duration}s
+                  </span>
+                  <span className="badge ok">
+                    保留 {item.kept_duration}s / 共 {item.total_duration}s
+                  </span>
+                  {item.guard && <span className="badge warn">保护：{item.guard}</span>}
+                </div>
+                <div className="row mt">
+                  <span className="small">
+                    命中：标记 {item.by_marker} / 关键字 {item.by_keyword} / 片头 {item.by_head} /
+                    分段 {item.by_break} / 重复 {item.by_duplicate} / 极短 {item.by_tiny} /
+                    少数域名 {item.by_minority}
+                  </span>
+                </div>
+                {(item.groups || []).length > 1 && (
+                  <p className="hint">
+                    分组：
+                    {item.groups.map((g) => `#${g.group} ${g.count}片/${g.duration}s`).join('，')}
+                  </p>
+                )}
+                {item.guard_kept > 0 && (
+                  <p className="hint mt">
+                    疑似正片分片 {item.guard_kept} 个已被保护，未删除。
+                  </p>
+                )}
+                {item.dropped.length > 0 && (
+                  <div className="log-box mt">
+                    {item.dropped.map((seg, j) => (
+                      <div key={j}>[{seg.reason}] {seg.duration}s {seg.url}</div>
+                    ))}
+                  </div>
+                )}
+                <details className="mt">
+                  <summary className="small">查看清单改写前后片段</summary>
+                  <div className="log-box mt">原始{'\n'}{item.raw_head}</div>
+                  <div className="log-box mt">过滤后{'\n'}{item.kept_head}</div>
+                </details>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
       <section className="card">
         <div className="card-title">边界说明</div>

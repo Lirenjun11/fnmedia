@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 import urllib.parse
+from collections import deque
 
 import httpx
 from fastapi import Request
@@ -29,6 +30,16 @@ _AD_KEEP_TAGS = (
     "#EXT-X-INDEPENDENT-SEGMENTS", "#EXT-X-START", "#EXT-X-ENDLIST",
     "#EXT-X-DISCONTINUITY-SEQUENCE", "#EXT-X-KEY", "#EXT-X-ALLOW-CACHE",
 )
+_AD_MAX_REMOVE_RATIO = 0.5
+_AD_MAX_REMOVED = 40
+_AD_MAX_BREAK_RATIO = 0.20
+_AD_MAX_GROUPS = 10
+_AD_MIN_GROUP_SEGMENTS = 3
+_AD_MAX_GROUP_SEGMENTS = 15
+_AD_MIN_GROUP_DURATION = 3.0
+_AD_MAX_GROUP_DURATION = 120.0
+_AD_MAX_GROUP_RELATIVE = 0.05
+_AD_PREVIEWS: deque = deque(maxlen=5)
 
 
 def _extinf_duration(line: str) -> float:
@@ -56,12 +67,51 @@ def ad_rules() -> dict:
         "keywords": [str(word).strip().lower() for word in keywords[:32]
                      if str(word).strip()],
         "head_skip": max(0.0, min(120.0, head_skip)),
+        "head_guard": bool(cfg.get("adfilter_head_guard", True)),
+        "breaks": bool(cfg.get("adfilter_breaks", True)),
     }
 
 
 def ad_rules_active(rules: dict) -> bool:
     return bool(rules["enabled"] and (
-        rules["markers"] or rules["keywords"] or rules["head_skip"] > 0))
+        rules["markers"] or rules["keywords"] or rules["head_skip"] > 0
+        or rules["breaks"]))
+
+
+def _same_stream(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    a, b = urllib.parse.urlsplit(left), urllib.parse.urlsplit(right)
+    if a.scheme != b.scheme or a.netloc != b.netloc:
+        return False
+    return a.path.rsplit("/", 1)[0] == b.path.rsplit("/", 1)[0]
+
+
+def recent_ad_previews(limit: int = 3) -> list[dict]:
+    return list(_AD_PREVIEWS)[-max(1, min(int(limit), 5)):]
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).netloc.lower()
+    except ValueError:
+        return ""
+
+
+def _is_tracking_segment(url: str, duration: float) -> bool:
+    if not 0 < duration < 0.5:
+        return False
+    path = urllib.parse.urlsplit(url).path.lower()
+    return not path.endswith((".ts", ".m4s", ".mp4", ".m4a", ".aac", ".mp3"))
+
+
+def _group_summary(records: list[dict]) -> dict[int, dict]:
+    groups: dict[int, dict] = {}
+    for rec in records:
+        info = groups.setdefault(rec["group"], {"count": 0, "duration": 0.0})
+        info["count"] += 1
+        info["duration"] += rec["duration"]
+    return groups
 
 
 def strip_ads(text: str, base_url: str = "",
@@ -74,25 +124,37 @@ def strip_ads(text: str, base_url: str = "",
     """
     rules = rules or ad_rules()
     stats = {"removed": 0, "removed_duration": 0.0, "kept_duration": 0.0,
-             "by_marker": 0, "by_keyword": 0, "by_head": 0, "sample": ""}
+             "total_duration": 0.0, "by_marker": 0, "by_keyword": 0,
+             "by_head": 0, "by_break": 0, "by_duplicate": 0, "by_tiny": 0,
+             "by_minority": 0, "guard_kept": 0, "guard": "", "sample": "",
+             "dropped": [], "groups": []}
     lines = text.splitlines()
+    total_duration = sum(_extinf_duration(row) for row in lines)
+    stats["total_duration"] = total_duration
     if not ad_rules_active(rules) or is_master(text):
-        stats["kept_duration"] = sum(_extinf_duration(row) for row in lines)
+        stats["kept_duration"] = total_duration
         return text, stats
 
-    out: list[str] = []
+    head_active = rules["head_skip"] > 0
+    if head_active and "#EXT-X-ENDLIST" not in text:
+        head_active = False
+        stats["guard"] = "head skip ignored: live playlist"
+
+    records: list[dict] = []
     pending: list[str] = []
     cue_ad = False
     marker_hit = False
     elapsed = 0.0
+    group = 0
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            out.append(line)
             continue
         if stripped.startswith("#"):
+            upper = stripped.upper()
+            if upper == "#EXT-X-DISCONTINUITY":
+                group += 1
             if rules["markers"]:
-                upper = stripped.upper()
                 if upper.startswith("#EXT-X-CUE-OUT"):
                     cue_ad = True
                 elif upper.startswith("#EXT-X-CUE-IN"):
@@ -110,24 +172,127 @@ def strip_ads(text: str, base_url: str = "",
         elif rules["keywords"] and any(word in absolute.lower()
                                        for word in rules["keywords"]):
             reason = "keyword"
-        elif rules["head_skip"] > 0 and elapsed < rules["head_skip"]:
+        elif head_active and elapsed < rules["head_skip"]:
             reason = "head"
         elapsed += duration
-        if reason:
+        records.append({"tags": block, "uri": line, "abs": absolute,
+                        "duration": duration, "reason": reason,
+                        "group": group, "host": _host_of(absolute)})
+        marker_hit = False
+    tail = pending
+
+    # Duplicate URIs and sub-half-second tracking segments are strong,
+    # request-free signals used by mainstream CMS ad filters.
+    seen: set[str] = set()
+    for rec in records:
+        if rec["reason"]:
+            continue
+        if rec["abs"] in seen:
+            rec["reason"] = "duplicate"
+        elif _is_tracking_segment(rec["abs"], rec["duration"]):
+            rec["reason"] = "tiny"
+        seen.add(rec["abs"])
+
+    # A host appearing at most twice in a long playlist is usually an
+    # injected ad server, not a CDN mirror.
+    if len(records) >= 20:
+        counts: dict[str, int] = {}
+        for rec in records:
+            counts[rec["host"]] = counts.get(rec["host"], 0) + 1
+        main_host = max(counts, key=counts.get) if counts else ""
+        for rec in records:
+            if (not rec["reason"] and rec["host"] != main_host
+                    and counts[rec["host"]] <= 2):
+                rec["reason"] = "minority"
+
+    # Conservative discontinuity-group heuristic: only short groups next to
+    # much longer content groups, with several conditions all true.
+    groups = _group_summary(records)
+    stats["groups"] = [
+        {"group": g, "count": info["count"],
+         "duration": round(info["duration"], 2)}
+        for g, info in sorted(groups.items())
+    ]
+    if rules["breaks"] and 2 <= len(groups) <= _AD_MAX_GROUPS:
+        longest = max((info["duration"] for info in groups.values()), default=0.0)
+        if longest > 0:
+            for g, info in groups.items():
+                if not (_AD_MIN_GROUP_SEGMENTS <= info["count"]
+                        <= _AD_MAX_GROUP_SEGMENTS):
+                    continue
+                if not (_AD_MIN_GROUP_DURATION <= info["duration"]
+                        <= _AD_MAX_GROUP_DURATION):
+                    continue
+                if info["duration"] / longest > _AD_MAX_GROUP_RELATIVE:
+                    continue
+                for rec in records:
+                    if rec["group"] == g and not rec["reason"]:
+                        rec["reason"] = "break"
+            break_recs = [rec for rec in records if rec["reason"] == "break"]
+            break_duration = sum(rec["duration"] for rec in break_recs)
+            if (break_recs and total_duration > 0 and
+                    break_duration / total_duration > _AD_MAX_BREAK_RATIO):
+                for rec in break_recs:
+                    rec["reason"] = ""
+                stats["guard"] = "break groups exceed 20%, reverted"
+
+    # A head-only hit that shares host and directory with kept content is
+    # almost always the first real segment, not an ad break.
+    if rules["head_guard"]:
+        has_feature = any(rec["reason"] in ("marker", "keyword")
+                          for rec in records)
+        if not has_feature:
+            reference = next((rec["abs"] for rec in records
+                              if rec["reason"] == ""), "")
+            for rec in records:
+                if rec["reason"] == "head" and _same_stream(reference, rec["abs"]):
+                    rec["reason"] = ""
+                    stats["guard_kept"] += 1
+            if stats["guard_kept"] and not stats["guard"]:
+                stats["guard"] = "head-only suspect segments kept"
+
+    removed = [rec for rec in records if rec["reason"]]
+    removed_duration = sum(rec["duration"] for rec in removed)
+    if removed and (len(removed) > _AD_MAX_REMOVED or
+                    (total_duration > 0 and
+                     removed_duration / total_duration > _AD_MAX_REMOVE_RATIO)
+                    or len(removed) == len(records)):
+        for rec in removed:
+            rec["reason"] = ""
+        stats["guard"] = "bulk removal reverted"
+        stats["guard_kept"] += len(removed)
+        removed = []
+
+    if not removed:
+        stats["kept_duration"] = total_duration
+        return text, stats
+
+    out: list[str] = []
+    for rec in records:
+        if rec["reason"]:
             stats["removed"] += 1
-            stats["removed_duration"] += duration
-            stats["by_" + reason] += 1
+            stats["removed_duration"] += rec["duration"]
+            stats["by_" + rec["reason"]] += 1
             if not stats["sample"]:
-                stats["sample"] = absolute[:100]
-            out.extend(row for row in block
+                stats["sample"] = rec["abs"][:100]
+            if len(stats["dropped"]) < 20:
+                stats["dropped"].append({
+                    "url": rec["abs"][:160],
+                    "duration": round(rec["duration"], 2),
+                    "reason": rec["reason"],
+                    "group": rec["group"],
+                })
+            out.extend(row for row in rec["tags"]
                        if row.strip().upper().startswith(_AD_KEEP_TAGS))
             out.append(_AD_PLACEHOLDER)
         else:
-            stats["kept_duration"] += duration
-            out.extend(block)
-            out.append(line)
-        marker_hit = False
-    out.extend(pending)
+            stats["kept_duration"] += rec["duration"]
+            tags = [row for row in rec["tags"]
+                    if not (row.strip().upper().startswith("#EXT-X-CUE-")
+                            or row.strip().upper().startswith("#EXT-X-DATERANGE"))]
+            out.extend(tags)
+            out.append(rec["uri"])
+    out.extend(tail)
     return "\n".join(out) + "\n", stats
 
 
@@ -353,14 +518,43 @@ def pick_best_variant(text: str) -> str | None:
 def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                      variant_prefix: str = "", is_master: bool = False,
                      decrypt_keys: bool = False) -> str:
-    if not is_master:
+    if not is_master and ad_rules_active(ad_rules()):
+        original = text
         text, ad_stats = strip_ads(text, base_url)
-        if ad_stats["removed"]:
+        if ad_stats["removed"] or ad_stats["guard_kept"] or ad_stats["guard"]:
             runtime.log(
-                f"adfilter: removed {ad_stats['removed']} segments "
-                f"(marker={ad_stats['by_marker']} keyword={ad_stats['by_keyword']} "
-                f"head={ad_stats['by_head']}) kept={ad_stats['kept_duration']:.0f}s "
-                f"sample={ad_stats['sample']}")
+                f"adfilter: removed={ad_stats['removed']} "
+                f"cut={ad_stats['removed_duration']:.0f}s "
+                f"kept={ad_stats['kept_duration']:.0f}s "
+                f"total={ad_stats['total_duration']:.0f}s "
+                f"hits=m{ad_stats['by_marker']}/k{ad_stats['by_keyword']}/"
+                f"h{ad_stats['by_head']}/b{ad_stats['by_break']}/"
+                f"d{ad_stats['by_duplicate']}/t{ad_stats['by_tiny']}/"
+                f"o{ad_stats['by_minority']} "
+                f"guard={ad_stats['guard'] or '-'} "
+                f"guarded={ad_stats['guard_kept']} "
+                f"sample={ad_stats['sample'][:80]}")
+            _AD_PREVIEWS.append({
+                "ts": time.time(),
+                "removed": ad_stats["removed"],
+                "removed_duration": round(ad_stats["removed_duration"], 2),
+                "kept_duration": round(ad_stats["kept_duration"], 2),
+                "total_duration": round(ad_stats["total_duration"], 2),
+                "by_marker": ad_stats["by_marker"],
+                "by_keyword": ad_stats["by_keyword"],
+                "by_head": ad_stats["by_head"],
+                "by_break": ad_stats["by_break"],
+                "by_duplicate": ad_stats["by_duplicate"],
+                "by_tiny": ad_stats["by_tiny"],
+                "by_minority": ad_stats["by_minority"],
+                "groups": ad_stats["groups"],
+                "guard": ad_stats["guard"],
+                "guard_kept": ad_stats["guard_kept"],
+                "sample": ad_stats["sample"],
+                "dropped": ad_stats["dropped"],
+                "raw_head": "\n".join(original.splitlines()[:40]),
+                "kept_head": "\n".join(text.splitlines()[:40]),
+            })
     out = []
     key_url = ""
     key_iv = ""

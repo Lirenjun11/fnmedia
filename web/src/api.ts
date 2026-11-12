@@ -39,6 +39,8 @@ export interface Config {
   adfilter_markers: boolean;
   adfilter_keywords: string[];
   adfilter_head_skip: number;
+  adfilter_head_guard: boolean;
+  adfilter_breaks: boolean;
 }
 
 export interface Bootstrap {
@@ -76,6 +78,28 @@ export interface FetchReport {
   sources_total: number;
   enabled: number;
   url: string;
+}
+
+export interface AdPreview {
+  ts: number;
+  removed: number;
+  removed_duration: number;
+  kept_duration: number;
+  total_duration: number;
+  by_marker: number;
+  by_keyword: number;
+  by_head: number;
+  by_break: number;
+  by_duplicate: number;
+  by_tiny: number;
+  by_minority: number;
+  groups: { group: number; count: number; duration: number }[];
+  guard: string;
+  guard_kept: number;
+  sample: string;
+  dropped: { url: string; duration: number; reason: string; group: number }[];
+  raw_head: string;
+  kept_head: string;
 }
 
 const TOKEN =
@@ -151,6 +175,8 @@ export const api = {
     request<FetchReport>('/v/api/ext/subscriptions/content', json('POST', { text })),
   clearCache: () => request<{ cleared: number }>('/v/api/ext/cache', { method: 'DELETE' }),
   logs: () => request<{ logs: { ts: number; msg: string }[] }>('/v/api/ext/logs'),
+  adfilterPreview: () =>
+    request<{ previews: AdPreview[] }>('/v/api/ext/adfilter/preview'),
   checkUpdate: (force = false) =>
     request<UpdateInfo>(`/v/api/ext/update/check${force ? '?force=1' : ''}`),
   exportConfig: () => request<{ config: Config }>('/v/api/ext/export'),
