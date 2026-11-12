@@ -5,6 +5,7 @@ from unittest.mock import patch
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+import acl as playstate_acl
 import app as appmod
 import cms
 import config
@@ -43,7 +44,7 @@ class PlayStateTest(unittest.TestCase):
         cfg = config.get()
         cfg["playstate"] = {}
         config.save(cfg)
-        playstate._loaded = False
+        playstate.reset()
         playstate.load()
 
     def open_item(self, client):
@@ -64,7 +65,8 @@ class PlayStateTest(unittest.TestCase):
             # 否则客户端会把 unix 时间当成位置直接跳到片尾。
             self.assertGreater(detail["watched_at"], 0)
             self.assertEqual(detail["watched_ts"], 0)
-            self.assertIn(guid, config.get()["playstate"]["favorites"])
+            self.assertIn(guid, playstate.favorite_guids())
+            self.assertTrue(playstate.is_favorite(guid))
             client.request("DELETE", "/v/api/v1/item/favorite", json={"guid": guid})
             detail2 = client.get(f"/v/api/v1/item/{guid}").json()["data"]
             self.assertEqual(detail2["is_favorite"], 0)
@@ -182,6 +184,144 @@ class PlayStateTest(unittest.TestCase):
                 self.assertEqual(
                     client.put("/v/api/v1/item/favorite",
                                json={"guid": "0" * 32}).json()["code"], -6)
+
+
+class PlayStateIsolationTest(unittest.TestCase):
+    """播放状态按飞牛账号隔离（参考项目 v0.2.48 的做法）。"""
+
+    def setUp(self):
+        cfg = config.get()
+        self._orig_playstate = cfg.get("playstate")
+        self._orig_enabled = cfg.get("acl_enabled")
+        cfg["playstate"] = {}
+        cfg["acl_enabled"] = True
+        config.save(cfg)
+        playstate.reset()
+        playstate.load()
+
+    def tearDown(self):
+        cfg = config.get()
+        cfg["playstate"] = self._orig_playstate or {}
+        cfg["acl_enabled"] = self._orig_enabled
+        config.save(cfg)
+        playstate.reset()
+
+    def as_user(self, uid):
+        return playstate_acl.push(
+            playstate_acl.Identity(uid=uid, name=uid, via="session"))
+
+    def test_history_isolated_between_accounts(self):
+        token = self.as_user("u-a")
+        try:
+            playstate.record({"item_guid": "g1", "ts": 120, "duration": 600},
+                             {"title": "甲看的片"})
+        finally:
+            playstate_acl.reset(token)
+        token = self.as_user("u-a")
+        try:
+            self.assertEqual(playstate.ts_for("g1"), 120)
+        finally:
+            playstate_acl.reset(token)
+
+        token = self.as_user("u-b")
+        try:
+            self.assertEqual(playstate.ts_for("g1"), 0)
+            self.assertEqual(playstate.history_records(), [])
+            row = playstate.apply({"guid": "g1"}, "g1")
+            self.assertEqual((row["watched_ts"], row["ts"]), (0, 0))
+        finally:
+            playstate_acl.reset(token)
+
+    def test_favorites_and_watched_isolated(self):
+        token = self.as_user("u-a")
+        try:
+            playstate.add_favorite("g1", {"title": "甲收藏"})
+            playstate.set_watched("g1")
+            self.assertTrue(playstate.is_favorite("g1"))
+        finally:
+            playstate_acl.reset(token)
+        token = self.as_user("u-b")
+        try:
+            self.assertFalse(playstate.is_favorite("g1"))
+            self.assertEqual(playstate.watched_ts("g1"), 0)
+            self.assertEqual(playstate.favorite_guids(), [])
+        finally:
+            playstate_acl.reset(token)
+
+    def test_identified_progress_does_not_leak_to_unidentified(self):
+        token = self.as_user("u-a")
+        try:
+            playstate.record({"item_guid": "g1", "ts": 200, "duration": 600}, {})
+        finally:
+            playstate_acl.reset(token)
+        # 未识别身份（ACL 关闭/客户端不带 token）走全局分区，看不到账号进度。
+        self.assertEqual(playstate.ts_for("g1"), 0)
+        self.assertEqual(playstate.history_records(), [])
+
+    def test_legacy_global_history_adopted_by_admin_once(self):
+        cfg = config.get()
+        cfg["playstate"] = {"history": {"g1": {
+            "item_guid": "g1", "title": "旧记录", "ts": 300,
+            "duration": 600, "updated_at": 1}}}
+        config.save(cfg)
+        playstate.reset()
+        playstate.load()
+        with patch("acl.is_admin", return_value=True):
+            token = self.as_user("u-admin")
+            try:
+                self.assertEqual(playstate.ts_for("g1"), 300)
+            finally:
+                playstate_acl.reset(token)
+        # 已经继承过，普通账号不会拿到旧记录。
+        with patch("acl.is_admin", return_value=False):
+            token = self.as_user("u-kid")
+            try:
+                self.assertEqual(playstate.ts_for("g1"), 0)
+            finally:
+                playstate_acl.reset(token)
+
+    def test_http_requests_isolated_by_identity_header(self):
+        """中间件把请求头解析成身份 → playstate 落到各自分区。
+
+        注意这里 ACL 总开关是关的：身份识别与权限开关解耦，历史隔离不依赖它。
+        """
+        cfg = config.get()
+        cfg["acl_enabled"] = False
+        config.save(cfg)
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            brief = appmod.app.state.store.remember([make_title()])[0]
+            guid = brief["guid"]
+            client.post("/v/api/v1/play/record",
+                        headers={"x-user-id": "u-a"},
+                        json={"item_guid": guid, "ts": 120, "duration": 600})
+            a = client.post("/v/api/v1/play/info", headers={"x-user-id": "u-a"},
+                            json={"item_guid": guid}).json()["data"]
+            b = client.post("/v/api/v1/play/info", headers={"x-user-id": "u-b"},
+                            json={"item_guid": guid}).json()["data"]
+            self.assertEqual(a["item"]["watched_ts"], 120)
+            self.assertEqual(b["item"]["watched_ts"], 0)
+            with patch.object(playstate_api, "_passthrough", new=empty_list):
+                self.assertEqual(
+                    client.get("/v/api/v1/play/list",
+                               headers={"x-user-id": "u-b"}).json()["data"], [])
+                self.assertEqual(
+                    len(client.get("/v/api/v1/play/list",
+                                   headers={"x-user-id": "u-a"}).json()["data"]), 1)
+
+    def test_non_admin_does_not_inherit_legacy(self):
+        cfg = config.get()
+        cfg["playstate"] = {"history": {"g1": {
+            "item_guid": "g1", "ts": 300, "duration": 600, "updated_at": 1}}}
+        config.save(cfg)
+        playstate.reset()
+        playstate.load()
+        with patch("acl.is_admin", return_value=False):
+            token = self.as_user("u-kid")
+            try:
+                self.assertEqual(playstate.ts_for("g1"), 0)
+            finally:
+                playstate_acl.reset(token)
 
 
 if __name__ == "__main__":

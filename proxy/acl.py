@@ -448,7 +448,12 @@ def _subject_name(uid: str) -> str:
 
 
 def _log_ident(ident: Identity) -> None:
-    """同一设备同一结果 5 分钟内只记一次，避免每个媒体分片都刷日志。"""
+    """同一设备同一结果 5 分钟内只记一次，避免每个媒体分片都刷日志。
+
+    账号权限没开时不记：此时识别只是给「播放状态按账号隔离」用，不必刷屏。
+    """
+    if not enabled():
+        return
     fp = ident.fp or ""
     now = time.monotonic()
     with _LOCK:
@@ -472,18 +477,16 @@ def identify(request, force: bool = False) -> Identity:
     ``force=True`` 用于管理页「开启前自检」：即使总开关还是关闭的，也实际
     走一遍身份映射，让管理员先确认能不能识别，再决定是否开启。
     """
-    if not enabled() and not force:
-        return Identity(via="off", fp=device_fp(request))
+    # 身份解析与权限开关解耦：即使没开账号权限，也要能认出「现在是哪个账号」
+    # ——播放历史/续播按账号隔离依赖它。权限判定仍由 enabled() 单独把关。
     cache_key = device_fp(request)
     now = time.monotonic()
-    with _LOCK:
-        hit = _ID_CACHE.get(cache_key) if cache_key else None
-        if hit and now - hit[0] < _CACHE_TTL:
-            return hit[1]
 
-    cfg = config.get()
-    ident: Identity
     # 1) 显式用户头：最短路径，也最容易被网关覆盖。
+    #
+    # 这一路**不进指纹缓存**：指纹由凭证/UA 算出，不含请求头，同一台机器上
+    # 带不同 x-user-id 的请求会共用同一个 key，先到的身份会把后面的全都盖掉
+    # （表现为两个账号串到同一份播放进度）。取值本身是纯内存操作，不需要缓存。
     picked = ""
     for name in HEADER_NAMES:
         try:
@@ -497,25 +500,33 @@ def identify(request, force: bool = False) -> Identity:
         ident = Identity(uid=picked, name=_subject_name(picked), via="header",
                          fp=cache_key)
         _log_ident(ident)
+        return ident
+
+    with _LOCK:
+        hit = _ID_CACHE.get(cache_key) if cache_key else None
+        if hit and now - hit[0] < _CACHE_TTL:
+            return hit[1]
+
+    cfg = config.get()
+    ident: Identity
+    # 2) 官方登录 token → 官方会话表 → user_guid（全自动，无需配置）。
+    uid, reason = _lookup_session(request)
+    if uid:
+        ident = Identity(uid=uid, name=_subject_name(uid), via="session",
+                         fp=cache_key)
+        _log_ident(ident)
     else:
-        # 2) 官方登录 token → 官方会话表 → user_guid（全自动，无需配置）。
-        uid, reason = _lookup_session(request)
-        if uid:
-            ident = Identity(uid=uid, name=_subject_name(uid), via="session",
+        # 3) 管理页「绑定当前设备」：会话反查不出来时的兜底。
+        rec = (cfg.get("acl_devices") or {}).get(cache_key)
+        if isinstance(rec, dict) and rec.get("uid"):
+            uid = str(rec["uid"])
+            ident = Identity(uid=uid, name=_subject_name(uid), via="device",
                              fp=cache_key)
             _log_ident(ident)
         else:
-            # 3) 管理页「绑定当前设备」：会话反查不出来时的兜底。
-            rec = (cfg.get("acl_devices") or {}).get(cache_key)
-            if isinstance(rec, dict) and rec.get("uid"):
-                uid = str(rec["uid"])
-                ident = Identity(uid=uid, name=_subject_name(uid), via="device",
-                                 fp=cache_key)
-                _log_ident(ident)
-            else:
-                ident = Identity(via="unknown", reason=reason or "no_mapping",
-                                 fp=cache_key)
-                _log_ident(ident)
+            ident = Identity(via="unknown", reason=reason or "no_mapping",
+                             fp=cache_key)
+            _log_ident(ident)
     if cache_key:
         with _LOCK:
             if len(_ID_CACHE) > 500:
@@ -699,6 +710,20 @@ def subjects() -> list[dict]:
             seen.add(uid)
             out.append({"id": uid, "name": uid, "source": "manual"})
     return out[:200]
+
+
+def is_admin(uid: str) -> bool:
+    """该账号是否官方管理员；用于「旧播放记录只由管理员继承一次」等场景。"""
+    uid = str(uid or "")
+    if not uid:
+        return False
+    try:
+        for row in discover().get("users") or []:
+            if str(row.get("id") or "") == uid:
+                return bool(row.get("is_admin"))
+    except Exception:  # noqa: BLE001 - 判定失败按非管理员处理
+        return False
+    return False
 
 
 def status() -> dict:
