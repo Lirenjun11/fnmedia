@@ -1,5 +1,5 @@
 [Unit]
-Description=fnos_media_ext 飞牛影视扩展（trim_media.sock 可逆接管）
+Description=fnmedia-ext 飞牛影视扩展（trim_media.sock 可逆接管）
 After=network.target
 After=trim-media.service
 

@@ -2,19 +2,19 @@
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
 case "${1:-}" in
     start)
-        systemctl start fnos-media-ext.service 2>>"${LOG}" || true
+        systemctl start fnmedia-ext.service 2>>"${LOG}" || true
         exit 0
         ;;
     stop)
-        systemctl stop fnos-media-ext.service 2>>"${LOG}" || true
+        systemctl stop fnmedia-ext.service 2>>"${LOG}" || true
         sleep 0.5
         for _root in "${TRIM_APPDEST:-}" "${APP_ROOT}/target" "${APP_ROOT}"; do
-            [ -n "${_root}" ] && rm -f "${_root}/fnos-media-ext.sock" 2>/dev/null || true
+            [ -n "${_root}" ] && rm -f "${_root}/fnmedia-ext.sock" 2>/dev/null || true
         done
         exit 0
         ;;
     status)
-        systemctl is-active --quiet fnos-media-ext.service && exit 0 || exit 3
+        systemctl is-active --quiet fnmedia-ext.service && exit 0 || exit 3
         ;;
     *) exit 1 ;;
 esac

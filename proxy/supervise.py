@@ -14,9 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MAIN_SOCK = Path(os.environ.get("FNOS_MEDIA_MAIN_SOCK", "/var/run/trim_media.sock"))
 UPSTREAM_SOCK = Path(os.environ.get("FNOS_MEDIA_UPSTREAM_SOCK",
                                    "/var/run/trim_media_upstream.sock"))
-RUN_DIR = Path("/run/fnos-media-ext")
+RUN_DIR = Path("/run/fnmedia-ext")
 STAGING = RUN_DIR / "listen.sock"
-GATEWAY = RUN_DIR / "fnos-media-ext.sock"
+GATEWAY = RUN_DIR / "fnmedia-ext.sock"
 
 _children: list[subprocess.Popen] = []
 _staging_inode: int | None = None
@@ -135,10 +135,10 @@ def main() -> int:
         _shutdown()
         return 1
     _swap()
-    print("[fnos_media_ext] takeover active", flush=True)
+    print("[fnmedia-ext] takeover active", flush=True)
     while True:
         if any(child.poll() is not None for child in _children):
-            print("[fnos_media_ext] child exited, rolling back", flush=True)
+            print("[fnmedia-ext] child exited, rolling back", flush=True)
             _shutdown()
             return 1
         time.sleep(1.0)

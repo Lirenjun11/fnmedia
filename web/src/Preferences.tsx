@@ -67,7 +67,7 @@ export default function PreferencesPage({ boot, refresh, notify }: Props) {
       const blob = new Blob([JSON.stringify(data.config, null, 2)], { type: 'application/json' });
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
-      link.download = `fnos_media_ext-config-${new Date().toISOString().slice(0, 10)}.json`;
+      link.download = `fnmedia-config-${new Date().toISOString().slice(0, 10)}.json`;
       link.click();
       URL.revokeObjectURL(link.href);
       notify('配置文件已下载到本地', 'ok');

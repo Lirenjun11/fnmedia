@@ -74,7 +74,7 @@ jobs:
 
       - name: Verify package artifact
         run: |
-          fpk_file="$(ls dist/fnos_media_ext-*.fpk)"
+          fpk_file="$(ls dist/fnmedia-ext-*.fpk)"
           test -s "$fpk_file" && test -s "${fpk_file}.sha256"
           ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
 
@@ -93,8 +93,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          fpk_file="$(ls dist/fnos_media_ext-*.fpk)"
-          title="fnos_media_ext ${TAG#v}"
+          fpk_file="$(ls dist/fnmedia-ext-*.fpk)"
+          title="fnmedia-ext ${TAG#v}"
           if gh release view "${TAG}" >/dev/null 2>&1; then
             gh release edit "${TAG}" --title "$title" --notes-file /tmp/release-notes.md
             gh release upload "${TAG}" "$fpk_file" "$fpk_file.sha256" --clobber

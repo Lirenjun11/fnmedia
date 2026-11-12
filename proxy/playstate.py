@@ -172,6 +172,12 @@ def ts_for(guid: str) -> int:
         return int((_history.get(guid) or {}).get("ts") or 0)
 
 
+def media_for(guid: str) -> str:
+    load()
+    with _lock:
+        return str((_history.get(guid) or {}).get("media_guid") or "")
+
+
 def duration_for(guid: str) -> int:
     load()
     with _lock:

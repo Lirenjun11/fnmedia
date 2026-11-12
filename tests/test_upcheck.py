@@ -17,7 +17,7 @@ def release(tag="v0.1.1", draft=False, prerelease=False, status=200):
         "html_url": "https://github.com/Lirenjun11/fnmedia/releases/tag/" + tag,
         "body": "- 修复若干问题",
         "published_at": "2026-11-10T00:00:00Z",
-        "assets": [{"name": "fnos_media_ext-0.1.1.fpk",
+        "assets": [{"name": "fnmedia-ext-0.1.1.fpk",
                     "browser_download_url": "https://example.invalid/fpk"}],
     }
     def handler(request):

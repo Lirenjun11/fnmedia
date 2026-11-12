@@ -90,7 +90,7 @@ jobs:
 
       - name: Verify package artifact
         run: |
-          fpk_file="$(ls dist/fnos_media_ext-*.fpk)"
+          fpk_file="$(ls dist/fnmedia-ext-*.fpk)"
           test -s "$fpk_file"
           test -s "${fpk_file}.sha256"
           ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
@@ -111,7 +111,7 @@ jobs:
       - name: Upload fpk artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fnos_media_ext-fpk
+          name: fnmedia-ext-fpk
           path: |
             dist/*.fpk
             dist/*.sha256

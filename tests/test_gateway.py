@@ -10,7 +10,7 @@ def head(target: str) -> bytes:
 
 class GatewayRewriteTest(unittest.TestCase):
     def test_desktop_root_maps_to_admin(self):
-        for target in ("/app/fnos-media-ext/", "/app/fnos-media-ext", "/"):
+        for target in ("/app/fnmedia-ext/", "/app/fnmedia-ext", "/"):
             out = _rewrite(head(target))
             self.assertIn(b"GET /v/online-admin", out, target)
 
@@ -19,7 +19,7 @@ class GatewayRewriteTest(unittest.TestCase):
         self.assertIn(b"HTTP/1.1", out)
 
     def test_prefixed_assets_are_stripped(self):
-        out = _rewrite(head("/app/fnos-media-ext/v/ext/assets/app.js"))
+        out = _rewrite(head("/app/fnmedia-ext/v/ext/assets/app.js"))
         self.assertIn(b"GET /v/ext/assets/app.js", out)
 
     def test_official_paths_pass_through(self):
@@ -28,7 +28,7 @@ class GatewayRewriteTest(unittest.TestCase):
         self.assertNotIn(b"online-admin", out)
 
     def test_prefix_constant(self):
-        self.assertEqual(APP_PREFIX, "/app/fnos-media-ext")
+        self.assertEqual(APP_PREFIX, "/app/fnmedia-ext")
 
 
 if __name__ == "__main__":

@@ -9,10 +9,10 @@ for _cand in "${TRIM_APPDEST:-}/repo" "${APP_ROOT}/target/repo" "${APP_ROOT}/rep
     fi
 done
 unset _cand
-LOG="${TRIM_PKGVAR:-/tmp}/fnos-media-app.log"
+LOG="${TRIM_PKGVAR:-/tmp}/fnmedia-app.log"
 mkdir -p "$(dirname "${LOG}")" 2>/dev/null || true
 fnos_fail() {
     [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "$1" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
-    echo "[fnos_media_ext] $1" >&2
+    echo "[fnmedia-ext] $1" >&2
     exit 1
 }

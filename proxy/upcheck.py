@@ -16,7 +16,7 @@ _FAIL_TTL = 600.0
 _TIMEOUT = 5.0
 _HEADERS = {
     "Accept": "application/vnd.github+json",
-    "User-Agent": "fnos_media_ext-update-check",
+    "User-Agent": "fnmedia-ext-update-check",
 }
 _lock = threading.Lock()
 _cache: dict = {}

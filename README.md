@@ -1,4 +1,4 @@
-# fnos_media_ext
+# fnmedia-ext
 
 零侵入、零内置源、订阅驱动、带完整 Web 配置页的飞牛影视（`trim.media`）在线接入层。
 
@@ -15,12 +15,12 @@
 
 ## 安装
 
-1. 在 fnOS 应用中心**手动安装 FPK**（`dist/fnos_media_ext-<version>.fpk`），需 fnOS 1.2.0+ 且应用「影视」正在运行。
+1. 在 fnOS 应用中心**手动安装 FPK**（`dist/fnmedia-ext-<version>.fpk`），需 fnOS 1.2.0+ 且应用「影视」正在运行。
 2. 桌面出现「飞牛影视扩展」图标，此时为纯透传状态，官方影视一切照旧。
 3. 打开管理页 →「订阅配置」粘贴你自己的订阅地址 →「拉取配置」全量导入并启用。
 4. 需要定期同步时开启「自动更新」并设置间隔（默认 24 小时）。
 
-管理页入口：桌面 iframe `/app/fnos-media-ext/`，或浏览器直连 `/v/online-admin`。
+管理页入口：桌面 iframe `/app/fnmedia-ext/`，或浏览器直连 `/v/online-admin`。
 
 ## 支持的订阅格式
 

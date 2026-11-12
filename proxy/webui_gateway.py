@@ -7,8 +7,8 @@ import sys
 import threading
 from pathlib import Path
 
-APP_PREFIX = "/app/fnos-media-ext"
-SOCK_NAME = "fnos-media-ext.sock"
+APP_PREFIX = "/app/fnmedia-ext"
+SOCK_NAME = "fnmedia-ext.sock"
 MAX_HEADER = 1 << 20
 MAX_BODY = 8 << 20
 RELAY_TIMEOUT = 60
@@ -18,7 +18,7 @@ def gateway_socket_path(base: Path) -> Path:
     parent = base.resolve().parent
     if (parent / "ui").is_dir() and base.name == "repo":
         return parent / SOCK_NAME
-    run = Path("/run/fnos-media-ext")
+    run = Path("/run/fnmedia-ext")
     run.mkdir(parents=True, exist_ok=True)
     return run / SOCK_NAME
 

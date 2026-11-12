@@ -71,7 +71,7 @@ class AppContractTest(unittest.TestCase):
         with TestClient(appmod.app) as client:
             page = client.get("/v/online-admin")
             self.assertEqual(page.status_code, 200)
-            self.assertIn("fnos_media_ext", page.text)
+            self.assertIn("fnmedia", page.text)
             self.assertIn('name="fnos-token"', page.text)
             self.assertIn("fnos_media_admin", page.cookies)
             import re
@@ -309,6 +309,22 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(info["item"]["guid"], eg)
             self.assertEqual(info["media_guid"], fake.ep_media_guid(eg))
             self.assertEqual(info["video_guid"], fake.ep_video_guid(eg))
+            title_info = client.post("/v/api/v1/play/info",
+                                     json={"item_guid": guid}).json()["data"]
+            self.assertEqual(title_info["type"], "Episode")
+            eg0 = fake.episode_guid(guid, 0)
+            self.assertEqual(title_info["guid"], eg0)
+            self.assertEqual(title_info["parent_guid"], sg)
+            streams = client.get(
+                f"/v/api/v1/stream/list/{guid}").json()["data"]
+            self.assertEqual(streams["files"][0]["guid"],
+                             fake.ep_media_guid(eg0))
+            client.post("/v/api/v1/play/record", json={
+                "item_guid": eg, "media_guid": fake.ep_media_guid(eg),
+                "ts": 12, "duration": 1200})
+            resumed = client.post("/v/api/v1/play/info",
+                                  json={"item_guid": guid}).json()["data"]
+            self.assertEqual(resumed["guid"], eg)
 
     def test_web_and_mobile_payload_compatibility(self):
         import cms as cms_mod

@@ -246,7 +246,7 @@ export function AboutPage({ boot, update, checking, onCheck }: Props & {
         <p className="page-desc">版本信息与免责声明</p>
       </div>
       <section className="card">
-        <div className="card-title">fnos_media_ext</div>
+        <div className="card-title">fnmedia</div>
         <div className="pill-row mt">
           <span className="badge brand">v{boot.version}</span>
           <span className="badge">零内置源</span>

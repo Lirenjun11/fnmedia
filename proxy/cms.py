@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 import httpx
 
 _MEDIA = re.compile(r"\.(m3u8|mp4|flv|mkv|ts)(\?|$)", re.I)
-_UA = "Mozilla/5.0 (compatible; fnos_media_ext/0.1)"
+_UA = "Mozilla/5.0 (compatible; fnmedia-ext/0.1)"
 _TAG_RE = re.compile(r"<[^>]*>")
 _WS_RE = re.compile(r"\s+")
 

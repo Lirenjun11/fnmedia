@@ -176,7 +176,7 @@ async def fetch(url: str, timeout: float = 5.0, max_bytes: int = 512 * 1024) -> 
             _public_url(current)
             async with client.stream(
                     "GET", current,
-                    headers={"User-Agent": "fnos_media_ext/0.1"}) as resp:
+                    headers={"User-Agent": "fnmedia-ext/0.1"}) as resp:
                 if resp.is_redirect:
                     location = resp.headers.get("location")
                     if not location:

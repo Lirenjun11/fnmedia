@@ -240,7 +240,7 @@ def _err(msg: str, status: int = 404) -> JSONResponse:
 
 @app.get("/_ext/healthz")
 async def healthz():
-    return {"ok": True, "service": "fnos_media_ext",
+    return {"ok": True, "service": "fnmedia-ext",
             "sources": len(config.enabled_sources())}
 
 
@@ -249,7 +249,7 @@ async def admin_page():
     index = STATIC / "index.html"
     if not index.exists():
         return HTMLResponse("<!doctype html><meta charset='utf-8'>"
-                            "<h1>fnos_media_ext</h1><p>前端产物未构建。</p>")
+                            "<h1>fnmedia</h1><p>前端产物未构建。</p>")
     token = config.token()
     page = index.read_text(encoding="utf-8").replace(
         "</head>",
@@ -453,17 +453,25 @@ async def _stream_list_impl(guid: str, request: Request):
     store = request.app.state.store
     ep = store.resolve_episode(guid)
     if ep:
-        tv_guid, _ = ep
-        mg, vg = fake.ep_media_guid(guid), fake.ep_video_guid(guid)
+        tv_guid, ep_index = ep
+        eg = guid
     elif store.get(guid):
         tv_guid = guid
-        mg, vg = fake.media_guid(guid), fake.video_guid(guid)
+        brief = store.get(tv_guid)
+        # 电视剧整剧身份 -> 续播集，和 play/info 保持一致。
+        ep_index = _resume_index(store, tv_guid) if brief and brief.get("is_tv") else 0
+        eg = fake.episode_guid(tv_guid, ep_index) if brief and brief.get("is_tv") else ""
     else:
         return await _passthrough(request)
     brief = store.get(tv_guid)
     if not brief:
         return await _passthrough(request)
-    ep_index = ep[1] if ep else 0
+    if ep:
+        mg, vg = fake.ep_media_guid(guid), fake.ep_video_guid(guid)
+    elif eg:
+        mg, vg = fake.ep_media_guid(eg), fake.ep_video_guid(eg)
+    else:
+        mg, vg = fake.media_guid(guid), fake.video_guid(guid)
     meta = hls.get_playlist_meta((tv_guid, 0, ep_index))
     runtime.log(f"stream/list: {brief.get('title', '')[:30]} ep{ep_index + 1} "
                 f"lines={len(brief.get('line_names') or [])} "
@@ -477,6 +485,15 @@ async def _body(request: Request) -> dict:
         return json.loads(await request.body() or b"{}")
     except ValueError:
         return {}
+
+
+def _resume_index(store: cms.TitleStore, guid: str) -> int:
+    media = playstate.media_for(guid)
+    if media:
+        resolved = store.resolve_media(media)
+        if resolved and resolved[0] == guid:
+            return resolved[1]
+    return 0
 
 
 def _tv_guid_of(store: cms.TitleStore, guid: str) -> str | None:
@@ -596,7 +613,13 @@ async def play_info_route(request: Request):
         brief = store.get(guid)
         if not brief:
             return await _passthrough(request)
-        info = fake.play_info(brief, mg, vg, guid)
+        if brief.get("is_tv"):
+            # 整部剧点播放：解析到续播集，播放器才有“下一集/选集”身份。
+            index = _resume_index(store, guid)
+            eg = fake.episode_guid(guid, index)
+            info = fake.episode_play_info(brief, index, eg)
+        else:
+            info = fake.play_info(brief, mg, vg, guid)
         canonical = guid
     info["ts"] = playstate.ts_for(canonical)
     return JSONResponse(fake.ok(fake.normalize_detail(info, _ua(request))))

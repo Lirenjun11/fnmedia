@@ -73,7 +73,7 @@ BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev
 mkdir -p "${OUT_DIR}"
 SUFFIX=""
 [ "${SLIM}" -eq 1 ] && SUFFIX="-slim"
-FINAL="${OUT_DIR}/fnos_media_ext-${VERSION}${SUFFIX}.fpk"
+FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${SUFFIX}.fpk"
 mv "${BUILT}" "${FINAL}"
 python3 - "${FINAL}" <<'PY'
 import hashlib, pathlib, sys
