@@ -529,7 +529,8 @@ def pick_best_variant(text: str) -> str | None:
 
 def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                      variant_prefix: str = "", is_master: bool = False,
-                     decrypt_keys: bool = False) -> str:
+                     decrypt_keys: bool = False,
+                     variant_query: str = "") -> str:
     if not is_master and ad_rules_active(ad_rules()):
         original = text
         text, ad_stats = strip_ads(text, base_url)
@@ -595,10 +596,12 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
             key_iv = ""
         if stripped.startswith("#"):
             attr_target = variant_prefix if is_master else seg_prefix
+            extra = variant_query if is_master else ""
 
             def sub(match):
                 absolute = urllib.parse.urljoin(base_url, match.group(1))
-                return f'URI="{attr_target}?u={encode_url(absolute)}"'
+                return (f'URI="{attr_target}?u={encode_url(absolute)}'
+                        f'{extra}"')
             out.append(_URI_ATTR.sub(sub, line))
             continue
         if stripped == _AD_PLACEHOLDER:
@@ -606,11 +609,12 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
             continue
         target = variant_prefix if is_master else seg_prefix
         absolute = urllib.parse.urljoin(base_url, stripped)
+        extra = variant_query if is_master else ""
         if key_url:
             iv = key_iv or f"{seq:032x}"
-            out.append(f"{target}?u={encode_seg(absolute, key_url, iv)}")
+            out.append(f"{target}?u={encode_seg(absolute, key_url, iv)}{extra}")
         else:
-            out.append(f"{target}?u={encode_url(absolute)}")
+            out.append(f"{target}?u={encode_url(absolute)}{extra}")
         seq += 1
     return "\n".join(out) + "\n"
 
@@ -647,12 +651,36 @@ async def fetch_playlist(client: httpx.AsyncClient, url: str,
     return text, base, meta
 
 
+def inject_start(text: str, offset: float) -> str:
+    """在媒体清单头部声明起播点。
+
+    手机/电视端的原生播放器不一定自己 seek，只按服务端下发的播放地址起播；
+    官方转码会话返回的地址本身就带起播点，我们下发的是完整点播清单，因此
+    用 HLS 标准的 EXT-X-START 补一个。直播窗口没有稳定时间轴，跳过。
+    """
+    if offset <= 0 or "#EXT-X-STREAM-INF" in text or "#EXT-X-ENDLIST" not in text:
+        return text
+    lines = text.splitlines()
+    if not lines or not lines[0].strip().startswith("#EXTM3U"):
+        return text
+    tag = f"#EXT-X-START:TIME-OFFSET={offset:.3f},PRECISE=NO"
+    return "\n".join([lines[0], tag] + lines[1:]) + "\n"
+
+
 def playlist_response(text: str, base: str, seg_prefix: str,
                       variant_prefix: str = "",
                       is_master: bool = False,
-                      decrypt_keys: bool = False) -> Response:
-    return Response(rewrite_playlist(text, base, seg_prefix, variant_prefix,
-                                     is_master, decrypt_keys),
+                      decrypt_keys: bool = False,
+                      start_offset: float = 0.0) -> Response:
+    variant_query = ""
+    if is_master and start_offset > 0:
+        # master 不能带 EXT-X-START，把起播点透传给子清单。
+        variant_query = f"&start={int(start_offset)}"
+    body = rewrite_playlist(text, base, seg_prefix, variant_prefix,
+                            is_master, decrypt_keys, variant_query)
+    if start_offset > 0:
+        body = inject_start(body, start_offset)
+    return Response(body,
                     media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
 

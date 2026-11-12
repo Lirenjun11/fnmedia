@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 import fake
 import hls
 import playstate
+import runtime
 import upstream
 
 router = APIRouter()
@@ -138,16 +139,45 @@ async def favorite_list(request: Request):
     return JSONResponse(payload)
 
 
+def _play_identity(store, body: dict):
+    """解析播放身份，返回 (剧 guid, 集序号, 集 guid)。
+
+    官方 Web 端把剧 guid 放在 `guid`、集 guid 放在 `item_guid`，手机端有时
+    只给 media/video guid。先解析能定位到具体集的字段，再退回裸标题 guid，
+    否则 item_guid 是剧 guid 时会提前返回第 1 集，丢掉 media_guid 里的集号。
+    """
+    for key in ("item_guid", "guid", "media_guid", "video_guid"):
+        value = str(body.get(key) or "")
+        if not value:
+            continue
+        ep = store.resolve_episode(value)
+        if ep:
+            return ep[0], ep[1], value
+        media = store.resolve_media(value)
+        if media:
+            return media[0], media[1], fake.episode_guid(media[0], media[1])
+    for key in ("item_guid", "guid"):
+        value = str(body.get(key) or "")
+        if value and store.get(value):
+            return value, 0, ""
+    return "", 0, ""
+
+
 @router.post("/v/api/v1/play/record")
 async def play_record(request: Request):
     body = await _body(request)
-    guid = _guid(body)
-    brief, canonical = _canonical(request, guid)
+    store = request.app.state.store
+    canonical, index, episode = _play_identity(store, body)
+    brief = store.get(canonical) if canonical else None
     if not brief:
         return await _passthrough(request)
-    meta = hls.get_playlist_meta((canonical, 0, 0)) or {}
-    playstate.record({**body, "item_guid": canonical}, brief,
+    meta = hls.get_playlist_meta((canonical, 0, index)) or {}
+    playstate.record({**body, "item_guid": canonical,
+                      "episode_guid": episode}, brief,
                      float(meta.get("duration") or 0))
+    runtime.log(f"play/record: {brief.get('title', '')[:30]} ep{index + 1} "
+                f"ts={body.get('ts')!r} dur={body.get('duration')!r} "
+                f"keys={','.join(sorted(str(k) for k in body)[:10])}")
     return JSONResponse({"code": 0, "msg": "", "data": True})
 
 

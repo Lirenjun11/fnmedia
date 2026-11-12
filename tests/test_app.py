@@ -913,6 +913,23 @@ class HlsTest(unittest.TestCase):
         self.assertIn("/seg?u=", media)
         self.assertNotIn("/variant?u=", media)
 
+    def test_resume_start_injected_into_media_playlist(self):
+        media = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg1.ts\n"
+                 "#EXT-X-ENDLIST\n")
+        out = hls.playlist_response(media, "https://cdn.invalid/p/index.m3u8",
+                                    "/seg", start_offset=120).body.decode()
+        self.assertIn("#EXT-X-START:TIME-OFFSET=120.000,PRECISE=NO", out)
+        # 直播清单没有稳定时间轴，不注入
+        live = "#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n"
+        self.assertNotIn("#EXT-X-START", hls.inject_start(live, 60))
+        # master 不能带 EXT-X-START，起播点透传给子清单
+        master = ("#EXTM3U\n"
+                  "#EXT-X-STREAM-INF:BANDWIDTH=2000000\nv720.m3u8\n")
+        out = hls.playlist_response(master, "https://cdn.invalid/p/master.m3u8",
+                                    "/seg", "/variant", True, False, 90).body.decode()
+        self.assertNotIn("#EXT-X-START", out)
+        self.assertIn("&start=90", out)
+
 
 if __name__ == "__main__":
     unittest.main()

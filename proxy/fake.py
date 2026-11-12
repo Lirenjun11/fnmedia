@@ -492,7 +492,10 @@ def episode_play_info(b: dict, index: int, guid: str) -> dict:
 
 def history_card(b: dict, rec: dict) -> dict:
     row = search_card(b)
-    row["ts"] = int(rec.get("ts") or 0)
+    pos = int(rec.get("ts") or 0)
+    row["ts"] = pos
+    # 继续观看卡片的进度条读 watched_ts（与 play/info 的续播字段同一语义）。
+    row["watched_ts"] = pos
     row["duration"] = int(rec.get("duration") or 0)
     row["_updated_at"] = int(rec.get("updated_at") or 0)
     return row

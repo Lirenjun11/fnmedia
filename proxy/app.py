@@ -425,6 +425,18 @@ async def season_route_post(guid: str, request: Request):
     return await season_route(guid, request)
 
 
+def _apply_episode_progress(rows: list, tv_guid: str) -> list:
+    """选集列表里给“最后观看的那一集”回填进度，客户端才显示续播条。"""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pos = playstate.episode_ts(tv_guid, str(row.get("guid") or ""))
+        if pos:
+            row["ts"] = pos
+            row["watched_ts"] = pos
+    return rows
+
+
 @app.get("/v/api/v1/episode/list/{guid}")
 async def episode_route(guid: str, request: Request):
     store = request.app.state.store
@@ -432,8 +444,8 @@ async def episode_route(guid: str, request: Request):
     brief = store.get(tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
-    return JSONResponse(fake.ok(fake.normalize_cards(
-        fake.episode_list(brief), _ua(request))))
+    rows = _apply_episode_progress(fake.episode_list(brief), tv_guid)
+    return JSONResponse(fake.ok(fake.normalize_cards(rows, _ua(request))))
 
 
 @app.post("/v/api/v1/episode/list/{guid}")
@@ -461,7 +473,8 @@ async def item_list_route(request: Request):
     tv_guid = store.resolve_season(parent)
     brief = store.get(tv_guid) if tv_guid else None
     if brief:
-        rows = fake.normalize_cards(fake.episode_list(brief), _ua(request))
+        rows = _apply_episode_progress(fake.episode_list(brief), tv_guid)
+        rows = fake.normalize_cards(rows, _ua(request))
         return JSONResponse(fake.ok(_listing(rows)))
     return await _passthrough(request)
 
@@ -519,6 +532,11 @@ async def _body(request: Request) -> dict:
 
 
 def _resume_index(store: cms.TitleStore, guid: str) -> int:
+    episode = playstate.episode_for(guid)
+    if episode:
+        resolved = store.resolve_episode(episode)
+        if resolved and resolved[0] == guid:
+            return resolved[1]
     media = playstate.media_for(guid)
     if media:
         resolved = store.resolve_media(media)
@@ -638,7 +656,8 @@ async def play_info_route(request: Request):
         brief = store.get(ep[0])
         if not brief:
             return await _passthrough(request)
-        info = fake.episode_play_info(brief, ep[1], guid)
+        index = ep[1]
+        info = fake.episode_play_info(brief, index, guid)
         canonical = ep[0]
     else:
         brief = store.get(guid)
@@ -650,9 +669,23 @@ async def play_info_route(request: Request):
             eg = fake.episode_guid(guid, index)
             info = fake.episode_play_info(brief, index, eg)
         else:
+            index = 0
             info = fake.play_info(brief, mg, vg, guid)
         canonical = guid
-    info["ts"] = playstate.ts_for(canonical)
+    pos = playstate.ts_for(canonical)
+    info["ts"] = pos
+    # 官方 Web/App 的续播点是 play/info 响应里的 item.watched_ts（客户端
+    # 直接拿它 seek），只写外层 ts 不会被读取。
+    item = info.get("item")
+    if isinstance(item, dict):
+        playstate.apply(item, canonical)
+        item["ts"] = pos
+        item["watched_ts"] = pos
+        meta = hls.get_playlist_meta((canonical, 0, index)) or {}
+        if not item.get("duration") and meta.get("duration"):
+            item["duration"] = int(meta["duration"])
+    runtime.log(f"play/info: {brief.get('title', '')[:30]} "
+                f"ep{index + 1} ts={pos} resume={pos > 0}")
     return JSONResponse(fake.ok(fake.normalize_detail(info, _ua(request))))
 
 
@@ -770,10 +803,23 @@ async def play_play(request: Request):
     link = f"{ONLINE}/{mg}/{suffix}?line={line}&index={index}"
     if not explicit:
         link += "&auto=1"
+    try:
+        start = int(float(body.get("startTimestamp")
+                          or body.get("start_ts") or 0))
+    except (TypeError, ValueError):
+        start = 0
+    if 5 <= start <= 43200:
+        # 超过片长 95% 的起点视为“已看完重看”，从头开始，避免一进去就结束。
+        meta = hls.get_playlist_meta((guid, line, index)) or {}
+        total = float(meta.get("duration") or 0)
+        if total > 0 and start > total * 0.95:
+            start = 0
+        else:
+            link += f"&start={start}"
     runtime.log(f"play: {brief.get('title', '')[:30]} ep{index + 1} "
                 f"line={line}/{len(brief.get('line_names') or [])} "
                 f"bitrate={body.get('bitrate')!r} auto={not explicit} "
-                f"ua={_ua(request)[:40]!r}")
+                f"start={start} ua={_ua(request)[:40]!r}")
     return JSONResponse(fake.play_response(
         mg, str(body.get("video_guid") or _video_guid_for(guid, index, mg)),
         link, "HLS" if is_hls else "MP4"))
@@ -830,9 +876,16 @@ async def preset_m3u8(mg: str, request: Request):
         pass
     label = (fake.line_display(brief, names[line]) if names
              else "原画").replace('"', "")
+    main_uri = f"main.m3u8?line={line}&index={index}"
+    try:
+        start = int(float(request.query_params.get("start") or 0))
+    except ValueError:
+        start = 0
+    if start > 0:
+        main_uri += f"&start={start}"
     text = ("#EXTM3U\n#EXT-X-VERSION:3\n"
             f'#EXT-X-STREAM-INF:BANDWIDTH=2000000,PROGRAM-ID=1,NAME="{label}"\n'
-            f"main.m3u8?line={line}&index={index}\n")
+            f"{main_uri}\n")
     return Response(text, media_type="application/vnd.apple.mpegurl",
                     headers={"Access-Control-Allow-Origin": "*",
                              "Cache-Control": "no-store"})
@@ -851,6 +904,10 @@ async def main_m3u8(mg: str, request: Request):
         line = int(request.query_params.get("line", 0))
     except ValueError:
         line = 0
+    try:
+        start_offset = float(request.query_params.get("start") or 0)
+    except ValueError:
+        start_offset = 0.0
     auto_start = request.query_params.get("auto") == "1"
     if not auto_start:
         cached = hls.get_playlist_text((guid, line, index))
@@ -859,7 +916,8 @@ async def main_m3u8(mg: str, request: Request):
             return hls.playlist_response(text, base, SEG_PREFIX,
                                          f"{ONLINE}/variant",
                                          hls.is_master(text),
-                                         hls.can_decrypt())
+                                         hls.can_decrypt(),
+                                         start_offset=start_offset)
     if auto_start and config.get().get("auto_best_source", True):
         winner = await _race_lines(request.app.state.src, brief, guid, index,
                                    line, 3.0)
@@ -874,7 +932,8 @@ async def main_m3u8(mg: str, request: Request):
             return hls.playlist_response(text, base, SEG_PREFIX,
                                          f"{ONLINE}/variant",
                                          hls.is_master(text),
-                                         hls.can_decrypt())
+                                         hls.can_decrypt(),
+                                         start_offset=start_offset)
     last_error = ""
     tried = set()
     while len(tried) < 2:
@@ -911,7 +970,8 @@ async def main_m3u8(mg: str, request: Request):
             return hls.playlist_response(text, base, SEG_PREFIX,
                                          f"{ONLINE}/variant",
                                          hls.is_master(text),
-                                         hls.can_decrypt())
+                                         hls.can_decrypt(),
+                                         start_offset=start_offset)
     if last_error:
         runtime.log(f"playback failed: {brief.get('title', '')[:40]} ({last_error})")
     return Response(status_code=502)
@@ -933,8 +993,13 @@ async def variant_playlist(request: Request):
         return Response(status_code=502)
     if hls.is_master(text):
         return Response(status_code=502)
+    try:
+        start_offset = float(request.query_params.get("start") or 0)
+    except ValueError:
+        start_offset = 0.0
     return hls.playlist_response(text, base, SEG_PREFIX,
-                                 decrypt_keys=hls.can_decrypt())
+                                 decrypt_keys=hls.can_decrypt(),
+                                 start_offset=start_offset)
 
 
 @app.get(f"{ONLINE}/{{mg}}/direct")

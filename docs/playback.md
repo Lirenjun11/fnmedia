@@ -9,7 +9,10 @@
 在线条目是虚拟 item，官方数据库中没有对应记录，因此官方的收藏、已看与播放历史接口对它们都会返回业务错误。扩展自行拦截并维护这些状态（不写官方数据库）：
 
 - 拦截 `PUT/DELETE /v/api/v1/item/favorite`、`POST/DELETE /v/api/v1/item/watched`、`POST/DELETE /v/api/v1/favorite/list`、`POST /v/api/v1/play/record`、`GET /v/api/v1/play/list`、`POST /v/api/v1/play/info`，并在详情与搜索卡片回填 `is_favorite / is_watched / watched_ts / ts / duration`。
-- 收藏、已看、收藏夹、首页「继续观看」均可用；`play/info` 回填 `ts` 从上次位置续播；看完 95% 自动移出继续观看并标记已看。
+- 续播：官方 Web/App 拿 `play/info` 响应里的 **`item.watched_ts`**（秒）作为起播位置，外层 `ts` 不会被读，因此两处同步回填；`play/play` 请求里的 `startTimestamp` 会带进播放地址，HLS 点播清单再注入 `#EXT-X-START`，让不自行 seek 的原生播放器也能接着播。起播点超过片长 95% 视为“已看完重看”，从头开始。
+- `watched_ts` 只表示播放进度（秒）；“标记已看的时间”放在 `watched_at`，不能混用——客户端会把 unix 时间戳当成播放位置跳到片尾。
+- 剧集进度按“最后观看的那一集”记录：换集时不会用旧集位置取 max，选集列表只给该集回填进度条；`play/info` 传剧 guid 时会解析到最后观看的那一集。
+- 收藏、已看、收藏夹、首页「继续观看」均可用；看完 95% 自动移出继续观看并标记已看。
 - 更多菜单里「手动匹配影片 / 刷新元数据 / 编辑元数据 / 删除」对虚拟条目语义上不适用，相关写请求吸收为 no-op，不再向官方报错。
 - 状态统一存于 `state/config.json` 的 `playstate` 键：收藏上限 500、历史上限 100，进度 10 秒节流写盘，服务停止时强制落盘。
 - 已知限制：标题库为纯内存态，服务重启后收藏/历史卡片需要重新搜索同名条目才会重新可播；状态本身不会丢失。多账号共用一份状态（未做用户隔离）。
