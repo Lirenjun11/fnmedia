@@ -71,7 +71,11 @@ export default function App() {
     <div className="layout">
       <aside className="sidebar">
         <div className="brand">
-          <img className="brand-mark" src="/v/ext/app-icon.png" alt="" />
+          <img
+            className="brand-mark"
+            src={`/v/ext/app-icon.png?v=${boot?.version || '2'}`}
+            alt=""
+          />
           <div>
             <div className="brand-name">fnmedia</div>
             <div className="brand-sub">飞牛影视扩展</div>
@@ -92,7 +96,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div>v{boot?.version || '0.0.1.0'} · 零内置源</div>
+          <div>v{boot?.version || '0.0.1.1'} · 零内置源</div>
         </div>
       </aside>
 
@@ -192,7 +196,7 @@ function Overview({ boot, onGo }: { boot: Bootstrap | null; onGo: () => void }) 
       <div className="card">
         <div className="card-title">运行信息</div>
         <div className="pill-row mt">
-          <span className="badge brand">v{boot?.version || '0.0.1.0'}</span>
+          <span className="badge brand">v{boot?.version || '0.0.1.1'}</span>
           <span className="badge">运行 {Math.round((boot?.uptime ?? 0) / 60)} 分钟</span>
           <span className="badge ok">上游接管正常</span>
         </div>

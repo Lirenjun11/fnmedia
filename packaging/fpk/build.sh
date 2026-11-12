@@ -33,8 +33,9 @@ EXCLUDES=(
     --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc'
     --exclude='.git/' --exclude='.tools/' --exclude='dist/'
     --exclude='state/' --exclude='packaging/fpk/.build/'
-    --exclude='node_modules/' --exclude='web/src/' --exclude='web/dist/'
-    --exclude='web/.vite/' --exclude='tests/' --exclude='*.fpk' --exclude='.DS_Store'
+    --exclude='node_modules/' --exclude='web/' --exclude='tests/'
+    --exclude='packaging/' --exclude='.github/'
+    --exclude='*.fpk' --exclude='.DS_Store'
 )
 [ "${SLIM}" -eq 1 ] && EXCLUDES+=(--exclude='wheelhouse/')
 
