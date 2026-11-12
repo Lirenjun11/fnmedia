@@ -8,5 +8,6 @@ proxy/static/
 state/
 dist/
 .tools/
+.workbuddy/
 packaging/fpk/.build/
 .DS_Store

@@ -20,6 +20,7 @@ import json
 import threading
 import time
 
+import acl
 import catalog
 import charts
 import cms
@@ -73,10 +74,16 @@ def refresh_interval() -> float:
 # --------------------------------------------------------------- 库卡片
 
 def libraries() -> list[dict]:
-    """构造要注入 mediadb/list 的虚拟库卡片（按固定顺序）。"""
+    """构造要注入 mediadb/list 的虚拟库卡片（按固定顺序）。
+
+    开启账号权限后只返回当前账号被授权的库；分类库还要求它的分类路由
+    所属的源已被授权，否则点进去也取不到内容。
+    """
     out: list[dict] = []
     if charts_enabled():
         for cat, title, mdb in charts.CHART_CATEGORIES:
+            if not acl.lib_allowed(f"chart:{cat}"):
+                continue
             if not charts.chart_cache.items(cat):
                 continue
             posters = [fake.poster_path(url)
@@ -85,8 +92,12 @@ def libraries() -> list[dict]:
             out.append(_lib_card(CHART_LIB_GUIDS[cat], title, mdb, posters))
     if catalog_enabled():
         for cat, title, mdb in catalog.CATALOG_CATEGORIES:
+            if not acl.lib_allowed(f"catalog:{cat}"):
+                continue
             route = catalog.catalog.route(cat)
             if not route or not route.get("total"):
+                continue
+            if not acl.provider_allowed(route.get("source_id")):
                 continue
             posters = [fake.poster_path(url)
                        for url in (route.get("posters") or [])][:8]
@@ -113,14 +124,39 @@ def is_virtual_lib(guid: str) -> bool:
     return guid in CHART_CAT_OF or guid in CATALOG_CAT_OF
 
 
+def lib_key(guid: str) -> str:
+    """库 guid -> 稳定的授权键（``chart:movie`` / ``catalog:tv``）。"""
+    cat = CHART_CAT_OF.get(guid)
+    if cat:
+        return f"chart:{cat}"
+    cat = CATALOG_CAT_OF.get(guid)
+    if cat:
+        return f"catalog:{cat}"
+    return ""
+
+
+def library_keys() -> list[dict]:
+    """管理页授权选项：所有可能存在的虚拟库（与是否已刷出内容无关）。"""
+    out: list[dict] = []
+    for cat, title, _ in charts.CHART_CATEGORIES:
+        out.append({"key": f"chart:{cat}", "title": title,
+                    "guid": CHART_LIB_GUIDS[cat], "kind": "chart"})
+    for cat, title, _ in catalog.CATALOG_CATEGORIES:
+        out.append({"key": f"catalog:{cat}", "title": title,
+                    "guid": CATALOG_LIB_GUIDS[cat], "kind": "catalog"})
+    return out
+
+
 def lib_guids() -> set[str]:
     return set(CHART_CAT_OF) | set(CATALOG_CAT_OF)
 
 
 def library_detail(guid: str) -> dict | None:
-    """``GET /v/api/v1/mdb/{guid}`` 的库详情；非虚拟库返回 None。"""
+    """``GET /v/api/v1/mdb/{guid}`` 的库详情；非虚拟库或无权限返回 None。"""
     if guid in CHART_CAT_OF:
         cat = CHART_CAT_OF[guid]
+        if not acl.lib_allowed(f"chart:{cat}"):
+            return None
         if not charts_enabled() or not charts.chart_cache.items(cat):
             return None
         title, mdb = charts.chart_cat_title(cat), charts.chart_cat_mdb(cat)
@@ -128,8 +164,12 @@ def library_detail(guid: str) -> dict | None:
                    for url in charts.chart_cache.covers(cat)][:8]
     elif guid in CATALOG_CAT_OF:
         cat = CATALOG_CAT_OF[guid]
+        if not acl.lib_allowed(f"catalog:{cat}"):
+            return None
         route = catalog.catalog.route(cat)
         if not catalog_enabled() or not route or not route.get("total"):
+            return None
+        if not acl.provider_allowed(route.get("source_id")):
             return None
         title, mdb = catalog.catalog_title(cat), catalog.catalog_mdb(cat)
         posters = [fake.poster_path(url)
@@ -185,11 +225,18 @@ def sum_counts() -> dict[str, int]:
     counts: dict[str, int] = {}
     if charts_enabled():
         for cat, _, _ in charts.CHART_CATEGORIES:
+            if not acl.lib_allowed(f"chart:{cat}"):
+                continue
             n = len(charts.chart_cache.items(cat))
             if n:
                 counts[CHART_LIB_GUIDS[cat]] = n
     if catalog_enabled():
         for cat, _, _ in catalog.CATALOG_CATEGORIES:
+            if not acl.lib_allowed(f"catalog:{cat}"):
+                continue
+            route = catalog.catalog.route(cat)
+            if route and not acl.provider_allowed(route.get("source_id")):
+                continue
             n = catalog.catalog.total(cat)
             if n:
                 counts[CATALOG_LIB_GUIDS[cat]] = n
@@ -295,16 +342,30 @@ def _remember_bind(guid: str, brief: dict) -> None:
 
 
 def restore(store: cms.TitleStore) -> int:
-    """进程启动时把上次绑定的榜单条目恢复到内存 store。"""
+    """进程启动时把上次绑定的榜单条目恢复到内存 store。
+
+    源可能在进程停止期间被禁用，恢复前先按当前启用源过滤一遍，否则重启后
+    旧线路会“复活”，继续从禁用源播放。
+    """
+    dropped = 0
     with _LOCK:
         if not _BINDS:
             _load_binds()
         count = 0
-        for rec in _BINDS.values():
+        for guid, rec in list(_BINDS.items()):
             brief = rec.get("brief")
-            if isinstance(brief, dict):
-                store.put_brief(dict(brief))
-                count += 1
+            if not isinstance(brief, dict):
+                continue
+            if not config.source_live(brief.get("provider")):
+                _BINDS.pop(guid, None)
+                dropped += 1
+                continue
+            store.put_brief(dict(brief))
+            count += 1
+        if dropped:
+            _save_binds()
+    if dropped:
+        runtime.log(f"vlib restore: 丢弃 {dropped} 条来自已禁用源的绑定")
     return count
 
 
@@ -339,18 +400,41 @@ def _pick_match(meta: dict, titles: list[cms.OnlineTitle]) -> cms.OnlineTitle | 
     return best
 
 
-async def ensure_bound(store: cms.TitleStore, client, guid: str) -> dict | None:
-    """确保榜单 guid 已绑定可播放 brief；未命中返回 None。"""
-    brief = store.get(guid)
+async def ensure_bound(store: cms.TitleStore, client, guid: str,
+                       ignore_acl: bool = False) -> dict | None:
+    """确保榜单 guid 已绑定「当前账号可播」的 brief；未命中返回 None。
+
+    全局 store 里的绑定可能来自另一个账号（甚至更宽的授权集），所以这里
+    先用 ``acl.filter_brief`` 判断对当前账号是否真的可用；不可用时继续走
+    重绑流程，用自己的授权源重新搜一次。
+
+    ``ignore_acl=True`` 给媒体分片链路用：播放器不带登录凭证时也能补绑，
+    避免整条播放链因为「认不出是谁」而中断。
+    """
+    raw = store.get(guid)
+    brief = acl.filter_brief(raw, enforce=not ignore_acl)
     if brief:
         return brief
+    if raw and not config.source_live(raw.get("provider")):
+        # 绑定来自已禁用的源：连同持久化记录一起作废，后面按当前启用源重搜。
+        runtime.log(f"vlib bind stale: {guid[:8]} provider="
+                    f"{raw.get('provider')} 已禁用")
+    if raw and brief is None:
+        runtime.log(f"vlib bind scope: {guid[:8]} 当前账号无可用线路，重新绑定")
     if not charts.chart_cache.is_chart_guid(guid):
         return None
     with _LOCK:
         cached = (_BINDS.get(guid) or {}).get("brief")
     if isinstance(cached, dict):
-        # store 可能因容量淘汰丢掉过它（例如翻了很多海量库页），绑定记录还在。
-        return store.put_brief(dict(cached))
+        if acl.filter_brief(cached, enforce=not ignore_acl):
+            # store 可能因容量淘汰丢掉过它（例如翻了很多海量库页），绑定记录还在。
+            return acl.filter_brief(store.put_brief(dict(cached)),
+                                    enforce=not ignore_acl)
+        if not config.source_live(cached.get("provider")):
+            with _LOCK:
+                _BINDS.pop(guid, None)
+                _save_binds()
+            _FAILED.pop(guid, None)
     now = time.monotonic()
     failed_at = _FAILED.get(guid)
     if failed_at and now - failed_at < _FAIL_TTL:
@@ -363,7 +447,9 @@ async def ensure_bound(store: cms.TitleStore, client, guid: str) -> dict | None:
             return None
     async def run() -> dict | None:
         meta = charts.chart_cache.get(guid) or {}
-        sources = config.enabled_sources()
+        # 榜单卡片按需搜源：只能用当前账号被授权的源，否则会把未授权
+        # 源的可播地址绑到卡片上，后续播放链就能绕过授权。
+        sources = acl.sources(ignore_acl)
         if not sources:
             return None
         cfg = config.get()
@@ -391,7 +477,7 @@ async def ensure_bound(store: cms.TitleStore, client, guid: str) -> dict | None:
         runtime.log(f"vlib bind: {item.get('title', '')[:24]} <- "
                     f"{matched.provider_name or matched.provider} "
                     f"lines={len(item.get('line_names') or [])}")
-        return item
+        return acl.filter_brief(item, enforce=not ignore_acl)
 
     task = asyncio.create_task(run())
     _INFLIGHT[guid] = task
@@ -465,10 +551,20 @@ async def item_list(store: cms.TitleStore, client, body: dict,
                     guid: str) -> dict | None:
     """虚拟库的 item/list 数据；非虚拟库返回 None（交给原逻辑）。"""
     if guid in CHART_CAT_OF:
-        return await _chart_listing(body, CHART_CAT_OF[guid])
+        cat = CHART_CAT_OF[guid]
+        if not acl.lib_allowed(f"chart:{cat}"):
+            return _listing(charts.chart_cat_title(cat),
+                            charts.chart_cat_mdb(cat), 0, [])
+        return await _chart_listing(body, cat)
     if guid in CATALOG_CAT_OF:
-        return await _catalog_listing(store, client, body,
-                                      CATALOG_CAT_OF[guid])
+        cat = CATALOG_CAT_OF[guid]
+        route = catalog.catalog.route(cat)
+        if (not acl.lib_allowed(f"catalog:{cat}")
+                or not route
+                or not acl.provider_allowed(route.get("source_id"))):
+            return _listing(catalog.catalog_title(cat),
+                            catalog.catalog_mdb(cat), 0, [])
+        return await _catalog_listing(store, client, body, cat)
     return None
 
 
@@ -494,7 +590,8 @@ async def _catalog_listing(store: cms.TitleStore, client, body: dict,
     if not catalog_enabled():
         return _listing(title, mdb, 0, [])
     page_size, start, end = _page_args(body, catalog.catalog.total(cat))
-    if catalog.catalog.stale() and not catalog.catalog._refreshing:
+    if catalog.catalog.needs_rebuild(cat) and not catalog.catalog._refreshing:
+        # 源被禁用后旧路由作废，后台按当前启用源重挑分类，不阻塞本次请求。
         asyncio.get_running_loop().create_task(
             catalog.catalog.refresh_routes(client, config.enabled_sources()))
     titles, total = await catalog.catalog.window(client, cat, start,
@@ -521,7 +618,9 @@ async def detail(store: cms.TitleStore, client, guid: str) -> dict | None:
     if not charts.chart_cache.is_chart_guid(guid):
         return None
     meta = charts.chart_cache.get(guid) or {}
-    brief = await ensure_bound(store, client, guid)
+    # 绑定是全局共享的（A 可能先用较宽的授权绑定），展示前必须按当前账号裁剪，
+    # 否则详情页会把别的账号才有的线路/源名暴露出来。
+    brief = acl.filter_brief(await ensure_bound(store, client, guid))
     if not brief:
         poster = fake.poster_path(meta.get("cover") or "")
         row = _blank_card(guid, meta.get("title") or "")
@@ -565,6 +664,32 @@ def bind_count() -> int:
         if not _BINDS:
             _load_binds()
         return len(_BINDS)
+
+
+def purge_provider(store: cms.TitleStore, provider: str) -> int:
+    """删除源时清掉它的绑定与内存条目。
+
+    源被“禁用”还能靠 provider 是否在配置里判断；源被“删除”后配置里已没有
+    这个 id，只能在这里主动清，否则旧线路会一直留在内存和绑定文件里。
+    """
+    pid = str(provider or "")
+    if not pid:
+        return 0
+    removed = 0
+    with _LOCK:
+        for guid, rec in list(_BINDS.items()):
+            brief = rec.get("brief") or {}
+            if str(brief.get("provider") or "") == pid:
+                _BINDS.pop(guid, None)
+                removed += 1
+        if removed:
+            _save_binds()
+    removed += store.purge(
+        lambda brief: str(brief.get("provider") or "") == pid)
+    _FAILED.clear()
+    if removed:
+        runtime.log(f"vlib purge provider {pid}: {removed} 条")
+    return removed
 
 
 def chart_of_media(media_guid: str) -> str | None:

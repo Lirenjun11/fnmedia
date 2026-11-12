@@ -3,11 +3,12 @@ import { api, type Bootstrap, type UpdateInfo } from './api';
 import SourcesPage from './Sources';
 import SubscriptionsPage from './Subscriptions';
 import PreferencesPage from './Preferences';
+import { AccountsPage } from './Accounts';
 import { AboutPage, AdFilterPage, CachePage, LogsPage, PlaybackPage, VirtualLibPage } from './Settings';
 
 export type Page =
   | 'overview' | 'sources' | 'subscriptions' | 'playback' | 'adfilter'
-  | 'vlib' | 'cache' | 'logs' | 'settings' | 'about';
+  | 'vlib' | 'accounts' | 'cache' | 'logs' | 'settings' | 'about';
 export type Notify = (message: string, kind?: 'ok' | 'err' | '') => void;
 
 const NAV: { key: Page; label: string; icon: string }[] = [
@@ -17,6 +18,7 @@ const NAV: { key: Page; label: string; icon: string }[] = [
   { key: 'playback', label: '搜索播放', icon: '▷' },
   { key: 'adfilter', label: '广告过滤', icon: '⊘' },
   { key: 'vlib', label: '虚拟媒体库', icon: '▤' },
+  { key: 'accounts', label: '账号权限', icon: '◍' },
   { key: 'cache', label: '缓存记录', icon: '▥' },
   { key: 'logs', label: '日志诊断', icon: '≡' },
   { key: 'settings', label: '设置', icon: '⚙' },
@@ -98,7 +100,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div>v{boot?.version || '0.0.1.10'} · 零内置源</div>
+          <div>v{boot?.version || '0.0.1.11'} · 零内置源</div>
         </div>
       </aside>
 
@@ -129,6 +131,9 @@ export default function App() {
             )}
             {page === 'vlib' && boot && (
               <VirtualLibPage boot={boot} refresh={refresh} notify={notify} />
+            )}
+            {page === 'accounts' && boot && (
+              <AccountsPage boot={boot} refresh={refresh} notify={notify} />
             )}
             {page === 'cache' && boot && (
               <CachePage boot={boot} refresh={refresh} notify={notify} />
@@ -204,9 +209,18 @@ function Overview({ boot, onGo }: { boot: Bootstrap | null; onGo: () => void }) 
       <div className="card">
         <div className="card-title">运行信息</div>
         <div className="pill-row mt">
-          <span className="badge brand">v{boot?.version || '0.0.1.10'}</span>
+          <span className="badge brand">v{boot?.version || '0.0.1.11'}</span>
           <span className="badge">运行 {Math.round((boot?.uptime ?? 0) / 60)} 分钟</span>
           <span className="badge ok">上游接管正常</span>
+          {boot?.acl?.enabled ? (
+            <span className={`badge ${boot.acl.known ? 'ok' : 'warn'}`}>
+              账号权限 {boot.acl.known
+                ? `已识别 ${boot.acl.name || boot.acl.uid}`
+                : '已开启 · 当前设备未识别'}
+            </span>
+          ) : (
+            <span className="badge">账号权限 未启用</span>
+          )}
         </div>
         <p className="hint">
           搜索使用固定并发与总预算，源数量增加不会改变超时；起播默认并发优选最快线路，

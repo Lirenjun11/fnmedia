@@ -142,6 +142,7 @@ class Catalog:
         self._lock = asyncio.Lock()
         self._routes: dict[str, dict] = {}
         self._updated_at = 0.0
+        self._last_attempt = 0.0
         self._refreshing = False
         self._pages: dict[tuple, tuple[float, list[cms.OnlineTitle]]] = {}
         self._load()
@@ -173,14 +174,27 @@ class Catalog:
 
     # ---------- 读取 ----------
     def route(self, cat: str) -> dict | None:
-        return self._routes.get(cat)
+        route = self._routes.get(cat)
+        if not route:
+            return None
+        # 每条路由都绑定到某个源：源被禁用后不能再拿它的分类出列表、更
+        # 不能用它的地址播放，直接视为该分类不可用（等重建选新源）。
+        if not config.source_live(route.get("source_id")):
+            return None
+        return route
+
+    def needs_rebuild(self, cat: str) -> bool:
+        """该分类是否该重建路由（源被禁用 / 从未建立 / 过期）。"""
+        if self.route(cat) is not None:
+            return self.stale()
+        return (time.time() - self._last_attempt) > 30.0
 
     def available(self, cat: str) -> bool:
-        route = self._routes.get(cat)
+        route = self.route(cat)
         return bool(route and route.get("total"))
 
     def total(self, cat: str) -> int:
-        return int((self._routes.get(cat) or {}).get("total") or 0)
+        return int((self.route(cat) or {}).get("total") or 0)
 
     def stale(self) -> bool:
         return (not self._updated_at) or (time.time() - self._updated_at) >= ROUTE_TTL
@@ -210,6 +224,7 @@ class Catalog:
         if self._refreshing:
             return self.status()
         self._refreshing = True
+        self._last_attempt = time.time()
         try:
             table = await self._discover(client, sources)
             if table:
@@ -303,7 +318,7 @@ class Catalog:
 
     async def window(self, client: httpx.AsyncClient, cat: str,
                      offset: int, size: int) -> tuple[list[cms.OnlineTitle], int]:
-        route = self._routes.get(cat)
+        route = self.route(cat)
         if not route:
             return [], 0
         total = int(route.get("total") or 0)

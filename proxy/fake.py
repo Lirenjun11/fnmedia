@@ -178,6 +178,10 @@ def brief_of(t: cms.OnlineTitle, guid: str) -> dict:
         for name, eps in t.lines.items() if eps
     }
     names = cms.line_names(t)
+    # 合并卡的线路来自不同源；单源卡没有映射时按 primary provider 补全。
+    line_sources = dict(t.line_sources or {})
+    for name in names:
+        line_sources.setdefault(name, t.provider)
     first = (t.lines.get(names[0]) or []) if names else []
     first_url = first[0].url if first else ""
     return {
@@ -188,7 +192,7 @@ def brief_of(t: cms.OnlineTitle, guid: str) -> dict:
         "poster": t.poster, "overview": t.overview, "actor": t.actor,
         "director": t.director, "updated": t.updated, "lines": lines,
         "is_tv": cms.is_tv(t), "episodes": cms.episode_count(t),
-        "line_names": names,
+        "line_names": names, "line_sources": line_sources,
         "primary_ext": "mp4" if ".mp4" in first_url.lower() else "m3u8",
     }
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+import acl
 import cms
 import catalog
 import charts
@@ -50,15 +51,33 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.10"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.11"
     except OSError:
-        return "0.0.1.10"
+        return "0.0.1.11"
 
 
 def _public_config() -> dict:
     cfg = config.get()
     cfg.pop("admin_token", None)
+    # 设备绑定只在本机有意义，不随导出口令外流；导入时保留现有绑定。
+    cfg.pop("acl_devices", None)
     return cfg
+
+
+def _acl_summary() -> dict:
+    ident = acl.current()
+    grant = (config.get().get("acl_grants") or {}).get(ident.uid) or {}
+    return {
+        "enabled": acl.enabled(),
+        "known": ident.known,
+        "uid": ident.uid,
+        "name": ident.name,
+        "via": ident.via,
+        "reason": ident.reason,
+        "libs": len(grant.get("libs") or []),
+        "sources": len(grant.get("sources") or []),
+        "sources_total": len(config.enabled_sources()),
+    }
 
 
 async def fetch_and_apply(url: str | None = None,
@@ -112,6 +131,7 @@ async def bootstrap(request: Request):
         "config": cfg,
         "sources": sources,
         "vlib": vlib_status(),
+        "acl": _acl_summary(),
     })
 
 
@@ -176,6 +196,11 @@ async def delete_source(sid: str, request: Request):
         return fail("源不存在", 404)
     cfg["sources"] = left
     config.save(cfg)
+    # 源被删除后配置里已没有这个 id，播放链无法再判断它失效，只能在这里清。
+    try:
+        vlib.purge_provider(request.app.state.store, sid)
+    except Exception as exc:  # noqa: BLE001 - 清理失败不影响删除本身
+        runtime.log(f"purge provider failed: {type(exc).__name__}")
     return ok({"deleted": sid})
 
 
@@ -362,6 +387,152 @@ async def apply_subscription(request: Request):
 async def clear_cache(request: Request):
     guard(request)
     return ok({"cleared": cms.clear_cache()})
+
+
+# --------------------------------------------------------------- 账号权限
+
+def _acl_payload() -> dict:
+    """管理页需要的完整视图：状态 + 可选库 + 可选源。"""
+    status = acl.status()
+    status["libs"] = vlib.library_keys()
+    status["sources"] = [
+        {"id": str(s.get("id") or ""), "name": str(s.get("name") or ""),
+         "enabled": bool(s.get("enabled"))}
+        for s in config.all_sources()
+    ]
+    return status
+
+
+@router.get("/acl/status")
+async def acl_status(request: Request):
+    guard(request)
+    return ok(_acl_payload())
+
+
+@router.get("/acl/probe")
+async def acl_probe(request: Request):
+    """自检：当前请求带了什么凭证、被识别成谁、官方库发现了哪些表。"""
+    guard(request)
+    return ok(acl.probe(request))
+
+
+@router.patch("/acl/config")
+async def acl_config(request: Request):
+    guard(request)
+    body = await body_json(request)
+    cfg = config.get()
+    turning_on = bool(body.get("enabled")) and not cfg.get("acl_enabled")
+    if turning_on:
+        # 冷启动死锁防护：没有任何授权就开启，等于所有账号（含管理员）在线
+        # 内容瞬间全部消失，且很难自救。
+        grants = cfg.get("acl_grants") or {}
+        if not any((g or {}).get("libs") or (g or {}).get("sources")
+                   for g in grants.values()):
+            return fail("请先给至少一个账号勾选媒体库或片源，再开启账号权限")
+    if "enabled" in body:
+        cfg["acl_enabled"] = bool(body["enabled"])
+    for key in ("acl_subjects", "acl_grants", "acl_devices"):
+        if key in body:
+            cfg[key] = body[key]
+    config.save(cfg)
+    acl.invalidate()
+    runtime.log(f"acl: enabled={cfg.get('acl_enabled')} "
+                f"subjects={len(cfg.get('acl_subjects') or [])} "
+                f"grants={len(cfg.get('acl_grants') or [])}")
+    return ok(_acl_payload())
+
+
+@router.post("/acl/grant")
+async def acl_grant(request: Request):
+    guard(request)
+    body = await body_json(request)
+    uid = str(body.get("uid") or "").strip()[:64]
+    if not uid:
+        return fail("请先选择账号")
+    cfg = config.get()
+    grants = dict(cfg.get("acl_grants") or {})
+    grants[uid] = {"libs": body.get("libs") or [],
+                   "sources": body.get("sources") or []}
+    cfg["acl_grants"] = grants
+    if body.get("name"):
+        subjects = [dict(s) for s in (cfg.get("acl_subjects") or [])]
+        if not any(str(s.get("id")) == uid for s in subjects):
+            subjects.append({"id": uid, "name": str(body["name"])[:60],
+                             "source": "manual"})
+            cfg["acl_subjects"] = subjects
+    config.save(cfg)
+    acl.invalidate(uid)
+    return ok(_acl_payload())
+
+
+@router.delete("/acl/grant/{uid}")
+async def acl_revoke(uid: str, request: Request):
+    guard(request)
+    cfg = config.get()
+    grants = dict(cfg.get("acl_grants") or {})
+    grants.pop(uid, None)
+    cfg["acl_grants"] = grants
+    config.save(cfg)
+    acl.invalidate(uid)
+    return ok(_acl_payload())
+
+
+@router.post("/acl/subjects")
+async def acl_add_subject(request: Request):
+    guard(request)
+    body = await body_json(request)
+    uid = str(body.get("id") or "").strip()[:64]
+    name = str(body.get("name") or uid).strip()[:60] or uid
+    if not uid:
+        return fail("账号标识不能为空（建议填 fnOS 的 user_id）")
+    cfg = config.get()
+    subjects = [dict(s) for s in (cfg.get("acl_subjects") or [])]
+    if not any(str(s.get("id")) == uid for s in subjects):
+        subjects.append({"id": uid, "name": name, "source": "manual"})
+    cfg["acl_subjects"] = subjects
+    config.save(cfg)
+    return ok(_acl_payload())
+
+
+@router.delete("/acl/subjects/{uid}")
+async def acl_del_subject(uid: str, request: Request):
+    guard(request)
+    cfg = config.get()
+    cfg["acl_subjects"] = [s for s in (cfg.get("acl_subjects") or [])
+                           if str(s.get("id")) != uid]
+    config.save(cfg)
+    return ok(_acl_payload())
+
+
+@router.post("/acl/bind")
+async def acl_bind(request: Request):
+    """把当前请求的设备凭证绑定到指定账号；uid 为空表示解绑。"""
+    guard(request)
+    body = await body_json(request)
+    uid = str(body.get("uid") or "").strip()[:64]
+    fp = acl.device_fp(request)
+    if not fp:
+        return fail("当前请求没有可用的设备凭证")
+    cfg = config.get()
+    devices = dict(cfg.get("acl_devices") or {})
+    if uid:
+        devices[fp] = {"uid": uid, "ua": request.headers.get("user-agent", "")[:120],
+                       "ts": int(time.time())}
+    else:
+        devices.pop(fp, None)
+    cfg["acl_devices"] = devices
+    config.save(cfg)
+    acl.invalidate()
+    runtime.log(f"acl bind: fp={fp[:8]} uid={uid or '-'} total={len(devices)}")
+    return ok({"bound": bool(uid), "fp": fp, "uid": uid,
+               "status": _acl_payload()})
+
+
+@router.post("/acl/discover")
+async def acl_discover(request: Request):
+    guard(request)
+    report = acl.discover(force=True)
+    return ok(report)
 
 
 def vlib_status() -> dict:

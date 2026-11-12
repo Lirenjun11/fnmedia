@@ -13,6 +13,8 @@ from dataclasses import dataclass, field, replace
 
 import httpx
 
+import config
+
 _MEDIA = re.compile(r"\.(m3u8|mp4|flv|mkv|ts)(\?|$)", re.I)
 _UA = "Mozilla/5.0 (compatible; fnmedia-ext/0.1)"
 _TAG_RE = re.compile(r"<[^>]*>")
@@ -52,6 +54,8 @@ class OnlineTitle:
     director: str = ""
     updated: str = ""
     lines: dict = field(default_factory=dict)
+    # 线路名 -> provider：合并卡里线路来自不同源，账号授权裁剪必须靠它。
+    line_sources: dict = field(default_factory=dict)
 
     @property
     def online_id(self) -> str:
@@ -199,6 +203,7 @@ def _merge_bucket(bucket: list[OnlineTitle]) -> list[OnlineTitle]:
     ordered = sorted(first_by_provider.values(), key=lambda x: x.provider)
     primary = ordered[0]
     lines: dict[str, list] = {}
+    line_sources: dict[str, str] = {}
     for t in ordered:
         prefix = str(t.provider_name or t.provider).strip()
         for name, eps in t.lines.items():
@@ -208,7 +213,8 @@ def _merge_bucket(bucket: list[OnlineTitle]) -> list[OnlineTitle]:
                 key = f"{prefix}：{name}·{n}"
                 n += 1
             lines[key] = eps
-    return [replace(primary, lines=lines)] + extra
+            line_sources[key] = t.provider
+    return [replace(primary, lines=lines, line_sources=line_sources)] + extra
 
 
 def merge_titles(titles: list[OnlineTitle]) -> list[OnlineTitle]:
@@ -256,8 +262,8 @@ async def search_source(client: httpx.AsyncClient, source: dict,
     return out
 
 
-_CACHE: dict[str, tuple[float, list[OnlineTitle]]] = {}
-_INFLIGHT: dict[str, asyncio.Task] = {}
+_CACHE: dict[tuple, tuple[float, list[OnlineTitle]]] = {}
+_INFLIGHT: dict[tuple, asyncio.Task] = {}
 _CACHE_TTL = 120.0
 
 
@@ -267,10 +273,15 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
     keyword = (keyword or "").strip()
     if not keyword or not sources:
         return []
-    hit = _CACHE.get(keyword)
+    # 缓存必须带上源集合：只按关键词缓存的话，禁用旧源、启用新源后同一
+    # 关键词仍会命中旧源的结果，用户会看到“禁用的源还能播”。
+    sig = tuple(sorted((str(s.get("id") or ""), str(s.get("api") or ""))
+                       for s in sources))
+    cache_key = (keyword, sig)
+    hit = _CACHE.get(cache_key)
     if hit and hit[1] and time.monotonic() - hit[0] < _CACHE_TTL:
         return hit[1]
-    task = _INFLIGHT.get(keyword)
+    task = _INFLIGHT.get(cache_key)
     if task and not task.done():
         return await task
 
@@ -309,15 +320,15 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
         if dedup:
             if len(_CACHE) > 200:
                 _CACHE.clear()
-            _CACHE[keyword] = (time.monotonic(), dedup)
+            _CACHE[cache_key] = (time.monotonic(), dedup)
         return dedup
 
     task = asyncio.create_task(run())
-    _INFLIGHT[keyword] = task
+    _INFLIGHT[cache_key] = task
     try:
         return await task
     finally:
-        _INFLIGHT.pop(keyword, None)
+        _INFLIGHT.pop(cache_key, None)
 
 
 def clear_cache() -> int:
@@ -340,13 +351,41 @@ class TitleStore:
     def guid_of(t: OnlineTitle) -> str:
         return hashlib.md5(f"on_{t.provider}_{t.vod_id}".encode()).hexdigest()
 
+    def _keep_richer(self, guid: str, brief: dict,
+                     acl_on: bool | None = None) -> dict:
+        """账号权限开启时，不允许把已有条目覆盖成「线路更少」的版本。
+
+        TitleStore 是进程级共享的：账号 A（授权源少）搜索一次，会把账号 B
+        之前搜到的多源合并卡覆盖成单源，B 的线路凭空消失。这里只在开启
+        ACL 时做「不降级」保护；关闭时保持原有的覆盖行为。
+        """
+        if acl_on is None:
+            try:
+                acl_on = bool(config.get().get("acl_enabled"))
+            except Exception:  # noqa: BLE001 - 配置读取失败按原行为处理
+                acl_on = False
+        if not acl_on:
+            return brief
+        old = self._items.get(guid)
+        if not isinstance(old, dict):
+            return brief
+        old_names = set(old.get("line_names") or [])
+        new_names = set(brief.get("line_names") or [])
+        if old_names and new_names and new_names <= old_names:
+            return old
+        return brief
+
     def remember(self, titles: list[OnlineTitle]) -> list[dict]:
         out = []
         from fake import (brief_of, media_guid, video_guid, ep_media_guid,
                           ep_video_guid, episode_guid, season_guid)
+        try:
+            acl_on = bool(config.get().get("acl_enabled"))
+        except Exception:  # noqa: BLE001
+            acl_on = False
         for t in titles:
             guid = self.guid_of(t)
-            brief = brief_of(t, guid)
+            brief = self._keep_richer(guid, brief_of(t, guid), acl_on)
             self._items[guid] = brief
             self._season[season_guid(guid)] = guid
             self._media[media_guid(guid)] = (guid, 0)
@@ -365,6 +404,19 @@ class TitleStore:
     def get(self, guid: str) -> dict | None:
         return self._items.get(guid)
 
+    def purge(self, predicate) -> int:
+        """按条件清掉条目（源被删除/禁用后，避免旧线路继续可播）。"""
+        removed = 0
+        for guid, brief in list(self._items.items()):
+            try:
+                hit = predicate(brief)
+            except Exception:  # noqa: BLE001 - 判定函数异常按不删除处理
+                hit = False
+            if hit:
+                self._drop(guid)
+                removed += 1
+        return removed
+
     def put_brief(self, brief: dict) -> dict:
         """按 brief 自带的 guid 注册一条可播放数据。
 
@@ -377,6 +429,7 @@ class TitleStore:
         guid = str(brief.get("guid") or "")
         if not guid:
             return brief
+        brief = self._keep_richer(guid, brief)
         self._items[guid] = brief
         self._season[season_guid(guid)] = guid
         self._media[media_guid(guid)] = (guid, 0)

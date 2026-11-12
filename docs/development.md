@@ -18,6 +18,7 @@ proxy/
   catalog.py       资源站分类深翻（虚拟库内容层）
   vlib.py          虚拟媒体库定义、卡片、榜单条目懒绑定
   vlib_api.py      mediadb/list、mdb/{guid}、mediadb/sum 接管
+  acl.py           账号权限：身份识别、库/源授权、合并卡线路裁剪
   admin_api.py     管理 REST 接口 + 订阅全量拉取与定时刷新
   webui_gateway.py 桌面 iframe 网关
   upcheck.py       GitHub 只读检查更新
@@ -32,6 +33,8 @@ packaging/fpk/     FPK 骨架与 build.sh
 搜索接口在扩展侧做会话级输入防抖（`search_debounce_ms`，默认 200ms，`0` 关闭，上限 1000）：飞牛客户端录入即搜产生的连续请求仍各自透传官方后端，但按会话只有最后一次会去查在线源，中间请求只返回官方本地结果；防抖等待不计入 `search_timeout` 预算，预算从防抖结束、开始查询时才起算。会话按凭据哈希分组，避免多设备互相抑制。飞牛前端的请求时机与官方本地结果均不受影响。
 
 管理页打开时按需检查一次更新（命中 6 小时缓存则不出网）；「日志诊断」页打开期间前端每 2 秒刷新一次日志，离开页面即停止——服务端没有任何常驻轮询。
+
+账号权限集中在 `acl.py`：HTTP middleware 每个请求解析一次身份（请求头 → 管理页设备绑定 → 官方 sqlite 会话表只读反查，结果缓存 30s），授权判定只读 `acl_grants`。所有详情 / 选集 / 播放链路都经由 `_brief()` → `acl.filter_brief()`，按线路的真实来源（`line_sources`）裁剪合并卡；虚拟库列表与详情按 `chart:*` / `catalog:*` 键过滤。`/v/api/ext/*` 与 `/v/online-admin` 永不参与判定，保证权限配置出问题时仍能在管理页关闭。
 
 虚拟媒体库的后台任务只在缓存过期时刷新（启动 5 秒后检查一次，之后每 10 分钟判断，命中 `vlib_refresh_hours` 才真正出网）；媒体库列表永远读本地缓存，刷新不阻塞页面。详见 [virtual-library.md](virtual-library.md)。
 

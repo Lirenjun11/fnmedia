@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import admin_api
+import acl
 import borrow
 import catalog as catalog_mod
 import charts
@@ -126,12 +127,26 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None,
 @app.middleware("http")
 async def access_log(request: Request, call_next):
     started = time.monotonic()
+    path = request.url.path
+    # 身份只在官方/媒体接口上解析；管理页自身（/v/api/ext/*）也需要，用于
+    # 自检与「绑定当前设备」，所以一并覆盖。静态资源不做无谓的库查询。
+    if path.startswith("/v/api/") or path.startswith(ONLINE) \
+            or path.startswith("/online/"):
+        try:
+            ident_token = acl.push(acl.identify(request))
+        except Exception as exc:  # noqa: BLE001 - 识别故障按未识别处理，不能 500
+            runtime.log(f"acl identify failed: {type(exc).__name__}")
+            ident_token = acl.push(acl.Identity(via="unknown",
+                                                reason="identify-error"))
+    else:
+        ident_token = acl.push(acl.Identity(via="off"))
     try:
         resp = await call_next(request)
     except Exception as exc:  
-        runtime.log(f"ERROR {request.method} {request.url.path} {type(exc).__name__}")
+        runtime.log(f"ERROR {request.method} {path} {type(exc).__name__}")
         raise
-    path = request.url.path
+    finally:
+        acl.reset(ident_token)
     if path.endswith("/task/running") or path.startswith("/v/api/ext/logs"):
         return resp
     if "/sys/img/" in path:
@@ -335,7 +350,7 @@ async def _search_is_latest(request: Request, debounce_ms: int) -> bool:
 @app.get("/v/api/v1/search/list")
 async def search_list(request: Request):
     local = await _passthrough(request)
-    sources = config.enabled_sources()
+    sources = acl.sources()
     keyword = request.query_params.get("q", "").strip()
     if not sources or not keyword:
         return local
@@ -393,7 +408,7 @@ async def item_detail(guid: str, request: Request):
         row = await vlib.detail(store, request.app.state.src, guid)
         if row:
             return JSONResponse(fake.ok(fake.normalize_detail(row, _ua(request))))
-    if not store.get(guid) and not store.resolve_media(guid) \
+    if not _brief(store, guid) and not store.resolve_media(guid) \
             and not store.resolve_episode(guid):
         owner = vlib.chart_of_media(guid)
         if owner:
@@ -401,30 +416,35 @@ async def item_detail(guid: str, request: Request):
             await vlib.ensure_bound(store, request.app.state.src, owner)
     ep = store.resolve_episode(guid)
     if ep:
-        brief = store.get(ep[0])
+        brief = _brief(store, ep[0])
+        if not brief and await _ensure_vlib(store, request.app.state.src, ep[0]):
+            # 该集挂在已禁用的源上：重绑后再取一次，详情页才不会空白。
+            brief = _brief(store, ep[0])
         if not brief:
             return await _passthrough(request)
         row = playstate.apply(fake.episode_item(brief, ep[1]), guid)
         return JSONResponse(fake.ok(fake.normalize_detail(row, _ua(request))))
     tv_guid = store.resolve_season(guid)
     if tv_guid:
-        brief = store.get(tv_guid)
+        brief = _brief(store, tv_guid)
+        if not brief and await _ensure_vlib(store, request.app.state.src, tv_guid):
+            brief = _brief(store, tv_guid)
         if not brief:
             return await _passthrough(request)
         row = playstate.apply(fake.season_item(brief), guid)
         return JSONResponse(fake.ok(fake.normalize_detail(row, _ua(request))))
-    if not store.get(guid):
+    if not _brief(store, guid):
         resolved = store.resolve_media(guid)
         if resolved:
             tv_guid, index = resolved
-            brief = store.get(tv_guid)
+            brief = _brief(store, tv_guid)
             if brief:
                 if guid in (fake.media_guid(tv_guid), fake.video_guid(tv_guid)):
                     return await _item_title_detail(brief, tv_guid, request)
                 row = playstate.apply(fake.episode_item(brief, index), guid)
                 return JSONResponse(fake.ok(
                     fake.normalize_detail(row, _ua(request))))
-    brief = store.get(guid)
+    brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
     return await _item_title_detail(brief, guid, request)
@@ -460,10 +480,10 @@ async def _item_title_detail(brief: dict, guid: str, request: Request):
 async def season_route(guid: str, request: Request):
     store = request.app.state.store
     tv_guid = _tv_guid_of(store, guid)
-    brief = store.get(tv_guid) if tv_guid else None
+    brief = _brief(store, tv_guid) if tv_guid else None
     if not brief and await _ensure_vlib(store, request.app.state.src, guid):
         tv_guid = _tv_guid_of(store, guid)
-        brief = store.get(tv_guid) if tv_guid else None
+        brief = _brief(store, tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
     rows = fake.season_list(brief)
@@ -499,10 +519,10 @@ def _apply_episode_progress(rows: list, tv_guid: str) -> list:
 async def episode_route(guid: str, request: Request):
     store = request.app.state.store
     tv_guid = _tv_guid_of(store, guid)
-    brief = store.get(tv_guid) if tv_guid else None
+    brief = _brief(store, tv_guid) if tv_guid else None
     if not brief and await _ensure_vlib(store, request.app.state.src, guid):
         tv_guid = _tv_guid_of(store, guid)
-        brief = store.get(tv_guid) if tv_guid else None
+        brief = _brief(store, tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
     rows = _apply_episode_progress(fake.episode_list(brief), tv_guid)
@@ -533,12 +553,12 @@ async def item_list_route(request: Request):
     parent = str(body.get("parent_guid") or body.get("ancestor_guid") or "")
     if not parent:
         return await _passthrough(request)
-    brief = store.get(parent)
+    brief = _brief(store, parent)
     if brief and brief.get("is_tv"):
         rows = fake.normalize_cards(fake.season_list(brief), _ua(request))
         return JSONResponse(fake.ok(_listing(rows)))
     tv_guid = store.resolve_season(parent)
-    brief = store.get(tv_guid) if tv_guid else None
+    brief = _brief(store, tv_guid) if tv_guid else None
     if brief:
         rows = _apply_episode_progress(fake.episode_list(brief), tv_guid)
         rows = fake.normalize_cards(rows, _ua(request))
@@ -562,21 +582,21 @@ async def stream_list_post(request: Request):
 
 async def _stream_list_impl(guid: str, request: Request):
     store = request.app.state.store
-    if not store.resolve_episode(guid) and not store.get(guid):
+    if not store.resolve_episode(guid) and not _brief(store, guid):
         await _ensure_vlib(store, request.app.state.src, guid)
     ep = store.resolve_episode(guid)
     if ep:
         tv_guid, ep_index = ep
         eg = guid
-    elif store.get(guid):
+    elif _brief(store, guid):
         tv_guid = guid
-        brief = store.get(tv_guid)
+        brief = _brief(store, tv_guid)
         # 电视剧整剧身份 -> 续播集，和 play/info 保持一致。
         ep_index = _resume_index(store, tv_guid) if brief and brief.get("is_tv") else 0
         eg = fake.episode_guid(tv_guid, ep_index) if brief and brief.get("is_tv") else ""
     else:
         return await _passthrough(request)
-    brief = store.get(tv_guid)
+    brief = _brief(store, tv_guid)
     if not brief:
         return await _passthrough(request)
     if ep:
@@ -624,25 +644,57 @@ def _tv_guid_of(store: cms.TitleStore, guid: str) -> str | None:
     season = store.resolve_season(guid)
     if season:
         return season
-    return guid if store.get(guid) else None
+    return guid if _brief(store, guid) else None
+
+
+def _brief(store: cms.TitleStore, guid: str, enforce: bool = True) -> dict | None:
+    """取可播放 brief，并按「源是否启用 / 当前账号是否被授权」裁剪线路。
+
+    只在内存里按 guid 命中是不够的：用户把某个源禁用后，之前搜到的线路、
+    持久化的榜单绑定、分类库缓存都还挂在这个 guid 上，播放链会继续从
+    已禁用的源取流。而在开启账号权限后，跨源合并卡里的线路必须按当前
+    账号的授权集裁剪，否则 A 的卡片会把 B 未授权的源一起带出去。
+    这些判断统一收敛到 ``acl.filter_brief``，所有详情/播放链路自动生效。
+
+    ``enforce=False`` 只给媒体分片链路用（播放器可能不带登录凭证）。
+    """
+    return acl.filter_brief(store.get(guid), enforce=enforce)
 
 
 def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
     ep = store.resolve_episode(guid)
     if ep:
-        return guid, fake.ep_media_guid(guid), fake.ep_video_guid(guid)
-    if store.get(guid):
+        # 集映射还在、但所属源已被禁用时不算命中，交给上层重绑。
+        if _brief(store, ep[0]):
+            return guid, fake.ep_media_guid(guid), fake.ep_video_guid(guid)
+        return None
+    if _brief(store, guid):
         return guid, fake.media_guid(guid), fake.video_guid(guid)
     return None
 
 
-async def _ensure_vlib(store: cms.TitleStore, client, guid: str) -> bool:
-    """榜单卡片在真正播放/取详情前才搜源绑定；这里做一次懒绑定。"""
-    owner = guid if charts.chart_cache.is_chart_guid(guid) \
-        else vlib.chart_of_media(guid)
+async def _ensure_vlib(store: cms.TitleStore, client, guid: str,
+                       ignore_acl: bool = False) -> bool:
+    """榜单卡片在真正播放/取详情前才搜源绑定；这里做一次懒绑定。
+
+    传入的可能是剧 guid、集 guid、media/video guid：先看内存映射能不能反查
+    到榜单条目，再退回按 media guid 遍历榜单，避免“源被禁用后集级播放入口
+    找不到可重绑的条目”。
+    """
+    owner = guid if charts.chart_cache.is_chart_guid(guid) else None
+    if not owner:
+        ep = store.resolve_episode(guid)
+        if ep and charts.chart_cache.is_chart_guid(ep[0]):
+            owner = ep[0]
+    if not owner:
+        media = store.resolve_media(guid)
+        if media and charts.chart_cache.is_chart_guid(media[0]):
+            owner = media[0]
+    if not owner:
+        owner = vlib.chart_of_media(guid)
     if not owner:
         return False
-    await vlib.ensure_bound(store, client, owner)
+    await vlib.ensure_bound(store, client, owner, ignore_acl=ignore_acl)
     return True
 
 
@@ -657,15 +709,16 @@ def _play_ref(store: cms.TitleStore, value: str) -> dict | None:
     if not value:
         return None
     ep = store.resolve_episode(value)
-    if ep:
+    if ep and _brief(store, ep[0]):
         return {"guid": ep[0], "index": ep[1], "media": value,
                 "video": fake.ep_video_guid(value), "episode": value}
     media = store.resolve_media(value)
     if media:
         guid, index = media
-        return {"guid": guid, "index": index, "media": value,
-                "video": _video_guid_for(guid, index, value), "episode": ""}
-    if store.get(value):
+        if _brief(store, guid):
+            return {"guid": guid, "index": index, "media": value,
+                    "video": _video_guid_for(guid, index, value), "episode": ""}
+    if _brief(store, value):
         return {"guid": value, "index": 0, "media": fake.media_guid(value),
                 "video": fake.video_guid(value), "episode": ""}
     return None
@@ -688,16 +741,21 @@ async def _resolve_play_ref(store: cms.TitleStore, client,
     return None
 
 
-async def _media_target(request: Request, mg: str):
+async def _media_target(request: Request, mg: str, enforce: bool = True):
     """按 media/video guid 找可播条目；store 淘汰或榜单未绑定时现场补绑。"""
     store = request.app.state.store
     resolved = store.resolve_media(mg)
-    if not resolved and await _ensure_vlib(store, request.app.state.src, mg):
+    if not resolved and await _ensure_vlib(
+            store, request.app.state.src, mg, ignore_acl=not enforce):
         resolved = store.resolve_media(mg)
     if not resolved:
         return None
     guid, index = resolved
-    brief = store.get(guid)
+    brief = _brief(store, guid, enforce=enforce)
+    if not brief and await _ensure_vlib(
+            store, request.app.state.src, guid, ignore_acl=not enforce):
+        # 命中的是已禁用源的旧映射：重绑后再取一次。
+        brief = _brief(store, guid, enforce=enforce)
     if not brief:
         return None
     return guid, index, brief
@@ -788,14 +846,14 @@ async def play_info_route(request: Request):
         return await _passthrough(request)
     guid, mg, vg = ref["guid"], ref["media"], ref["video"]
     if ref["episode"]:
-        brief = store.get(guid)
+        brief = _brief(store, guid)
         if not brief:
             return await _passthrough(request)
         index = ref["index"]
         info = fake.episode_play_info(brief, index, ref["episode"])
         canonical = guid
     else:
-        brief = store.get(guid)
+        brief = _brief(store, guid)
         if not brief:
             return await _passthrough(request)
         if brief.get("is_tv"):
@@ -833,7 +891,7 @@ async def stream_post(request: Request):
         runtime.log(f"stream unresolved keys={sorted(body)}")
         return await _passthrough(request)
     guid, index, mg = ref["guid"], ref["index"], ref["media"]
-    brief = store.get(guid)
+    brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
     line = _line_from_body(brief, body)
@@ -852,7 +910,7 @@ async def stream_post(request: Request):
 async def person_list_route(guid: str, request: Request):
     store = request.app.state.store
     target = _tv_guid_of(store, guid)
-    brief = store.get(target) if target else None
+    brief = _brief(store, target) if target else None
     if not brief:
         return await _passthrough(request)
     people = None
@@ -879,7 +937,7 @@ async def media_range_route(file_hash: str, request: Request):
     if not ref:
         return await _passthrough(request)
     guid, index, mg = ref["guid"], ref["index"], ref["media"]
-    brief = store.get(guid)
+    brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
     line, explicit = _range_selection(request, brief)
@@ -913,7 +971,7 @@ async def play_play(request: Request):
         runtime.log(f"play/play unresolved keys={sorted(body)}")
         return await _passthrough(request)
     guid, index, mg = ref["guid"], ref["index"], ref["media"]
-    brief = store.get(guid)
+    brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
     explicit = any(body.get(k) for k in
@@ -981,7 +1039,7 @@ async def _warm_line(client, brief: dict, guid: str, index: int,
 async def preset_m3u8(mg: str, request: Request):
     """播放 master：只列当前线路。手机端会逐条预取 master 的所有变体，
     多变体会把它拖到超时；换线由 qualities -> play/play 重新下发单变体。"""
-    target = await _media_target(request, mg)
+    target = await _media_target(request, mg, enforce=False)
     if not target:
         runtime.log(f"preset miss: {mg[:12]}")
         return Response(status_code=404)
@@ -1022,7 +1080,7 @@ async def preset_m3u8(mg: str, request: Request):
 
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")
 async def main_m3u8(mg: str, request: Request):
-    target = await _media_target(request, mg)
+    target = await _media_target(request, mg, enforce=False)
     if not target:
         runtime.log(f"main miss: {mg[:12]}")
         return Response(status_code=404)
@@ -1131,7 +1189,7 @@ async def variant_playlist(request: Request):
 
 @app.get(f"{ONLINE}/{{mg}}/direct")
 async def direct_media(mg: str, request: Request):
-    target = await _media_target(request, mg)
+    target = await _media_target(request, mg, enforce=False)
     if not target:
         return Response(status_code=404)
     guid, index, brief = target
@@ -1255,7 +1313,7 @@ async def catch_all(full_path: str, request: Request):
                         guid = part
                         break
             store = request.app.state.store
-            if guid and (store.get(guid) or store.resolve_episode(guid)):
+            if guid and (_brief(store, guid) or store.resolve_episode(guid)):
                 runtime.log(f"virtual noop {request.method} {full_path} "
                             f"keys={list(parsed)[:8]} "
                             f"bitrate={parsed.get('bitrate')!r}")

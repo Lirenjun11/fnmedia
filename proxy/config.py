@@ -45,6 +45,14 @@ DEFAULTS = {
     "vlib_charts": True,
     "vlib_catalog": True,
     "vlib_refresh_hours": 6,
+    # ---- 账号权限（默认关闭；关闭时全链路短路，行为与旧版一致）----
+    # acl_subjects: [{id,name,source}] 授权主体（fnOS 账号）
+    # acl_grants:   {uid: {libs: ["chart:movie"], sources: [sid]}}
+    # acl_devices:  {fingerprint: {uid,ua,ts}} 设备凭证绑定
+    "acl_enabled": False,
+    "acl_subjects": [],
+    "acl_grants": {},
+    "acl_devices": {},
 }
 
 _NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 10.0),
@@ -56,6 +64,69 @@ _INTEGERS = ("enabled_limit", "search_concurrency", "update_interval_hours",
 _LOCK = threading.RLock()
 _cache: dict | None = None
 _mtime = 0.0
+
+
+def _clean_subjects(raw) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    if not isinstance(raw, list):
+        return out
+    for row in raw[:200]:
+        if not isinstance(row, dict):
+            continue
+        uid = str(row.get("id") or "").strip()[:64]
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        out.append({
+            "id": uid,
+            "name": str(row.get("name") or uid).strip()[:60] or uid,
+            "source": "auto" if row.get("source") == "auto" else "manual",
+        })
+    return out
+
+
+def _clean_grants(raw) -> dict:
+    """主体授权：{uid: {libs: [key], sources: [sid]}}，统一去重并限量。"""
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for uid, value in list(raw.items())[:200]:
+        uid = str(uid or "").strip()[:64]
+        if not uid or not isinstance(value, dict):
+            continue
+        libs = value.get("libs")
+        if not isinstance(libs, list):
+            libs = []
+        sources = value.get("sources")
+        if not isinstance(sources, list):
+            sources = []
+        out[uid] = {
+            "libs": sorted({str(x).strip()[:40] for x in libs[:64]
+                            if str(x).strip()}),
+            "sources": sorted({str(x).strip()[:40] for x in sources[:400]
+                               if str(x).strip()}),
+        }
+    return out
+
+
+def _clean_devices(raw) -> dict:
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for fp, value in list(raw.items())[:400]:
+        fp = str(fp or "").strip()[:64]
+        if not fp or len(fp) < 8 or not isinstance(value, dict):
+            continue
+        uid = str(value.get("uid") or "").strip()[:64]
+        if not uid:
+            continue
+        out[fp] = {
+            "uid": uid,
+            "ua": str(value.get("ua") or "")[:120],
+            "ts": int(value.get("ts") or 0),
+        }
+    return out
 
 
 def _ensure_token(cfg: dict) -> bool:
@@ -132,6 +203,10 @@ def save(cfg: dict) -> dict:
     clean["vlib_enabled"] = bool(clean["vlib_enabled"])
     clean["vlib_charts"] = bool(clean["vlib_charts"])
     clean["vlib_catalog"] = bool(clean["vlib_catalog"])
+    clean["acl_enabled"] = bool(clean["acl_enabled"])
+    clean["acl_subjects"] = _clean_subjects(clean["acl_subjects"])
+    clean["acl_grants"] = _clean_grants(clean["acl_grants"])
+    clean["acl_devices"] = _clean_devices(clean["acl_devices"])
     raw_keywords = clean["adfilter_keywords"]
     if not isinstance(raw_keywords, list):
         raw_keywords = []
@@ -160,6 +235,48 @@ def enabled_sources() -> list[dict]:
     limit = int(cfg.get("enabled_limit", 12))
     return [dict(s) for s in cfg.get("sources", [])
             if s.get("enabled") and s.get("api")][:limit]
+
+
+_ids_cache: tuple | None = None
+
+
+def _source_sets() -> tuple[frozenset[str], frozenset[str]]:
+    """(配置里出现过的源 id, 当前启用的源 id)，按源配置签名缓存。"""
+    global _ids_cache
+    rows = get().get("sources", [])
+    sig = tuple(sorted((str(s.get("id") or ""), bool(s.get("enabled")),
+                        str(s.get("api") or "")) for s in rows))
+    if _ids_cache is not None and _ids_cache[0] == sig:
+        return _ids_cache[1], _ids_cache[2]
+    known = frozenset(str(s.get("id") or "") for s in rows if s.get("id"))
+    enabled = frozenset(str(s.get("id") or "") for s in rows
+                        if s.get("id") and s.get("enabled") and s.get("api"))
+    _ids_cache = (sig, known, enabled)
+    return known, enabled
+
+
+def enabled_source_ids() -> frozenset[str]:
+    """当前启用源 id 集合（不受 enabled_limit 截断）。
+
+    播放/详情要用它判断一条已有数据是否还允许使用：源被禁用后，之前
+    搜到的线路必须立刻失效，而不是继续从禁用源取流。
+    """
+    return _source_sets()[1]
+
+
+def source_live(provider: str) -> bool:
+    """provider 是否仍可用。
+
+    只有「源仍在配置里、但已被禁用」才算失效；配置里压根没有这个 id 的
+    数据（历史遗留、外部构造的 brief）保持原行为，不做误杀。
+    """
+    pid = str(provider or "")
+    if not pid:
+        return True
+    known, enabled = _source_sets()
+    if pid not in known:
+        return True
+    return pid in enabled
 
 
 def all_sources() -> list[dict]:

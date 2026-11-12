@@ -11,7 +11,7 @@
 - **磁盘状态可清理**：配置在 `state/config.json`；虚拟媒体库的三份缓存（榜单、分类路由、榜单绑定）均为可再生数据，可在管理页一键清空。
 - **固定预算**：搜索 2.5s 总预算；起播 3s 并发优选最快线路，失败自动换线。
 - **支持内网自建源**：默认允许订阅地址、海报、清单与直链指向局域网 / 回环地址（`allow_intranet`，可在「设置」关闭）；链路本地、保留与云元数据地址始终拦截。
-- **不做**：常驻预热、后台自愈、全站测速、插件自更新、账号 ACL。
+- **不做**：常驻预热、后台自愈、全站测速、插件自更新。
 
 ## 安装
 
@@ -45,6 +45,7 @@
 | 检查更新红点 | 手动 + 打开页面自动检查，只读不安装 | [docs/update-check.md](docs/update-check.md) |
 | 广告切片过滤 | 按清单文本特征跳过广告分片，默认关闭 | [docs/playback.md](docs/playback.md) |
 | 虚拟媒体库 | 媒体库首页注入榜单四库 + 海量分类四库，可开关 | [docs/virtual-library.md](docs/virtual-library.md) |
+| 账号权限 | 按 fnOS 账号控制可见的虚拟库与可用片源，默认关闭 | [docs/source-acl.md](docs/source-acl.md) |
 
 ## 开发
 
@@ -60,6 +61,7 @@ bash packaging/fpk/build.sh --fnpack .tools/fnpack   # 打包 FPK
 - [docs/metadata.md](docs/metadata.md) —— 元数据清洗与官方刮削借用
 - [docs/playback.md](docs/playback.md) —— 播放链路、播放状态、手机 App 兜底
 - [docs/virtual-library.md](docs/virtual-library.md) —— 虚拟媒体库：榜单四库与海量分类四库
+- [docs/source-acl.md](docs/source-acl.md) —— 账号权限：身份识别、库/源授权、逃生方式
 - [docs/update-check.md](docs/update-check.md) —— 检查更新（只读）与红点提示
 - [docs/development.md](docs/development.md) —— 架构、构建、测试、发版
 - [docs/limitations.md](docs/limitations.md) —— 已知限制、免责声明、致谢

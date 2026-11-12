@@ -47,6 +47,87 @@ export interface Config {
   vlib_charts: boolean;
   vlib_catalog: boolean;
   vlib_refresh_hours: number;
+  acl_enabled: boolean;
+  acl_subjects: AclSubject[];
+  acl_grants: Record<string, AclGrant>;
+  acl_devices?: Record<string, { uid: string; ua: string; ts: number }>;
+}
+
+export interface AclSubject {
+  id: string;
+  name: string;
+  source: string;
+}
+
+export interface AclGrant {
+  libs: string[];
+  sources: string[];
+}
+
+export interface AclLib {
+  key: string;
+  title: string;
+  guid: string;
+  kind: string;
+}
+
+export interface AclSource {
+  id: string;
+  name: string;
+  enabled: boolean;
+}
+
+export interface AclMe {
+  uid: string;
+  name: string;
+  via: string;
+  reason: string;
+  fp: string;
+  known: boolean;
+}
+
+export interface AclStatus {
+  enabled: boolean;
+  subjects: AclSubject[];
+  grants: Record<string, AclGrant>;
+  devices: { fp: string; uid: string; ua: string; ts: number }[];
+  me: AclMe;
+  discover: {
+    db: string;
+    users: number;
+    tables: { db: string; user_table: string; session_tables: string[] }[];
+    error: string;
+  };
+  libs: AclLib[];
+  sources: AclSource[];
+  unassigned_sources: number;
+  unassigned_subjects: number;
+  enabled_sources: number;
+}
+
+export interface AclSummary {
+  enabled: boolean;
+  known: boolean;
+  uid: string;
+  name: string;
+  via: string;
+  reason: string;
+  libs: number;
+  sources: number;
+  sources_total: number;
+}
+
+export interface AclProbe {
+  me: AclMe;
+  headers: Record<string, string>;
+  cookie_keys: string[];
+  credential_candidates: number;
+  discover: {
+    db: string;
+    users: { id: string; name: string; source: string }[];
+    tables: { db: string; user_table: string; session_tables: string[] }[];
+    error: string;
+  };
 }
 
 export interface VlibRouteInfo {
@@ -86,6 +167,7 @@ export interface Bootstrap {
   config: Config;
   sources: Source[];
   vlib: VlibStatus;
+  acl: AclSummary;
 }
 
 export interface UpdateInfo {
@@ -215,6 +297,23 @@ export const api = {
   vlibRefresh: (what: 'all' | 'charts' | 'catalog' = 'all') =>
     request<VlibStatus>('/v/api/ext/vlib/refresh', json('POST', { what })),
   vlibClear: () => request<VlibStatus>('/v/api/ext/vlib/cache', { method: 'DELETE' }),
+  aclStatus: () => request<AclStatus>('/v/api/ext/acl/status'),
+  aclProbe: () => request<AclProbe>('/v/api/ext/acl/probe'),
+  aclConfig: (value: Partial<Pick<Config, 'acl_enabled' | 'acl_subjects' | 'acl_grants'>>) =>
+    request<AclStatus>('/v/api/ext/acl/config', json('PATCH', value)),
+  aclGrant: (uid: string, libs: string[], sources: string[], name?: string) =>
+    request<AclStatus>('/v/api/ext/acl/grant', json('POST', { uid, libs, sources, name })),
+  aclRevoke: (uid: string) =>
+    request<AclStatus>(`/v/api/ext/acl/grant/${encodeURIComponent(uid)}`, { method: 'DELETE' }),
+  aclAddSubject: (id: string, name: string) =>
+    request<AclStatus>('/v/api/ext/acl/subjects', json('POST', { id, name })),
+  aclDelSubject: (id: string) =>
+    request<AclStatus>(`/v/api/ext/acl/subjects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  aclBind: (uid: string) =>
+    request<{ bound: boolean; fp: string; uid: string; status: AclStatus }>(
+      '/v/api/ext/acl/bind', json('POST', { uid })),
+  aclDiscover: () =>
+    request<AclProbe['discover']>('/v/api/ext/acl/discover', json('POST', {})),
   checkUpdate: (force = false) =>
     request<UpdateInfo>(`/v/api/ext/update/check${force ? '?force=1' : ''}`),
   exportConfig: () => request<{ config: Config }>('/v/api/ext/export'),

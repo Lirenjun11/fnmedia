@@ -1,0 +1,369 @@
+import _bootstrap
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+import acl
+import app as appmod
+import charts
+import cms
+import config
+import fake
+import vlib
+
+
+class FakeRequest:
+    def __init__(self, headers=None, host="127.0.0.1"):
+        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+        self.client = SimpleNamespace(host=host)
+        self.cookies = {}
+
+
+def brief_of(*, provider="s_1", lines=None, mapping=None, names=None):
+    lines = lines or {"L1": [{"url": "https://a.invalid/1.m3u8"}]}
+    names = names or list(lines)
+    data = {
+        "guid": "g1", "provider": provider, "provider_name": provider,
+        "title": "测试片", "lines": lines, "line_names": names,
+        "episodes": max((len(v) for v in lines.values()), default=1),
+        "is_tv": False,
+    }
+    if mapping is not None:
+        data["line_sources"] = mapping
+    return data
+
+
+class AclTest(unittest.TestCase):
+    def setUp(self):
+        cfg = config.get()
+        self._orig = {
+            "sources": list(cfg.get("sources") or []),
+            "acl_enabled": cfg.get("acl_enabled"),
+            "acl_subjects": list(cfg.get("acl_subjects") or []),
+            "acl_grants": dict(cfg.get("acl_grants") or {}),
+            "acl_devices": dict(cfg.get("acl_devices") or {}),
+        }
+        cfg.update({
+            "sources": [
+                {"id": "s_1", "name": "源一", "api": "https://a.invalid/api",
+                 "enabled": True},
+                {"id": "s_2", "name": "源二", "api": "https://b.invalid/api",
+                 "enabled": True},
+                {"id": "s_3", "name": "源三", "api": "https://c.invalid/api",
+                 "enabled": False},
+            ],
+            "enabled_limit": 10,
+            "acl_enabled": False,
+            "acl_subjects": [{"id": "u1", "name": "客厅", "source": "manual"}],
+            "acl_grants": {},
+            "acl_devices": {},
+        })
+        config.save(cfg)
+        acl.invalidate()
+
+    def tearDown(self):
+        cfg = config.get()
+        cfg.update(self._orig)
+        config.save(cfg)
+        acl.invalidate()
+
+    def enable(self, grants=None, devices=None):
+        cfg = config.get()
+        cfg["acl_enabled"] = True
+        cfg["acl_grants"] = grants or {}
+        cfg["acl_devices"] = devices or {}
+        config.save(cfg)
+        acl.invalidate()
+
+    def as_user(self, uid):
+        return acl.push(acl.Identity(uid=uid, name=uid, via="device"))
+
+    # ---------------------------------------------------------- 基础行为
+    def test_disabled_keeps_legacy_source_live_behaviour(self):
+        live = brief_of(provider="s_1")
+        dead = brief_of(provider="s_3")
+        self.assertIs(acl.filter_brief(live), live)
+        self.assertIsNone(acl.filter_brief(dead))
+        self.assertEqual(len(acl.sources()), 2)
+
+    def test_unauthorized_account_sees_nothing(self):
+        self.enable(grants={})
+        token = self.as_user("u1")
+        try:
+            self.assertIsNone(acl.filter_brief(brief_of(provider="s_1")))
+            self.assertEqual(acl.sources(), [])
+            self.assertFalse(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+    def test_line_level_filter_uses_line_sources(self):
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_1"]}})
+        lines = {
+            "L1": [{"url": "https://a.invalid/1.m3u8"}],
+            "源二：L1": [{"url": "https://b.invalid/1.m3u8"}],
+        }
+        brief = brief_of(provider="s_1", lines=lines,
+                         mapping={"L1": "s_1", "源二：L1": "s_2"})
+        token = self.as_user("u1")
+        try:
+            kept = acl.filter_brief(brief)
+            self.assertEqual(kept["line_names"], ["L1"])
+            self.assertEqual(list(kept["lines"]), ["L1"])
+            self.assertEqual(kept["episodes"], 1)
+            # 原 brief 不被就地修改（它来自全局 store）。
+            self.assertEqual(len(brief["line_names"]), 2)
+        finally:
+            acl.reset(token)
+
+    def test_missing_mapping_falls_back_to_primary_provider(self):
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_3"]}})
+        token = self.as_user("u1")
+        try:
+            # 未授权 s_1 且没有线路映射：整条不可用。
+            self.assertIsNone(acl.filter_brief(brief_of(provider="s_1")))
+        finally:
+            acl.reset(token)
+
+    def test_sources_intersect_global_enabled(self):
+        self.enable(grants={"u1": {"libs": [],
+                                   "sources": ["s_1", "s_3"]}})
+        token = self.as_user("u1")
+        try:
+            self.assertEqual([s["id"] for s in acl.sources()], ["s_1"])
+        finally:
+            acl.reset(token)
+
+    def test_lib_wildcard(self):
+        self.enable(grants={"u1": {"libs": ["*"], "sources": []}})
+        token = self.as_user("u1")
+        try:
+            self.assertTrue(acl.lib_allowed("chart:movie"))
+            self.assertTrue(acl.lib_allowed("catalog:anime"))
+        finally:
+            acl.reset(token)
+
+    # ---------------------------------------------------------- 身份
+    def test_header_identity_wins(self):
+        self.enable(grants={"u9": {"libs": ["chart:tv"], "sources": []}})
+        ident = acl.identify(FakeRequest({"x-user-id": "u9"}))
+        self.assertEqual((ident.uid, ident.via), ("u9", "header"))
+
+    def test_device_binding_identity(self):
+        req = FakeRequest({"cookie": "fnos-token=abc"}, host="10.0.0.2")
+        fp = acl.device_fp(req)
+        self.enable(grants={"u1": {"libs": [], "sources": []}},
+                    devices={fp: {"uid": "u1", "ua": "test", "ts": 1}})
+        ident = acl.identify(req)
+        self.assertEqual((ident.uid, ident.via), ("u1", "device"))
+
+    def test_unknown_without_credentials(self):
+        self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": []}})
+        ident = acl.identify(FakeRequest({}))
+        self.assertFalse(ident.known)
+        self.assertEqual(ident.reason, "no_credential")
+        token = acl.push(ident)
+        try:
+            self.assertFalse(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+    def test_identity_cache_is_invalidated_on_grant_change(self):
+        req = FakeRequest({"x-user-id": "u1"})
+        self.enable(grants={"u1": {"libs": [], "sources": []}})
+        self.assertTrue(acl.identify(req).uid == "u1")
+        cfg = config.get()
+        cfg["acl_grants"] = {"u1": {"libs": ["chart:movie"], "sources": []}}
+        config.save(cfg)
+        acl.invalidate("u1")
+        token = acl.push(acl.identify(req))
+        try:
+            self.assertTrue(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+    # ---------------------------------------------------------- 配置校验
+    def test_config_dedup_and_limits(self):
+        cfg = config.get()
+        cfg["acl_grants"] = {
+            "u1": {"libs": ["chart:movie", "chart:movie", ""],
+                   "sources": ["s_1", "s_1"]},
+        }
+        cfg["acl_devices"] = {"short": {"uid": "u1"},
+                              "fp1234567890": {"uid": "u2", "ua": "ua", "ts": 3}}
+        saved = config.save(cfg)
+        self.assertEqual(saved["acl_grants"]["u1"]["libs"], ["chart:movie"])
+        self.assertEqual(saved["acl_grants"]["u1"]["sources"], ["s_1"])
+        self.assertEqual(list(saved["acl_devices"]), ["fp1234567890"])
+
+    # ---------------------------------------------------------- 接口
+    def test_mediadb_list_only_returns_granted_libs(self):
+        now = 1
+        charts.chart_cache._apply({
+            "updated_at": now, "provider_ok": 1, "provider_total": 1,
+            "charts": {"movie": [{"id": "m1", "guid": charts.chart_guid(
+                "movie", "m1"), "cat": "movie", "title": "电影一",
+                "rating": 8.0, "cover": "", "year": "2025", "tags": []}],
+                "tv": [{"id": "t1", "guid": charts.chart_guid("tv", "t1"),
+                        "cat": "tv", "title": "剧集一", "rating": 8.0,
+                        "cover": "", "year": "2025", "tags": []}]},
+        })
+        self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": []}})
+        upstream = {"code": 0, "msg": "", "data": [{"guid": "local-1"}]}
+        with patch("app._passthrough",
+                   AsyncMock(return_value=JSONResponse(upstream))):
+            with TestClient(appmod.app) as client:
+                data = client.get("/v/api/v1/mediadb/list",
+                                  headers={"x-user-id": "u1"}).json()["data"]
+        guids = [row["guid"] for row in data]
+        self.assertIn(vlib.CHART_LIB_GUIDS["movie"], guids)
+        self.assertNotIn(vlib.CHART_LIB_GUIDS["tv"], guids)
+        self.assertIn("local-1", guids)
+
+    def test_mdb_detail_denied_for_ungranted_lib(self):
+        charts.chart_cache._apply({
+            "updated_at": 1, "provider_ok": 1, "provider_total": 1,
+            "charts": {"tv": [{"id": "t1", "guid": charts.chart_guid(
+                "tv", "t1"), "cat": "tv", "title": "剧集一", "rating": 8.0,
+                "cover": "", "year": "2025", "tags": []}]},
+        })
+        self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": []}})
+        upstream = {"code": -6, "msg": "此媒体库不存在", "data": None}
+        with patch("app._passthrough",
+                   AsyncMock(return_value=JSONResponse(upstream, status_code=404))):
+            with TestClient(appmod.app) as client:
+                resp = client.get(f"/v/api/v1/mdb/{vlib.CHART_LIB_GUIDS['tv']}",
+                                  headers={"x-user-id": "u1"})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_search_only_uses_granted_sources(self):
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_2"]}})
+        seen = []
+
+        async def fake_search(client, sources, keyword, **kwargs):
+            seen.extend(s["id"] for s in sources)
+            return []
+
+        upstream = {"code": 0, "msg": "", "data": []}
+        with patch("app._passthrough",
+                   AsyncMock(return_value=JSONResponse(upstream))), \
+                patch("cms.search_all", fake_search):
+            with TestClient(appmod.app) as client:
+                client.get("/v/api/v1/search/list?q=测试",
+                           headers={"x-user-id": "u1"})
+        self.assertEqual(seen, ["s_2"])
+
+    def test_admin_grant_and_bind_endpoints(self):
+        token = config.token()
+        headers = {"x-admin-token": token}
+        with TestClient(appmod.app) as client:
+            resp = client.post("/v/api/ext/acl/grant",
+                               headers=headers,
+                               json={"uid": "u1", "libs": ["chart:movie"],
+                                     "sources": ["s_1"]})
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()["data"]
+            self.assertEqual(data["grants"]["u1"]["sources"], ["s_1"])
+            resp = client.post("/v/api/ext/acl/bind", headers=headers,
+                               json={"uid": "u1"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.json()["data"]["bound"])
+
+    def test_enable_requires_grant(self):
+        token = config.token()
+        with TestClient(appmod.app) as client:
+            resp = client.patch("/v/api/ext/acl/config",
+                                headers={"x-admin-token": token},
+                                json={"enabled": True})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("至少一个账号", resp.json()["msg"])
+
+    def test_export_omits_device_bindings(self):
+        self.enable(devices={"fp1234567890": {"uid": "u1", "ua": "ua", "ts": 1}})
+        token = config.token()
+        with TestClient(appmod.app) as client:
+            data = client.get("/v/api/ext/export",
+                              headers={"x-admin-token": token}).json()["data"]
+        self.assertNotIn("acl_devices", data["config"])
+
+    # ---------------------------------------------------------- 播放链路
+    def _seed_brief(self, client, provider="s_2"):
+        title = cms.OnlineTitle(
+            provider=provider, vod_id="acl-1", title="授权测试片",
+            type_name="电影", year="2025",
+            lines={"m3u8": [cms.Episode("正片",
+                                        "https://a.invalid/acl.m3u8")]})
+        brief = fake.brief_of(title, cms.TitleStore.guid_of(title))
+        client.app.state.store.put_brief(brief)
+        return brief
+
+    def test_play_play_does_not_leak_unauthorized_source(self):
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_1"]}})
+        upstream = {"code": -1, "msg": "official", "data": None}
+        with patch("app._passthrough",
+                   AsyncMock(return_value=JSONResponse(upstream))), \
+                TestClient(appmod.app) as client:
+            brief = self._seed_brief(client, provider="s_2")
+            mg = fake.media_guid(brief["guid"])
+            resp = client.post("/v/api/v1/play/play",
+                               headers={"x-user-id": "u1"},
+                               json={"media_guid": mg})
+        self.assertEqual(resp.json(), upstream)
+        self.assertNotIn("play_link", resp.text)
+
+    def test_media_endpoint_does_not_require_identity(self):
+        """播放器拉 m3u8/分片不一定带登录凭证，媒体端点只校验源是否启用。
+
+        越权拦截在带凭证的入口（play/play、media/range）完成；这里保证不会
+        因为「认不出是谁」把正在播放的链路打断。
+        """
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_1"]}})
+        with patch("hls.fetch_playlist",
+                   AsyncMock(return_value=(
+                       "#EXTM3U\n#EXTINF:4,\nseg1.ts\n", "https://a.invalid/x",
+                       {"duration": 4}))), \
+                TestClient(appmod.app) as client:
+            brief = self._seed_brief(client, provider="s_2")
+            mg = fake.media_guid(brief["guid"])
+            resp = client.get(f"/v/media/online/{mg}/preset.m3u8",
+                              headers={"x-user-id": "u1"})
+        self.assertNotEqual(resp.status_code, 404)
+
+    def test_authorized_account_can_play(self):
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_2"]}})
+        with patch("app._passthrough",
+                   AsyncMock(return_value=JSONResponse({"code": -1}))), \
+                TestClient(appmod.app) as client:
+            brief = self._seed_brief(client, provider="s_2")
+            mg = fake.media_guid(brief["guid"])
+            resp = client.post("/v/api/v1/play/play",
+                               headers={"x-user-id": "u1"},
+                               json={"media_guid": mg})
+        body = resp.json()
+        self.assertEqual(body.get("code"), 0)
+        self.assertIn("/v/media/online/", body["data"]["play_link"])
+
+    # ---------------------------------------------------------- 共享 store
+    def test_store_does_not_downgrade_merged_lines_when_acl_on(self):
+        store = cms.TitleStore()
+        rich = brief_of(provider="s_1", lines={
+            "L1": [{"url": "https://a.invalid/1.m3u8"}],
+            "源二：L1": [{"url": "https://b.invalid/1.m3u8"}],
+        }, mapping={"L1": "s_1", "源二：L1": "s_2"})
+        poor = brief_of(provider="s_1")
+        # 先关闭：旧行为是覆盖。
+        store.put_brief(dict(rich))
+        store.put_brief(dict(poor))
+        self.assertEqual(store.get("g1")["line_names"], ["L1"])
+        # 开启：不允许把多线路覆盖成单线路。
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_1"]}})
+        store.put_brief(dict(rich))
+        store.put_brief(dict(poor))
+        self.assertEqual(store.get("g1")["line_names"], ["L1", "源二：L1"])
+
+
+if __name__ == "__main__":
+    unittest.main()
