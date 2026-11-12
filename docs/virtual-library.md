@@ -25,10 +25,16 @@
 | GET | `/v/api/v1/mdb/{guid}` | 虚拟库返回库详情（名称、分类、海报墙）；其他 guid 原样透传 |
 | GET | `/v/api/v1/mediadb/sum` | 在官方统计里追加每个虚拟库的条目数与 `total` |
 | POST | `/v/api/v1/item/list` | `ancestor_guid`/`parent_guid` 命中虚拟库时按 `page` / `page_size` / `offset` 返回海报墙 |
+| GET | `/v/api/v1/item/{库guid}` | 返回 `type=MediaDB` 的库根节点；不拦截会透传官方并拿到 `-6 此媒体库不存在` |
 
 榜单条目还接入了：`item/{guid}`（懒绑定后返回标准详情）、`play/info`、`stream/list`、
 `stream`、`play/play`、`media/range`。绑定前这些接口会先做一次搜源（单飞 + 3 分钟失败冷却），
 成功后 media/video/episode guid 全部注册进 `TitleStore`，后续链路与普通在线条目完全一致。
+
+播放四入口（`play/info`、`play/play`、`stream`、`media/range`）统一走 `_resolve_play_ref`：
+`media_guid` / `video_guid` / `item_guid` / `guid` 任意一个都能识别，并按需懒绑定，
+不再出现「搜索能播、虚拟库不能播」的字段差异。`preset/main/direct` 取流时若 store
+已被淘汰，也会按 media guid 反查榜单并补绑，而不是直接 404。
 
 ## 配置项
 
