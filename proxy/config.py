@@ -33,11 +33,15 @@ DEFAULTS = {
     "playstate": {},
     "update_repo": "Lirenjun11/fnmedia",
     "admin_token": "",
+    "adfilter_enabled": False,
+    "adfilter_markers": True,
+    "adfilter_keywords": [],
+    "adfilter_head_skip": 0.0,
 }
 
 _NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 10.0),
             "search_concurrency": (1, 16), "play_timeout": (2.0, 30.0),
-            "update_interval_hours": (1, 168)}
+            "update_interval_hours": (1, 168), "adfilter_head_skip": (0.0, 120.0)}
 _INTEGERS = ("enabled_limit", "search_concurrency", "update_interval_hours")
 _LOCK = threading.RLock()
 _cache: dict | None = None
@@ -110,6 +114,15 @@ def save(cfg: dict) -> dict:
     clean["online_first"] = bool(clean["online_first"])
     clean["merge_sources"] = bool(clean["merge_sources"])
     clean["allow_intranet"] = bool(clean["allow_intranet"])
+    clean["adfilter_enabled"] = bool(clean["adfilter_enabled"])
+    clean["adfilter_markers"] = bool(clean["adfilter_markers"])
+    raw_keywords = clean["adfilter_keywords"]
+    if not isinstance(raw_keywords, list):
+        raw_keywords = []
+    clean["adfilter_keywords"] = [
+        str(word).strip().lower()[:64] for word in raw_keywords[:64]
+        if str(word).strip()
+    ][:32]
     clean["sources"] = [s for s in clean["sources"] if isinstance(s, dict) and s.get("api")]
     clean["subscriptions"] = [s for s in clean["subscriptions"]
                               if isinstance(s, dict) and s.get("url")]

@@ -35,6 +35,10 @@ export interface Config {
   auto_best_source: boolean;
   allow_intranet: boolean;
   douban_enabled: boolean;
+  adfilter_enabled: boolean;
+  adfilter_markers: boolean;
+  adfilter_keywords: string[];
+  adfilter_head_skip: number;
 }
 
 export interface Bootstrap {

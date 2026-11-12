@@ -112,6 +112,101 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
   );
 }
 
+export function AdFilterPage({ boot, refresh, notify }: Props) {
+  const [form, setForm] = useState<Config>({ ...boot.config });
+  const [keywords, setKeywords] = useState(
+    (boot.config.adfilter_keywords || []).join('\n'),
+  );
+  const [saving, setSaving] = useState(false);
+
+  const set = (key: keyof Config, value: number | boolean) =>
+    setForm((current) => ({ ...current, [key]: value }));
+
+  async function save() {
+    setSaving(true);
+    try {
+      await api.patchConfig({
+        adfilter_enabled: Boolean(form.adfilter_enabled),
+        adfilter_markers: Boolean(form.adfilter_markers),
+        adfilter_head_skip: Number(form.adfilter_head_skip),
+        adfilter_keywords: keywords
+          .split(/[\n,]/)
+          .map((word) => word.trim())
+          .filter(Boolean)
+          .slice(0, 32),
+      });
+      await refresh();
+      notify('广告过滤设置已保存并即时生效', 'ok');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '保存失败', 'err');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="page-head">
+        <h1>广告切片过滤</h1>
+        <p className="page-desc">按播放清单里的文本特征跳过广告分片，默认关闭</p>
+      </div>
+      <section className="card">
+        <div className="card-title">总开关</div>
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.adfilter_enabled}
+            onChange={(e) => set('adfilter_enabled', e.target.checked)}
+          />
+          <span>启用广告分片过滤</span>
+        </label>
+        <p className="card-sub mt">
+          只读取 m3u8 文本（时长、分片地址、广告标记），不下载分片内容、不增加起播等待。
+          规则改动即时生效，无需清理缓存。误判时关掉本开关即可原样恢复。
+        </p>
+        <div className="divider" />
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.adfilter_markers}
+            onChange={(e) => set('adfilter_markers', e.target.checked)}
+          />
+          <span>识别显式广告标记（CUE-OUT / CUE-IN、广告 DATERANGE）</span>
+        </label>
+        <div className="grid mt">
+          <div>
+            <label className="field">片头跳过（秒，0 关闭，最多 120）</label>
+            <input type="number" min="0" max="120" step="1"
+                   value={form.adfilter_head_skip}
+                   onChange={(e) => set('adfilter_head_skip', Number(e.target.value))} />
+          </div>
+        </div>
+        <div className="mt">
+          <label className="field">分片地址关键字（每行一个，最多 32 个，不区分大小写）</label>
+          <textarea rows={4} value={keywords}
+                    placeholder={'例如：/ad/\n例如：advert'}
+                    onChange={(e) => setKeywords(e.target.value)} />
+        </div>
+        <p className="hint mt">
+          关键字只匹配分片 URL；不同源用不同域名时可分别填写。建议先在「日志诊断」页观察
+          adfilter 命中记录，再逐步收紧规则。不要用「分片时长短」当判据，正片常见 6 秒切片。
+        </p>
+        <div className="row end mt">
+          <button className="btn primary" disabled={saving} onClick={() => void save()}>
+            {saving ? '保存中…' : '保存设置'}
+          </button>
+        </div>
+      </section>
+      <section className="card">
+        <div className="card-title">边界说明</div>
+        <p className="small">
+          仅作用于订阅源的 HLS 媒体清单，官方本地影片完全不受影响。加密清单会保留每个分片的
+          原始序号，避免解密错位；片头跳过会同步修正展示时长。此功能可能改变源站既有的
+          广告呈现，请自行确认使用合法性。
+        </p>
+      </section>
+    </>
+  );
+}
+
 export function CachePage({ boot, refresh, notify }: Props) {
   const [busy, setBusy] = useState(false);
   async function clear() {

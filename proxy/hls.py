@@ -15,10 +15,120 @@ from fastapi.responses import Response, StreamingResponse
 
 import config
 import netguard
+import runtime
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 _URI_ATTR = re.compile(r'URI="([^"]+)"')
+
+_AD_PLACEHOLDER = "__FNMEDIA_AD_SEGMENT__"
+_AD_RANGE_RE = re.compile(r"(?i)\b(ad|ads|advert|advertisement|commercial)\b")
+_AD_KEEP_TAGS = (
+    "#EXTM3U", "#EXT-X-VERSION", "#EXT-X-TARGETDURATION",
+    "#EXT-X-MEDIA-SEQUENCE", "#EXT-X-PLAYLIST-TYPE",
+    "#EXT-X-INDEPENDENT-SEGMENTS", "#EXT-X-START", "#EXT-X-ENDLIST",
+    "#EXT-X-DISCONTINUITY-SEQUENCE", "#EXT-X-KEY", "#EXT-X-ALLOW-CACHE",
+)
+
+
+def _extinf_duration(line: str) -> float:
+    stripped = line.strip()
+    if not stripped.startswith("#EXTINF:"):
+        return 0.0
+    try:
+        return max(0.0, float(stripped[8:].split(",", 1)[0]))
+    except ValueError:
+        return 0.0
+
+
+def ad_rules() -> dict:
+    cfg = config.get()
+    keywords = cfg.get("adfilter_keywords") or []
+    if not isinstance(keywords, list):
+        keywords = []
+    try:
+        head_skip = float(cfg.get("adfilter_head_skip") or 0)
+    except (TypeError, ValueError):
+        head_skip = 0.0
+    return {
+        "enabled": bool(cfg.get("adfilter_enabled")),
+        "markers": bool(cfg.get("adfilter_markers", True)),
+        "keywords": [str(word).strip().lower() for word in keywords[:32]
+                     if str(word).strip()],
+        "head_skip": max(0.0, min(120.0, head_skip)),
+    }
+
+
+def ad_rules_active(rules: dict) -> bool:
+    return bool(rules["enabled"] and (
+        rules["markers"] or rules["keywords"] or rules["head_skip"] > 0))
+
+
+def strip_ads(text: str, base_url: str = "",
+              rules: dict | None = None) -> tuple[str, dict]:
+    """Drop ad segments from a media playlist, keeping AES-128 indexes intact.
+
+    Removed segments leave a placeholder URI line so rewrite_playlist still
+    advances its sequence counter; tag lines are dropped except global tags
+    and #EXT-X-KEY, which must survive to keep the key scope of later segments.
+    """
+    rules = rules or ad_rules()
+    stats = {"removed": 0, "removed_duration": 0.0, "kept_duration": 0.0,
+             "by_marker": 0, "by_keyword": 0, "by_head": 0, "sample": ""}
+    lines = text.splitlines()
+    if not ad_rules_active(rules) or is_master(text):
+        stats["kept_duration"] = sum(_extinf_duration(row) for row in lines)
+        return text, stats
+
+    out: list[str] = []
+    pending: list[str] = []
+    cue_ad = False
+    marker_hit = False
+    elapsed = 0.0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        if stripped.startswith("#"):
+            if rules["markers"]:
+                upper = stripped.upper()
+                if upper.startswith("#EXT-X-CUE-OUT"):
+                    cue_ad = True
+                elif upper.startswith("#EXT-X-CUE-IN"):
+                    cue_ad = False
+                elif upper.startswith("#EXT-X-DATERANGE") and _AD_RANGE_RE.search(stripped):
+                    marker_hit = True
+            pending.append(line)
+            continue
+        block, pending = pending, []
+        duration = sum(_extinf_duration(row) for row in block)
+        absolute = urllib.parse.urljoin(base_url, stripped) if base_url else stripped
+        reason = ""
+        if rules["markers"] and (cue_ad or marker_hit):
+            reason = "marker"
+        elif rules["keywords"] and any(word in absolute.lower()
+                                       for word in rules["keywords"]):
+            reason = "keyword"
+        elif rules["head_skip"] > 0 and elapsed < rules["head_skip"]:
+            reason = "head"
+        elapsed += duration
+        if reason:
+            stats["removed"] += 1
+            stats["removed_duration"] += duration
+            stats["by_" + reason] += 1
+            if not stats["sample"]:
+                stats["sample"] = absolute[:100]
+            out.extend(row for row in block
+                       if row.strip().upper().startswith(_AD_KEEP_TAGS))
+            out.append(_AD_PLACEHOLDER)
+        else:
+            stats["kept_duration"] += duration
+            out.extend(block)
+            out.append(line)
+        marker_hit = False
+    out.extend(pending)
+    return "\n".join(out) + "\n", stats
 
 
 def encode_url(url: str) -> str:
@@ -243,6 +353,14 @@ def pick_best_variant(text: str) -> str | None:
 def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                      variant_prefix: str = "", is_master: bool = False,
                      decrypt_keys: bool = False) -> str:
+    if not is_master:
+        text, ad_stats = strip_ads(text, base_url)
+        if ad_stats["removed"]:
+            runtime.log(
+                f"adfilter: removed {ad_stats['removed']} segments "
+                f"(marker={ad_stats['by_marker']} keyword={ad_stats['by_keyword']} "
+                f"head={ad_stats['by_head']}) kept={ad_stats['kept_duration']:.0f}s "
+                f"sample={ad_stats['sample']}")
     out = []
     key_url = ""
     key_iv = ""
@@ -274,6 +392,9 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                 absolute = urllib.parse.urljoin(base_url, match.group(1))
                 return f'URI="{attr_target}?u={encode_url(absolute)}"'
             out.append(_URI_ATTR.sub(sub, line))
+            continue
+        if stripped == _AD_PLACEHOLDER:
+            seq += 1
             continue
         target = variant_prefix if is_master else seg_prefix
         absolute = urllib.parse.urljoin(base_url, stripped)
@@ -310,7 +431,12 @@ async def fetch_playlist(client: httpx.AsyncClient, url: str,
             child_text, child_base, child_meta = await fetch_playlist(
                 client, urllib.parse.urljoin(base, best), timeout, depth + 1)
             return child_text, child_base, build_playlist_meta(text, child_meta)
-    return text, base, build_playlist_meta(text)
+    meta = build_playlist_meta(text)
+    rules = ad_rules()
+    if ad_rules_active(rules) and not is_master(text):
+        _, ad_stats = strip_ads(text, base, rules)
+        meta["duration"] = ad_stats["kept_duration"]
+    return text, base, meta
 
 
 def playlist_response(text: str, base: str, seg_prefix: str,

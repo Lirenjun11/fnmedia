@@ -43,6 +43,7 @@
 | 手机 App 播放兜底 | 修复手机端「文件权限不足」403 | [docs/playback.md](docs/playback.md) |
 | 内网自建源 | 允许局域网 / 回环的订阅、海报与分片代理 | [docs/limitations.md](docs/limitations.md) |
 | 检查更新红点 | 手动 + 打开页面自动检查，只读不安装 | [docs/update-check.md](docs/update-check.md) |
+| 广告切片过滤 | 按清单文本特征跳过广告分片，默认关闭 | [docs/playback.md](docs/playback.md) |
 
 ## 开发
 
