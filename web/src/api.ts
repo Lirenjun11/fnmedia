@@ -57,6 +57,7 @@ export interface AclSubject {
   id: string;
   name: string;
   source: string;
+  is_admin?: boolean;
 }
 
 export interface AclGrant {
@@ -96,6 +97,7 @@ export interface AclStatus {
     db: string;
     users: number;
     tables: { db: string; user_table: string; session_tables: string[] }[];
+    sessions: number;
     error: string;
   };
   libs: AclLib[];
@@ -124,8 +126,9 @@ export interface AclProbe {
   credential_candidates: number;
   discover: {
     db: string;
-    users: { id: string; name: string; source: string }[];
+    users: { id: string; name: string; source: string; is_admin?: boolean }[];
     tables: { db: string; user_table: string; session_tables: string[] }[];
+    sessions: { db: string; table: string; token: string; uid: string }[];
     error: string;
   };
 }

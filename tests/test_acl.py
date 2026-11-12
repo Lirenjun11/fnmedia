@@ -365,5 +365,115 @@ class AclTest(unittest.TestCase):
         self.assertEqual(store.get("g1")["line_names"], ["L1", "源二：L1"])
 
 
+class OfficialSchemaTest(unittest.TestCase):
+    """用官方库的真实表结构验证「自动读账号 + 自动识别身份」。
+
+    官方布局：
+    - ``trimmedia.db``   ``user(guid, username, is_admin, status)``
+    - ``trimactivity.db`` ``user_token(token, user_guid, status, update_time)``
+    上一版只认 ``uid``/``user_id`` 列，导致这两张表都识别不到，只能在管理页
+    手工填账号；这一组用例就是防它回归。
+    """
+
+    def setUp(self):
+        import sqlite3
+        self._dir = tempfile.mkdtemp(prefix="fnmedia-acl-")
+        med = sqlite3.connect(f"{self._dir}/trimmedia.db")
+        med.executescript(
+            "CREATE TABLE user (guid TEXT PRIMARY KEY, username TEXT,"
+            " is_admin INTEGER, status INTEGER);"
+            "INSERT INTO user VALUES"
+            " ('u-guid-1', '爸爸', 1, 1),"
+            " ('u-guid-2', '妈妈', 0, 1),"
+            " ('default-user-template', '模板', 0, 1);"
+        )
+        med.commit()
+        med.close()
+        act = sqlite3.connect(f"{self._dir}/trimactivity.db")
+        act.executescript(
+            "CREATE TABLE user_token (id INTEGER PRIMARY KEY, token TEXT,"
+            " user_guid TEXT, status INTEGER, update_time INTEGER);"
+            "INSERT INTO user_token (token, user_guid, status, update_time)"
+            " VALUES ('tok-dad', 'u-guid-1', 1, 10),"
+            " ('tok-mom', 'u-guid-2', 1, 10),"
+            " ('tok-old', 'u-guid-2', 0, 5);"
+        )
+        act.commit()
+        act.close()
+        self._cands = list(acl.borrow.CANDIDATES)
+        acl.borrow.CANDIDATES = [self._dir]
+        acl.discover(force=True)
+        acl.invalidate()
+        cfg = config.get()
+        self._cfg = {"acl_enabled": cfg.get("acl_enabled"),
+                     "acl_grants": dict(cfg.get("acl_grants") or {}),
+                     "acl_devices": dict(cfg.get("acl_devices") or {}),
+                     "acl_subjects": list(cfg.get("acl_subjects") or [])}
+        cfg.update({"acl_enabled": True, "acl_devices": {},
+                    "acl_grants": {"u-guid-1": {"libs": ["chart:movie"],
+                                                "sources": []},
+                                   "u-guid-2": {"libs": [], "sources": []}},
+                    "acl_subjects": []})
+        config.save(cfg)
+
+    def tearDown(self):
+        cfg = config.get()
+        cfg.update(self._cfg)
+        config.save(cfg)
+        acl.borrow.CANDIDATES = self._cands
+        acl.discover(force=True)
+        acl.invalidate()
+        import shutil
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def test_discovers_official_user_table(self):
+        report = acl.discover(force=True)
+        ids = [row["id"] for row in report["users"]]
+        self.assertIn("u-guid-1", ids)
+        self.assertIn("u-guid-2", ids)
+        # 占位账号不该出现在可授权清单里。
+        self.assertNotIn("default-user-template", ids)
+        # 管理员排最前，管理页第一眼就是自己。
+        self.assertEqual(report["users"][0]["id"], "u-guid-1")
+        self.assertTrue(report["users"][0]["is_admin"])
+        names = {row["id"]: row["name"] for row in report["users"]}
+        self.assertEqual(names["u-guid-2"], "妈妈")
+
+    def test_session_lookup_uses_raw_authorization_token(self):
+        ident = acl.identify(FakeRequest({"authorization": "tok-dad"}))
+        self.assertEqual((ident.uid, ident.via), ("u-guid-1", "session"))
+        self.assertEqual(ident.name, "爸爸")
+
+    def test_session_lookup_accepts_bearer_prefix(self):
+        ident = acl.identify(FakeRequest({"authorization": "Bearer tok-mom"}))
+        self.assertEqual((ident.uid, ident.via), ("u-guid-2", "session"))
+
+    def test_session_lookup_accepts_trim_mc_token_cookie(self):
+        ident = acl.identify(FakeRequest({"cookie": "a=1; Trim-MC-token=tok-dad"}))
+        self.assertEqual((ident.uid, ident.via), ("u-guid-1", "session"))
+
+    def test_disabled_session_is_ignored(self):
+        # status=0 的旧 token 不该把请求认成妈妈之外的账号；这里只验证
+        # 「无有效 token 时不会命中已失效会话」。
+        ident = acl.identify(FakeRequest({"authorization": "tok-old"}))
+        self.assertFalse(ident.known)
+        self.assertEqual(ident.reason, "no_mapping")
+
+    def test_session_identity_gates_content_without_binding(self):
+        ident = acl.identify(FakeRequest({"authorization": "tok-dad"}))
+        token = acl.push(ident)
+        try:
+            self.assertTrue(acl.lib_allowed("chart:movie"))
+            self.assertFalse(acl.lib_allowed("chart:tv"))
+        finally:
+            acl.reset(token)
+        ident = acl.identify(FakeRequest({"authorization": "tok-mom"}))
+        token = acl.push(ident)
+        try:
+            self.assertFalse(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+
 if __name__ == "__main__":
     unittest.main()

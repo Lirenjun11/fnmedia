@@ -14,7 +14,7 @@ const VIA_TEXT: Record<string, string> = {
   off: '账号权限未启用',
   header: '请求头识别',
   device: '本机设备绑定',
-  session: '官方登录会话',
+  session: '官方登录账号（自动识别）',
   unknown: '未识别',
 };
 
@@ -26,7 +26,7 @@ const REASON_TEXT: Record<string, string> = {
 };
 
 function meText(me: AclStatus['me']): string {
-  if (me.via === 'off') return '账号权限未启用（开启后按请求头/设备绑定识别）';
+  if (me.via === 'off') return '账号权限未启用（开启后按官方登录账号自动识别）';
   if (me.known) return `${me.name || me.uid}（${VIA_TEXT[me.via] || me.via}）`;
   const reason = REASON_TEXT[me.reason] || me.reason || '未知原因';
   return `未识别：${reason}`;
@@ -193,8 +193,9 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
       <section className="card">
         <div className="card-title">总开关</div>
         <p className="card-sub">
-          身份优先取请求头里的账号标识；没有时用「设备绑定」或官方登录会话反查。
-          管理页自身永不受权限限制，出问题可随时在这里关闭。
+          身份直接用飞牛影视的登录账号自动识别（读官方库的 token→账号映射），
+          不需要手工绑定；设备绑定只在前一步识别不出来时兜底。管理页自身永不
+          受权限限制，出问题可随时在这里关闭。
         </p>
         <label className="row" style={{ cursor: 'pointer' }}>
           <input
@@ -230,6 +231,13 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                 : ' · 未发现用户表/会话表'}
               {probe.discover.error ? ` · 错误 ${probe.discover.error}` : ''}
             </div>
+            <div className="small">
+              会话映射：
+              {probe.discover.sessions.length
+                ? probe.discover.sessions.map(
+                  (s) => `${s.db}.${s.table}(${s.token}→${s.uid})`).join('；')
+                : '未发现（无法自动识别账号）'}
+            </div>
             {probe.discover.users.length > 0 && (
               <div className="small">
                 发现的账号：{probe.discover.users.map((u) => `${u.name}(${u.id})`).join('、')}
@@ -247,8 +255,9 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
           </span>}
         </div>
         <p className="card-sub">
-          勾选某个账号可看的虚拟库、可用的片源。未勾选 = 看不到、搜不到、播不了；
-          片源还要求全局处于启用状态。
+          账号由飞牛影视媒体库自动读取（含管理员标记），无需手工添加；
+          勾选某个账号可看的虚拟库、可用的片源。未勾选 = 看不到、搜不到、
+          播不了；片源还要求全局处于启用状态。
         </p>
         {status && (status.unassigned_subjects > 0 || status.unassigned_sources > 0) && (
           <div className="pill-row mb">
@@ -270,9 +279,10 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
             {!status?.subjects.length && (
               <div className="empty">
                 <div className="empty-icon">◉</div>
-                <div>还没有可授权的账号</div>
+                <div>还没有读到官方账号</div>
                 <div className="small mt">
-                  官方库里没发现用户表时，可手动添加账号标识。
+                  确认已安装飞牛影视并至少登录过一次，然后点上方「重新自检」。
+                  仍读不到时可用下方「手动添加」兜底。
                 </div>
               </div>
             )}
@@ -287,7 +297,19 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                              gap: 8, textAlign: 'left' }}
                     onClick={() => setActive(item.id)}
                   >
-                    <span>{item.name}</span>
+                    <span>
+                      {item.name}
+                      {item.is_admin && (
+                        <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.8 }}>
+                          管理员
+                        </span>
+                      )}
+                      {item.source === 'manual' && (
+                        <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.8 }}>
+                          手动
+                        </span>
+                      )}
+                    </span>
                     <span style={{ fontSize: 12, opacity: 0.95, fontWeight: 400 }}>
                       {count ? `${g?.libs?.length || 0}库/${g?.sources?.length || 0}源` : '未授权'}
                     </span>
@@ -302,14 +324,14 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
             <div className="divider" />
             {!showAdd ? (
               <button className="btn sm ghost" onClick={() => setShowAdd(true)}>
-                + 手动添加账号
+                + 手动添加（官方库读不到时兜底）
               </button>
             ) : (
               <div className="stack">
                 <div>
-                  <label className="field">账号标识（建议填 fnOS user_id）</label>
+                  <label className="field">账号标识（官方库里的 user guid）</label>
                   <input value={newId} onChange={(e) => setNewId(e.target.value)}
-                         placeholder="例如 1000" />
+                         placeholder="从自检结果里的「发现的账号」复制" />
                 </div>
                 <div>
                   <label className="field">展示名（可选）</label>
@@ -360,8 +382,8 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                   )}
                 </div>
                 <div className="small">
-                  绑定后，这台浏览器/客户端发出的请求都按所选账号授权。
-                  手机 App 需在手机上打开管理页单独绑定一次。
+                  仅在自动识别失败时用（例如播放器进程不带登录 token）。绑定按
+                  凭证指纹记录，只存哈希；正常情况下不需要绑定。
                 </div>
 
                 <div className="divider" />

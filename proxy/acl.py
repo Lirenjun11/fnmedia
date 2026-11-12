@@ -14,10 +14,11 @@
 身份来源（按优先级）：
 
 1. 网关/客户端注入的用户头（``x-user-id`` 等），值直接当账号 id；
-2. 管理页「绑定当前设备」：把当前请求的凭证指纹映射到账号（最可靠，
-   不依赖官方 token 格式）；
-3. 官方 sqlite 会话表：拿 Cookie/Authorization 值（含 md5/sha256 形式）
-   在会话表里反查 user_id（尽力而为，探测不到就降级为未识别）。
+2. 官方登录会话：请求里的 token（``Authorization`` / ``Trim-MC-token``）
+   在 ``trimactivity.db.user_token`` 里映射到 ``user_guid``，再回
+   ``trimmedia.db.user`` 取用户名 —— **全自动，不用管理员配任何东西**；
+3. 管理页「绑定当前设备」：前两步都识别不出来时的兜底（例如播放器进程
+   没带 token）。
 """
 from __future__ import annotations
 
@@ -40,10 +41,13 @@ HEADER_NAMES = (
     "x-trim-user-id", "trim-user-id", "x-trim-uid",
     "x-fnos-user-id", "x-fnos-userid", "x-fnos-uid",
 )
+# 官方客户端把登录 token 放在这些位置（飞牛影视用的是 ``Trim-MC-token``）。
+TOKEN_HEADERS = ("authorization", "trim-mc-token", "x-trim-token")
 # Cookie 里可能是会话凭证的键；找不到就整串 Cookie 参与哈希匹配。
 COOKIE_NAMES = (
-    "fnos-token", "fnos_token", "fnos-token-v2", "trim-token", "trim_token",
-    "fnnas-token", "token", "access_token", "session", "sessionid", "sid",
+    "trim-mc-token", "fnos-token", "fnos_token", "fnos-token-v2",
+    "trim-token", "trim_token", "fnnas-token", "token", "access_token",
+    "session", "sessionid", "sid",
 )
 
 _CACHE_TTL = 30.0
@@ -54,10 +58,15 @@ _ID_CACHE: dict[str, tuple[float, "Identity"]] = {}
 _LOG_SEEN: dict[str, tuple[float, str]] = {}
 _DISCOVER_CACHE: tuple[float, dict] | None = None
 
-_UID_COLS = ("uid", "user_id", "userid")
-_NAME_COLS = ("nickname", "nick_name", "username", "user_name", "name",
+# 官方库的主键列名：``trimmedia.db.user`` 用 ``guid``，会话表用 ``user_guid``。
+# 上一版只匹配 uid/user_id，导致官方表整张识别不到、只能手工加账号。
+_UID_COLS = ("guid", "user_guid", "userguid", "uid", "user_id", "userid")
+_NAME_COLS = ("username", "nickname", "nick_name", "user_name", "name",
               "display_name", "account")
-_TOKEN_HINTS = ("token", "session", "sid", "ticket")
+_USER_TABLES = ("user", "users", "account", "accounts")
+# 会话表里判定「这条 token 还有效」与「取最新一条」的列。
+_STATUS_COLS = ("status", "state", "valid", "enabled")
+_ORDER_COLS = ("update_time", "updated_at", "mtime", "create_time", "id")
 
 
 @dataclass(frozen=True)
@@ -151,16 +160,25 @@ def device_fp(request) -> str:
 
 
 def _candidates(request) -> list[str]:
-    """请求里可能是会话凭证的值（原值；调用方再补 md5/sha256 变体）。"""
+    """请求里可能是会话 token 的值，按可信度排序（原值，不做哈希）。
+
+    官方做法是拿 ``Authorization`` / ``Trim-MC-token`` 的值**原样**去
+    ``user_token.token`` 里比对，所以这里保持原值；带 ``Bearer`` 前缀的
+    客户端再补一个去前缀的变体。
+    """
     out: list[str] = []
-    try:
-        auth = str(request.headers.get("authorization") or "")
-    except Exception:  # noqa: BLE001
-        auth = ""
-    if auth:
-        value = auth.split(None, 1)[1] if " " in auth else auth
-        if value:
-            out.append(value.strip())
+    for name in TOKEN_HEADERS:
+        try:
+            raw = str(request.headers.get(name) or "").strip()
+        except Exception:  # noqa: BLE001
+            raw = ""
+        if not raw:
+            continue
+        out.append(raw)
+        if " " in raw:
+            tail = raw.split(None, 1)[1].strip()
+            if tail:
+                out.append(tail)
     try:
         cookie = str(request.headers.get("cookie") or "")
     except Exception:  # noqa: BLE001
@@ -171,11 +189,8 @@ def _candidates(request) -> list[str]:
         key, _, value = part.partition("=")
         key = key.strip().lower()
         value = value.strip().strip('"')
-        if not value:
-            continue
-        if key in COOKIE_NAMES or len(value) >= 24:
+        if value and key in COOKIE_NAMES:
             out.append(value)
-    # 去重且限制数量，避免把超长 Cookie 全丢进 SQL。
     seen, clean = set(), []
     for value in out:
         if value in seen or len(value) > 4096:
@@ -185,14 +200,15 @@ def _candidates(request) -> list[str]:
     return clean[:8]
 
 
-def _variants(value: str) -> list[str]:
-    token = value.strip()
-    out = [token]
-    try:
-        out.append(hashlib.md5(token.encode()).hexdigest())
-        out.append(hashlib.sha256(token.encode()).hexdigest())
-    except Exception:  # noqa: BLE001
-        pass
+def _hash_variants(values: list[str]) -> list[str]:
+    """少数部署会把 token 哈希后入库；原值匹配失败时再试一轮。"""
+    out: list[str] = []
+    for value in values[:4]:
+        try:
+            out.append(hashlib.md5(value.encode()).hexdigest())
+            out.append(hashlib.sha256(value.encode()).hexdigest())
+        except Exception:  # noqa: BLE001
+            continue
     return out
 
 
@@ -209,9 +225,12 @@ def _db_files() -> list[str]:
             names = sorted(os.listdir(directory))
         except OSError:
             continue
-        for name in names[:24]:
-            if name.endswith((".db", ".sqlite", ".sqlite3")):
-                found.append(os.path.join(directory, name))
+        # 官方固定两个库：账号在 trimmedia.db，token→账号映射在
+        # trimactivity.db。先排它们，避免被同目录其它 .db 抢在前面。
+        ordered = [n for n in ("trimmedia.db", "trimactivity.db") if n in names]
+        ordered += [n for n in names[:32] if n not in ordered
+                    and n.endswith((".db", ".sqlite", ".sqlite3"))]
+        found += [os.path.join(directory, n) for n in ordered]
     return found
 
 
@@ -229,68 +248,122 @@ def _schema(conn: sqlite3.Connection) -> dict[str, list[str]]:
     return tables
 
 
+def _pick(lowered: dict[str, str], names: tuple[str, ...]) -> str:
+    """按优先级从「小写列名→真实列名」里挑一个存在的。"""
+    for name in names:
+        if name in lowered:
+            return lowered[name]
+    return ""
+
+
 def _user_table(tables: dict[str, list[str]]) -> tuple[str, str, str] | None:
+    """找出官方账号表；``user``/``users`` 等标准名字优先于「名字里带 user」。"""
+    def match(name: str, cols: list[str]):
+        lowered = {c.lower(): c for c in cols}
+        id_col = _pick(lowered, _UID_COLS)
+        name_col = _pick(lowered, _NAME_COLS)
+        if id_col and name_col:
+            return name, id_col, name_col
+        return None
+
+    for wanted in _USER_TABLES:
+        for name, cols in tables.items():
+            if name.lower() == wanted:
+                hit = match(name, cols)
+                if hit:
+                    return hit
     for name, cols in tables.items():
         low = name.lower()
         if "user" not in low and "account" not in low:
             continue
-        lowered = {c.lower(): c for c in cols}
-        id_col = next((lowered[c] for c in _UID_COLS if c in lowered), "")
-        name_col = next((lowered[c] for c in _NAME_COLS if c in lowered), "")
-        if id_col and name_col:
-            return name, id_col, name_col
+        hit = match(name, cols)
+        if hit:
+            return hit
     return None
 
 
-def _session_tables(tables: dict[str, list[str]]) -> list[tuple[str, list[str], str]]:
-    out = []
+def _session_tables(tables: dict[str, list[str]]) -> list[dict]:
+    """找出「token → 账号」映射表，并记录可用列。
+
+    官方是 ``trimactivity.db.user_token(token, user_guid, status,
+    update_time)``；这里不硬编码表名，只要求「有 token 列 + 有账号列」，
+    这样官方以后改表名也能自动跟上。
+    """
+    out: list[dict] = []
     for name, cols in tables.items():
         lowered = {c.lower(): c for c in cols}
         token_cols = [c for low, c in lowered.items()
-                      if any(h in low for h in _TOKEN_HINTS)]
-        uid_col = next((lowered[c] for c in _UID_COLS if c in lowered), "")
-        if token_cols and uid_col:
-            out.append((name, token_cols[:6], uid_col))
+                      if low == "token" or low.endswith("_token")
+                      or low.startswith("token_")]
+        uid_col = _pick(lowered, _UID_COLS)
+        if not token_cols or not uid_col:
+            continue
+        out.append({
+            "table": name,
+            "token_cols": token_cols[:4],
+            "uid_col": uid_col,
+            "status_col": _pick(lowered, _STATUS_COLS),
+            "order_col": _pick(lowered, _ORDER_COLS),
+            # 名字里直接带 token 的表（user_token）排前面，少打几次空查询。
+            "rank": 0 if "token" in name.lower() else 1,
+        })
+    out.sort(key=lambda row: row["rank"])
     return out
 
 
 def discover(force: bool = False) -> dict:
-    """只读探测官方用户表/会话表；结果缓存，失败不留异常。"""
+    """只读探测官方账号表/会话表；结果缓存，失败不留异常。"""
     global _DISCOVER_CACHE
     now = time.monotonic()
     with _LOCK:
         if not force and _DISCOVER_CACHE and now - _DISCOVER_CACHE[0] < _DISCOVER_TTL:
             return _DISCOVER_CACHE[1]
-    report: dict = {"db": "", "users": [], "tables": [], "error": ""}
+    report: dict = {"db": "", "users": [], "tables": [], "sessions": [],
+                    "error": ""}
     users: list[dict] = []
     tables_seen: list[dict] = []
+    sessions: list[dict] = []
     for path in _db_files():
         try:
             with closing(borrow._connect(path)) as conn:  # noqa: SLF001 - 复用只读连接
                 tables = _schema(conn)
                 user_table = _user_table(tables)
-                sessions = _session_tables(tables)
+                found = _session_tables(tables)
                 tables_seen.append({
                     "db": os.path.basename(path),
                     "user_table": user_table[0] if user_table else "",
-                    "session_tables": [t[0] for t in sessions],
+                    "session_tables": [t["table"] for t in found],
                 })
+                for sess in found:
+                    sessions.append(dict(sess, db=path))
                 if user_table:
                     table, id_col, name_col = user_table
+                    lowered = {c.lower(): c for c in tables[table]}
+                    extra = [c for c in ("is_admin", "status")
+                             if c in lowered]
+                    cols = ", ".join(
+                        [f'"{id_col}"', f'"{name_col}"']
+                        + [f'"{lowered[c]}"' for c in extra])
                     rows = conn.execute(
-                        f'SELECT "{id_col}", "{name_col}" FROM "{table}" LIMIT 200'
-                    ).fetchall()
+                        f'SELECT {cols} FROM "{table}" LIMIT 200').fetchall()
                     for row in rows:
                         uid = str(row[0] if row[0] is not None else "").strip()
-                        if not uid:
+                        # 官方会放一个占位账号，它不是真实用户。
+                        if not uid or uid == "default-user-template":
                             continue
-                        users.append({
+                        item = {
                             "id": uid[:64],
                             "name": str(row[1] or uid).strip()[:60] or uid,
                             "source": "auto",
-                        })
+                        }
+                        if "is_admin" in extra:
+                            item["is_admin"] = bool(
+                                row[2 + extra.index("is_admin")])
+                        if "status" in extra:
+                            item["status"] = row[2 + extra.index("status")]
+                        users.append(item)
                     if not report["db"]:
-                        report["db"] = path
+                        report["db"] = os.path.dirname(path)
         except (sqlite3.Error, OSError) as exc:
             report["error"] = report["error"] or type(exc).__name__
             continue
@@ -302,44 +375,58 @@ def discover(force: bool = False) -> dict:
             continue
         seen.add(row["id"])
         clean.append(row)
+    # 管理员排前面，方便管理页里先看到「自己」。
+    clean.sort(key=lambda row: (not row.get("is_admin"), row["name"]))
     report["users"] = clean[:200]
     report["tables"] = tables_seen[:12]
+    report["sessions"] = sessions[:8]
     with _LOCK:
         _DISCOVER_CACHE = (now, report)
     return report
 
 
 def _lookup_session(request) -> tuple[str, str]:
-    """用请求凭证在官方会话表里反查 user_id；返回 (uid, 原因)。"""
-    values = _candidates(request)
-    if not values:
+    """用请求里的登录 token 在官方会话表反查 user_guid；返回 (uid, 原因)。"""
+    tokens = _candidates(request)
+    if not tokens:
         return "", "no_credential"
     report = discover()
-    if not any((row or {}).get("session_tables")
-               for row in report.get("tables") or []):
-        # 连会话表都没探测到，别再逐请求扫库，直接给出可诊断的原因。
+    sessions = report.get("sessions") or []
+    if not sessions:
         return "", "no_session_table"
-    wanted: list[str] = []
-    for value in values:
-        wanted.extend(_variants(value))
-    wanted = list(dict.fromkeys(wanted))[:24]
-    placeholders = ",".join("?" for _ in wanted)
-    for path in _db_files():
-        try:
-            with closing(borrow._connect(path)) as conn:  # noqa: SLF001
-                tables = _schema(conn)
-                for table, token_cols, uid_col in _session_tables(tables):
-                    for token_col in token_cols:
-                        sql = (f'SELECT "{uid_col}" FROM "{table}" '
-                               f'WHERE "{token_col}" IN ({placeholders}) LIMIT 1')
-                        try:
-                            row = conn.execute(sql, wanted).fetchone()
-                        except sqlite3.Error:
-                            continue
-                        if row and str(row[0] or "").strip():
-                            return str(row[0]).strip()[:64], ""
-        except (sqlite3.Error, OSError):
+    by_db: dict[str, list[dict]] = {}
+    for sess in sessions:
+        by_db.setdefault(str(sess.get("db") or ""), []).append(sess)
+    # 先按原值匹配；全不中再试一轮哈希形式（非官方部署才可能用到）。
+    for values in (tokens, _hash_variants(tokens)):
+        wanted = list(dict.fromkeys(values))[:16]
+        if not wanted:
             continue
+        marks = ",".join("?" for _ in wanted)
+        for path, group in by_db.items():
+            try:
+                with closing(borrow._connect(path)) as conn:  # noqa: SLF001
+                    for sess in group:
+                        table = sess.get("table") or ""
+                        uid_col = sess.get("uid_col") or ""
+                        if not table or not uid_col:
+                            continue
+                        for token_col in sess.get("token_cols") or []:
+                            sql = (f'SELECT "{uid_col}" FROM "{table}" '
+                                   f'WHERE "{token_col}" IN ({marks})')
+                            if sess.get("status_col"):
+                                sql += f' AND "{sess["status_col"]}"=1'
+                            if sess.get("order_col"):
+                                sql += f' ORDER BY "{sess["order_col"]}" DESC'
+                            sql += " LIMIT 1"
+                            try:
+                                row = conn.execute(sql, wanted).fetchone()
+                            except sqlite3.Error:
+                                continue
+                            if row and str(row[0] or "").strip():
+                                return str(row[0]).strip()[:64], ""
+            except (sqlite3.Error, OSError):
+                continue
     return "", "no_mapping"
 
 
@@ -406,18 +493,18 @@ def identify(request, force: bool = False) -> Identity:
                          fp=cache_key)
         _log_ident(ident)
     else:
-        # 2) 管理页绑定的设备指纹。
-        rec = (cfg.get("acl_devices") or {}).get(cache_key)
-        if isinstance(rec, dict) and rec.get("uid"):
-            uid = str(rec["uid"])
-            ident = Identity(uid=uid, name=_subject_name(uid), via="device",
+        # 2) 官方登录 token → 官方会话表 → user_guid（全自动，无需配置）。
+        uid, reason = _lookup_session(request)
+        if uid:
+            ident = Identity(uid=uid, name=_subject_name(uid), via="session",
                              fp=cache_key)
             _log_ident(ident)
         else:
-            # 3) 官方库会话表反查（尽力而为）。
-            uid, reason = _lookup_session(request)
-            if uid:
-                ident = Identity(uid=uid, name=_subject_name(uid), via="session",
+            # 3) 管理页「绑定当前设备」：会话反查不出来时的兜底。
+            rec = (cfg.get("acl_devices") or {}).get(cache_key)
+            if isinstance(rec, dict) and rec.get("uid"):
+                uid = str(rec["uid"])
+                ident = Identity(uid=uid, name=_subject_name(uid), via="device",
                                  fp=cache_key)
                 _log_ident(ident)
             else:
@@ -559,8 +646,11 @@ def subjects() -> list[dict]:
         if not uid or uid in seen:
             continue
         seen.add(uid)
-        out.append({"id": uid, "name": str(row.get("name") or uid),
-                    "source": "auto"})
+        item = {"id": uid, "name": str(row.get("name") or uid),
+                "source": "auto"}
+        if row.get("is_admin"):
+            item["is_admin"] = True
+        out.append(item)
     # 授权表里有、但主体清单暂时读不到的账号也要能管理（D3：两通道解耦）。
     for uid in (config.get().get("acl_grants") or {}):
         if uid and uid not in seen:
@@ -608,6 +698,7 @@ def status() -> dict:
             "db": report.get("db") or "",
             "users": len(report.get("users") or []),
             "tables": report.get("tables") or [],
+            "sessions": len(report.get("sessions") or []),
             "error": report.get("error") or "",
         },
         "unassigned_sources": len(unassigned_sources),
@@ -649,6 +740,12 @@ def probe(request) -> dict:
             "db": report.get("db") or "",
             "users": report.get("users") or [],
             "tables": report.get("tables") or [],
+            "sessions": [
+                {"db": os.path.basename(str(s.get("db") or "")),
+                 "table": s.get("table"), "token": (s.get("token_cols") or [""])[0],
+                 "uid": s.get("uid_col")}
+                for s in (report.get("sessions") or [])
+            ],
             "error": report.get("error") or "",
         },
     }
