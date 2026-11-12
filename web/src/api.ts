@@ -43,6 +43,36 @@ export interface Config {
   adfilter_head_guard: boolean;
   adfilter_breaks: boolean;
   adfilter_strong: boolean;
+  vlib_enabled: boolean;
+  vlib_charts: boolean;
+  vlib_catalog: boolean;
+  vlib_refresh_hours: number;
+}
+
+export interface VlibRouteInfo {
+  name: string;
+  source: string;
+  total: number;
+}
+
+export interface VlibStatus {
+  enabled: boolean;
+  charts_enabled: boolean;
+  catalog_enabled: boolean;
+  bindings: number;
+  charts: {
+    refreshing: boolean;
+    updated_at: number;
+    provider_ok: number;
+    provider_total: number;
+    last_error: string;
+    counts: Record<string, number>;
+  };
+  catalog: {
+    refreshing: boolean;
+    updated_at: number;
+    routes: Record<string, VlibRouteInfo>;
+  };
 }
 
 export interface Bootstrap {
@@ -55,6 +85,7 @@ export interface Bootstrap {
   last_update: number;
   config: Config;
   sources: Source[];
+  vlib: VlibStatus;
 }
 
 export interface UpdateInfo {
@@ -180,6 +211,10 @@ export const api = {
   logs: () => request<{ logs: { ts: number; msg: string }[] }>('/v/api/ext/logs'),
   adfilterPreview: () =>
     request<{ previews: AdPreview[] }>('/v/api/ext/adfilter/preview'),
+  vlibStatus: () => request<VlibStatus>('/v/api/ext/vlib/status'),
+  vlibRefresh: (what: 'all' | 'charts' | 'catalog' = 'all') =>
+    request<VlibStatus>('/v/api/ext/vlib/refresh', json('POST', { what })),
+  vlibClear: () => request<VlibStatus>('/v/api/ext/vlib/cache', { method: 'DELETE' }),
   checkUpdate: (force = false) =>
     request<UpdateInfo>(`/v/api/ext/update/check${force ? '?force=1' : ''}`),
   exportConfig: () => request<{ config: Config }>('/v/api/ext/export'),

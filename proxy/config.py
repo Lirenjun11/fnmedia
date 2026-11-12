@@ -41,14 +41,18 @@ DEFAULTS = {
     "adfilter_head_guard": True,
     "adfilter_breaks": True,
     "adfilter_strong": True,
+    "vlib_enabled": True,
+    "vlib_charts": True,
+    "vlib_catalog": True,
+    "vlib_refresh_hours": 6,
 }
 
 _NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 10.0),
             "search_concurrency": (1, 16), "play_timeout": (2.0, 30.0),
             "update_interval_hours": (1, 168), "adfilter_head_skip": (0.0, 120.0),
-            "search_debounce_ms": (0, 1000)}
+            "search_debounce_ms": (0, 1000), "vlib_refresh_hours": (1, 24)}
 _INTEGERS = ("enabled_limit", "search_concurrency", "update_interval_hours",
-             "search_debounce_ms")
+             "search_debounce_ms", "vlib_refresh_hours")
 _LOCK = threading.RLock()
 _cache: dict | None = None
 _mtime = 0.0
@@ -125,6 +129,9 @@ def save(cfg: dict) -> dict:
     clean["adfilter_head_guard"] = bool(clean["adfilter_head_guard"])
     clean["adfilter_breaks"] = bool(clean["adfilter_breaks"])
     clean["adfilter_strong"] = bool(clean["adfilter_strong"])
+    clean["vlib_enabled"] = bool(clean["vlib_enabled"])
+    clean["vlib_charts"] = bool(clean["vlib_charts"])
+    clean["vlib_catalog"] = bool(clean["vlib_catalog"])
     raw_keywords = clean["adfilter_keywords"]
     if not isinstance(raw_keywords, list):
         raw_keywords = []

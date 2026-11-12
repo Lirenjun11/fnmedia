@@ -10,11 +10,14 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 import cms
+import catalog
+import charts
 import config
 import hls
 import runtime
 import subscription
 import upcheck
+import vlib
 
 router = APIRouter(prefix="/v/api/ext")
 COOKIE = "fnos_media_admin"
@@ -47,9 +50,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.6"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.0"
     except OSError:
-        return "0.0.1.6"
+        return "0.0.2.0"
 
 
 def _public_config() -> dict:
@@ -108,6 +111,7 @@ async def bootstrap(request: Request):
         "last_update": cfg.get("last_update", 0),
         "config": cfg,
         "sources": sources,
+        "vlib": vlib_status(),
     })
 
 
@@ -358,6 +362,45 @@ async def apply_subscription(request: Request):
 async def clear_cache(request: Request):
     guard(request)
     return ok({"cleared": cms.clear_cache()})
+
+
+def vlib_status() -> dict:
+    return {
+        "enabled": vlib.enabled(),
+        "charts_enabled": vlib.charts_enabled(),
+        "catalog_enabled": vlib.catalog_enabled(),
+        "charts": charts.chart_cache.status(),
+        "catalog": catalog.catalog.status(),
+        "bindings": vlib.bind_count(),
+    }
+
+
+@router.get("/vlib/status")
+async def vlib_status_route(request: Request):
+    guard(request)
+    return ok(vlib_status())
+
+
+@router.post("/vlib/refresh")
+async def vlib_refresh(request: Request):
+    """立即刷新榜单与分类路由；失败保留旧缓存，结果如实返回。"""
+    guard(request)
+    body = await body_json(request)
+    what = str(body.get("what") or "all")
+    client = request.app.state.src
+    if what in ("all", "charts"):
+        await charts.chart_cache.refresh(client)
+    if what in ("all", "catalog"):
+        await catalog.catalog.refresh_routes(client, config.enabled_sources())
+    return ok(vlib_status())
+
+
+@router.delete("/vlib/cache")
+async def vlib_clear(request: Request):
+    guard(request)
+    charts.chart_cache.reset()
+    catalog.catalog.reset()
+    return ok(vlib_status())
 
 
 @router.get("/logs")

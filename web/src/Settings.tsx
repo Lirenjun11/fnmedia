@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type AdPreview, type Bootstrap, type Config, type UpdateInfo } from './api';
 import type { Notify } from './App';
-
 interface Props {
   boot: Bootstrap;
   refresh: () => Promise<void>;
@@ -448,6 +447,176 @@ export function LogsPage({ notify }: { notify: Notify }) {
             ))}
           </div>
         )}
+      </section>
+    </>
+  );
+}
+
+const VLIB_CATS = [
+  { key: 'movie', label: '电影' },
+  { key: 'tv', label: '剧集' },
+  { key: 'anime', label: '动漫' },
+  { key: 'variety', label: '综艺' },
+];
+
+function timeText(ts: number): string {
+  return ts ? new Date(ts * 1000).toLocaleString() : '尚未刷新';
+}
+
+export function VirtualLibPage({ boot, refresh, notify }: Props) {
+  const [form, setForm] = useState({
+    vlib_enabled: !!boot.config.vlib_enabled,
+    vlib_charts: !!boot.config.vlib_charts,
+    vlib_catalog: !!boot.config.vlib_catalog,
+    vlib_refresh_hours: Number(boot.config.vlib_refresh_hours ?? 6),
+  });
+  const [status, setStatus] = useState(boot.vlib);
+  const [busy, setBusy] = useState('');
+
+  const set = (key: keyof typeof form, value: number | boolean) =>
+    setForm((current) => ({ ...current, [key]: value }));
+
+  async function save() {
+    setBusy('save');
+    try {
+      await api.patchConfig({
+        vlib_enabled: form.vlib_enabled,
+        vlib_charts: form.vlib_charts,
+        vlib_catalog: form.vlib_catalog,
+        vlib_refresh_hours: Number(form.vlib_refresh_hours),
+      });
+      await refresh();
+      setStatus(await api.vlibStatus());
+      notify('虚拟媒体库设置已保存并即时生效', 'ok');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '保存失败', 'err');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function run(kind: 'refresh' | 'clear') {
+    setBusy(kind);
+    try {
+      const data = kind === 'refresh'
+        ? await api.vlibRefresh('all')
+        : await api.vlibClear();
+      setStatus(data);
+      notify(kind === 'refresh' ? '已触发刷新，稍后重新进入影视即可看到' : '缓存已清空',
+             'ok');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '操作失败', 'err');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  const chartCounts = status?.charts?.counts || {};
+  const routes = status?.catalog?.routes || {};
+
+  return (
+    <>
+      <div className="page-head">
+        <h1>虚拟媒体库</h1>
+        <p className="page-desc">在飞牛影视媒体库首页注入在线榜单与海量分类库</p>
+      </div>
+      <section className="card">
+        <div className="card-title">总开关</div>
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input className="check" type="checkbox" checked={form.vlib_enabled}
+                 onChange={(e) => set('vlib_enabled', e.target.checked)} />
+          <span>注入虚拟媒体库（关掉后媒体库首页立即恢复官方原样）</span>
+        </label>
+        <div className="divider" />
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input className="check" type="checkbox" checked={form.vlib_charts}
+                 onChange={(e) => set('vlib_charts', e.target.checked)} />
+          <span>榜单四库：🎬热门电影 / 📺热门剧集 / 🌸动漫新番 / 🎤热门综艺</span>
+        </label>
+        <p className="card-sub">
+          展示层来自豆瓣公开榜单（片名、海报、评分），点进详情时才用片名聚合搜索
+          你的资源站；命中后复用既有详情、选集、线路与续播能力，未命中显示「暂无在线片源」。
+        </p>
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input className="check" type="checkbox" checked={form.vlib_catalog}
+                 onChange={(e) => set('vlib_catalog', e.target.checked)} />
+          <span>海量四库：🎞海量电影 / 📺海量剧集 / 🌸海量动漫 / 🎤海量综艺</span>
+        </label>
+        <p className="card-sub">
+          从资源站 Apple CMS 分类表里按「最近更新」深翻，每页直连详情接口，
+          点开即可播放，无需再搜索。脏类（解说/预告/短剧/福利等）自动剔除。
+        </p>
+        <div className="grid mt">
+          <div>
+            <label className="field">刷新间隔（小时，1 – 24）</label>
+            <input type="number" min="1" max="24" value={form.vlib_refresh_hours}
+                   onChange={(e) => set('vlib_refresh_hours', Number(e.target.value))} />
+          </div>
+        </div>
+        <div className="row end mt">
+          <button className="btn primary" disabled={!!busy} onClick={() => void save()}>
+            {busy === 'save' ? '保存中…' : '保存设置'}
+          </button>
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="card-title">运行状态</div>
+        <div className="grid">
+          <div className="stat">
+            <div className="value">{status?.charts?.provider_ok ?? 0}</div>
+            <div className="label">榜单数据源成功 / {status?.charts?.provider_total ?? 0}</div>
+          </div>
+          <div className="stat">
+            <div className="value">{status?.bindings ?? 0}</div>
+            <div className="label">已绑定可播放条目</div>
+          </div>
+          <div className="stat">
+            <div className="value">{Object.values(routes).filter((r) => r.total > 0).length}</div>
+            <div className="label">海量库可用分类</div>
+          </div>
+        </div>
+        <p className="hint mt">
+          榜单刷新：{timeText(status?.charts?.updated_at)}；
+          分类路由：{timeText(status?.catalog?.updated_at)}
+          {status?.charts?.refreshing || status?.catalog?.refreshing ? '（刷新中…）' : ''}
+        </p>
+        {status?.charts?.last_error && (
+          <p className="hint">榜单错误：{status.charts.last_error}</p>
+        )}
+        <div className="stack mt">
+          {VLIB_CATS.map((cat) => {
+            const route = routes[cat.key];
+            return (
+              <div className="row" key={cat.key}>
+                <span className="badge ok">榜单·{cat.label} {chartCounts[cat.key] ?? 0}</span>
+                <span className="badge">
+                  海量·{cat.label} {route?.total ?? 0}
+                  {route?.source ? ` · ${route.source}` : ''}
+                </span>
+                {route?.name && <span className="small">{route.name}</span>}
+              </div>
+            );
+          })}
+        </div>
+        <div className="row mt">
+          <button className="btn sm" disabled={!!busy} onClick={() => void run('refresh')}>
+            {busy === 'refresh' ? '刷新中…' : '立即刷新榜单与分类'}
+          </button>
+          <button className="btn sm" disabled={!!busy} onClick={() => void run('clear')}>
+            清空虚拟库缓存
+          </button>
+          <span className="small">刷新失败会保留旧缓存；清空后需重新刷新才恢复内容</span>
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="card-title">说明</div>
+        <p className="small">
+          虚拟库只在本扩展内伪造媒体库条目，不改官方数据库、不写官方影视数据。
+          榜单条目本身不是片源，点开时才按片名搜索你配置的资源站；海量库条目来自
+          资源站公开分类接口。停用扩展或关闭总开关后，媒体库首页立即恢复官方原样。
+        </p>
       </section>
     </>
   );

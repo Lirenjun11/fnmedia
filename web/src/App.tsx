@@ -3,11 +3,11 @@ import { api, type Bootstrap, type UpdateInfo } from './api';
 import SourcesPage from './Sources';
 import SubscriptionsPage from './Subscriptions';
 import PreferencesPage from './Preferences';
-import { AboutPage, AdFilterPage, CachePage, LogsPage, PlaybackPage } from './Settings';
+import { AboutPage, AdFilterPage, CachePage, LogsPage, PlaybackPage, VirtualLibPage } from './Settings';
 
 export type Page =
   | 'overview' | 'sources' | 'subscriptions' | 'playback' | 'adfilter'
-  | 'cache' | 'logs' | 'settings' | 'about';
+  | 'vlib' | 'cache' | 'logs' | 'settings' | 'about';
 export type Notify = (message: string, kind?: 'ok' | 'err' | '') => void;
 
 const NAV: { key: Page; label: string; icon: string }[] = [
@@ -16,7 +16,8 @@ const NAV: { key: Page; label: string; icon: string }[] = [
   { key: 'subscriptions', label: '订阅配置', icon: '◈' },
   { key: 'playback', label: '搜索播放', icon: '▷' },
   { key: 'adfilter', label: '广告过滤', icon: '⊘' },
-  { key: 'cache', label: '缓存记录', icon: '▤' },
+  { key: 'vlib', label: '虚拟媒体库', icon: '▤' },
+  { key: 'cache', label: '缓存记录', icon: '▥' },
   { key: 'logs', label: '日志诊断', icon: '≡' },
   { key: 'settings', label: '设置', icon: '⚙' },
   { key: 'about', label: '关于', icon: 'ⓘ' },
@@ -97,7 +98,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div>v{boot?.version || '0.0.1.6'} · 零内置源</div>
+          <div>v{boot?.version || '0.0.2.0'} · 零内置源</div>
         </div>
       </aside>
 
@@ -125,6 +126,9 @@ export default function App() {
             )}
             {page === 'adfilter' && boot && (
               <AdFilterPage boot={boot} refresh={refresh} notify={notify} />
+            )}
+            {page === 'vlib' && boot && (
+              <VirtualLibPage boot={boot} refresh={refresh} notify={notify} />
             )}
             {page === 'cache' && boot && (
               <CachePage boot={boot} refresh={refresh} notify={notify} />
@@ -200,7 +204,7 @@ function Overview({ boot, onGo }: { boot: Bootstrap | null; onGo: () => void }) 
       <div className="card">
         <div className="card-title">运行信息</div>
         <div className="pill-row mt">
-          <span className="badge brand">v{boot?.version || '0.0.1.6'}</span>
+          <span className="badge brand">v{boot?.version || '0.0.2.0'}</span>
           <span className="badge">运行 {Math.round((boot?.uptime ?? 0) / 60)} 分钟</span>
           <span className="badge ok">上游接管正常</span>
         </div>

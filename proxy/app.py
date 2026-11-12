@@ -18,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 
 import admin_api
 import borrow
+import catalog as catalog_mod
+import charts
 import cms
 import config
 import douban
@@ -27,6 +29,8 @@ import playstate
 import playstate_api
 import runtime
 import upstream
+import vlib
+import vlib_api
 
 STATIC = Path(__file__).resolve().parent / "static"
 ONLINE = "/v/media/online"
@@ -51,6 +55,33 @@ async def _auto_update_worker() -> None:
             runtime.log(f"auto subscription refresh failed: {type(exc).__name__}")
 
 
+async def _vlib_worker(app: FastAPI) -> None:
+    """虚拟媒体库后台刷新：榜单缓存 + 资源站分类路由。
+
+    只在缓存过期时刷新；页面请求永远读缓存（stale-while-revalidate），
+    刷新失败保留旧数据，绝不让媒体库列表变空。
+    """
+    await asyncio.sleep(5)
+    while True:
+        try:
+            cfg = config.get()
+            if cfg.get("vlib_enabled", True):
+                interval = max(1.0, float(cfg.get("vlib_refresh_hours", 6))) * 3600
+                if cfg.get("vlib_charts", True) \
+                        and charts.chart_cache.stale(interval):
+                    await charts.chart_cache.refresh(app.state.src)
+                if cfg.get("vlib_catalog", True) \
+                        and config.enabled_sources() \
+                        and catalog_mod.catalog.stale():
+                    await catalog_mod.catalog.refresh_routes(
+                        app.state.src, config.enabled_sources())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  
+            runtime.log(f"vlib refresh failed: {type(exc).__name__}")
+        await asyncio.sleep(600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.up = upstream.make_client(
@@ -69,14 +100,19 @@ async def lifespan(app: FastAPI):
     )
     app.state.store = cms.TitleStore()
     playstate.load()
+    vlib.bind_client(app.state.src)
+    restored = vlib.restore(app.state.store)
     runtime.log(f"service started, sources={len(config.enabled_sources())} "
-                f"aes_decrypt={'on' if hls.can_decrypt() else 'off'}")
+                f"aes_decrypt={'on' if hls.can_decrypt() else 'off'} "
+                f"vlib_charts={charts.chart_cache.total()} restored={restored}")
     worker = asyncio.create_task(_auto_update_worker())
+    vlib_worker = asyncio.create_task(_vlib_worker(app))
     try:
         yield
     finally:
+        vlib_worker.cancel()
         worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+        await asyncio.gather(vlib_worker, worker, return_exceptions=True)
         playstate.persist(force=True)
         await app.state.up.aclose()
         await app.state.src.aclose()
@@ -268,6 +304,7 @@ if STATIC.is_dir():
 
 app.include_router(admin_api.router)
 app.include_router(playstate_api.router)
+app.include_router(vlib_api.router)
 
 
 _SEARCH_LATEST: dict[str, float] = {}
@@ -347,6 +384,16 @@ async def item_detail_query(request: Request):
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
     store = request.app.state.store
+    if charts.chart_cache.is_chart_guid(guid):
+        row = await vlib.detail(store, request.app.state.src, guid)
+        if row:
+            return JSONResponse(fake.ok(fake.normalize_detail(row, _ua(request))))
+    if not store.get(guid) and not store.resolve_media(guid) \
+            and not store.resolve_episode(guid):
+        owner = vlib.chart_of_media(guid)
+        if owner:
+            # 未绑定榜单条目：先把线路搜出来，后面的 media/episode 分支才认得。
+            await vlib.ensure_bound(store, request.app.state.src, owner)
     ep = store.resolve_episode(guid)
     if ep:
         brief = store.get(ep[0])
@@ -406,6 +453,9 @@ async def season_route(guid: str, request: Request):
     store = request.app.state.store
     tv_guid = _tv_guid_of(store, guid)
     brief = store.get(tv_guid) if tv_guid else None
+    if not brief and await _ensure_vlib(store, request.app.state.src, guid):
+        tv_guid = _tv_guid_of(store, guid)
+        brief = store.get(tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
     rows = fake.season_list(brief)
@@ -442,6 +492,9 @@ async def episode_route(guid: str, request: Request):
     store = request.app.state.store
     tv_guid = _tv_guid_of(store, guid)
     brief = store.get(tv_guid) if tv_guid else None
+    if not brief and await _ensure_vlib(store, request.app.state.src, guid):
+        tv_guid = _tv_guid_of(store, guid)
+        brief = store.get(tv_guid) if tv_guid else None
     if not brief:
         return await _passthrough(request)
     rows = _apply_episode_progress(fake.episode_list(brief), tv_guid)
@@ -463,6 +516,12 @@ async def item_list_route(request: Request):
     """部分客户端用 item/list + parent_guid 拉取季/集子项。"""
     body = await _body(request)
     store = request.app.state.store
+    lib = str(body.get("ancestor_guid") or body.get("parent_guid") or "")
+    if vlib.is_virtual_lib(lib):
+        data = await vlib.item_list(store, request.app.state.src, body, lib)
+        if data is not None:
+            data["list"] = fake.normalize_cards(data["list"], _ua(request))
+            return JSONResponse(fake.ok(data))
     parent = str(body.get("parent_guid") or body.get("ancestor_guid") or "")
     if not parent:
         return await _passthrough(request)
@@ -495,6 +554,8 @@ async def stream_list_post(request: Request):
 
 async def _stream_list_impl(guid: str, request: Request):
     store = request.app.state.store
+    if not store.resolve_episode(guid) and not store.get(guid):
+        await _ensure_vlib(store, request.app.state.src, guid)
     ep = store.resolve_episode(guid)
     if ep:
         tv_guid, ep_index = ep
@@ -565,6 +626,16 @@ def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
     if store.get(guid):
         return guid, fake.media_guid(guid), fake.video_guid(guid)
     return None
+
+
+async def _ensure_vlib(store: cms.TitleStore, client, guid: str) -> bool:
+    """榜单卡片在真正播放/取详情前才搜源绑定；这里做一次懒绑定。"""
+    owner = guid if charts.chart_cache.is_chart_guid(guid) \
+        else vlib.chart_of_media(guid)
+    if not owner:
+        return False
+    await vlib.ensure_bound(store, client, owner)
+    return True
 
 
 def _clamp_line(value: str, names: list[str],
@@ -648,6 +719,8 @@ async def play_info_route(request: Request):
     guid = str(body.get("item_guid") or "")
     store = request.app.state.store
     identity = _identity(store, guid)
+    if not identity and await _ensure_vlib(store, request.app.state.src, guid):
+        identity = _identity(store, guid)
     if not identity:
         return await _passthrough(request)
     _, mg, vg = identity
@@ -696,6 +769,8 @@ async def stream_post(request: Request):
              or body.get("guid") or "")
     store = request.app.state.store
     resolved = store.resolve_media(mg)
+    if not resolved and await _ensure_vlib(store, request.app.state.src, mg):
+        resolved = store.resolve_media(mg)
     if not resolved:
         return await _passthrough(request)
     guid, index = resolved
@@ -741,6 +816,9 @@ async def media_range_route(file_hash: str, request: Request):
     store = request.app.state.store
     mg = file_hash
     resolved = store.resolve_media(file_hash)
+    if not resolved and not store.resolve_episode(file_hash) \
+            and await _ensure_vlib(store, request.app.state.src, file_hash):
+        resolved = store.resolve_media(file_hash)
     if not resolved:
         ep = store.resolve_episode(file_hash)
         if not ep:
@@ -780,6 +858,8 @@ async def play_play(request: Request):
              or body.get("guid") or "")
     store = request.app.state.store
     resolved = store.resolve_media(mg)
+    if not resolved and await _ensure_vlib(store, request.app.state.src, mg):
+        resolved = store.resolve_media(mg)
     if not resolved:
         return await _passthrough(request)
     guid, index = resolved
