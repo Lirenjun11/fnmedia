@@ -176,6 +176,11 @@ def _norm_title(text) -> str:
     return _NORM_RE.sub("", s)
 
 
+def norm_title(text) -> str:
+    """片名规范化（去标点/空白/大小写），供跨源匹配与虚拟库绑定复用。"""
+    return _norm_title(text)
+
+
 def _year4(t: OnlineTitle) -> str:
     value = str(t.year or "")[:4]
     return value if value.isdigit() else ""
@@ -359,6 +364,32 @@ class TitleStore:
 
     def get(self, guid: str) -> dict | None:
         return self._items.get(guid)
+
+    def put_brief(self, brief: dict) -> dict:
+        """按 brief 自带的 guid 注册一条可播放数据。
+
+        搜索结果用 remember()（guid 由源+vodi 派生）；虚拟媒体库的榜单条目
+        用稳定的 chart guid，需要把搜源命中的线路挂到这个 guid 上，播放链
+        才能照常按 guid 反查 media/episode。返回注册后的 brief。
+        """
+        from fake import (media_guid, video_guid, ep_media_guid,
+                          ep_video_guid, episode_guid, season_guid)
+        guid = str(brief.get("guid") or "")
+        if not guid:
+            return brief
+        self._items[guid] = brief
+        self._season[season_guid(guid)] = guid
+        self._media[media_guid(guid)] = (guid, 0)
+        self._media[video_guid(guid)] = (guid, 0)
+        for idx in range(max(1, int(brief.get("episodes") or 1))):
+            eg = episode_guid(guid, idx)
+            self._episode[eg] = (guid, idx)
+            self._media[ep_media_guid(eg)] = (guid, idx)
+            self._media[ep_video_guid(eg)] = (guid, idx)
+        if len(self._items) > self._max:
+            for key in list(self._items)[: max(1, self._max // 4)]:
+                self._drop(key)
+        return brief
 
     def resolve_media(self, mg: str) -> tuple[str, int] | None:
         return self._media.get(mg)
