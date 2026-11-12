@@ -643,6 +643,63 @@ async def _ensure_vlib(store: cms.TitleStore, client, guid: str) -> bool:
     return True
 
 
+def _play_ref(store: cms.TitleStore, value: str) -> dict | None:
+    """把客户端给的任意标识（item/media/video/剧 guid）解析成统一播放引用。
+
+    搜索结果的播放链只传 media_guid，虚拟库进来的客户端可能传 item_guid、
+    甚至直接传剧/集 guid，所以四条链路（play/info、play/play、stream、
+    media/range）都走这一个入口，避免某条入口认不出标识而透传给官方。
+    """
+    value = str(value or "")
+    if not value:
+        return None
+    ep = store.resolve_episode(value)
+    if ep:
+        return {"guid": ep[0], "index": ep[1], "media": value,
+                "video": fake.ep_video_guid(value), "episode": value}
+    media = store.resolve_media(value)
+    if media:
+        guid, index = media
+        return {"guid": guid, "index": index, "media": value,
+                "video": _video_guid_for(guid, index, value), "episode": ""}
+    if store.get(value):
+        return {"guid": value, "index": 0, "media": fake.media_guid(value),
+                "video": fake.video_guid(value), "episode": ""}
+    return None
+
+
+async def _resolve_play_ref(store: cms.TitleStore, client,
+                            body: dict) -> dict | None:
+    """按客户端可能使用的字段顺序解析播放引用；未绑定的榜单条目现场绑定。"""
+    for key in ("media_guid", "video_guid", "item_guid", "guid"):
+        value = str(body.get(key) or "")
+        if not value:
+            continue
+        ref = _play_ref(store, value)
+        if ref:
+            return ref
+        if await _ensure_vlib(store, client, value):
+            ref = _play_ref(store, value)
+            if ref:
+                return ref
+    return None
+
+
+async def _media_target(request: Request, mg: str):
+    """按 media/video guid 找可播条目；store 淘汰或榜单未绑定时现场补绑。"""
+    store = request.app.state.store
+    resolved = store.resolve_media(mg)
+    if not resolved and await _ensure_vlib(store, request.app.state.src, mg):
+        resolved = store.resolve_media(mg)
+    if not resolved:
+        return None
+    guid, index = resolved
+    brief = store.get(guid)
+    if not brief:
+        return None
+    return guid, index, brief
+
+
 def _clamp_line(value: str, names: list[str],
                 brief: dict | None = None) -> int | None:
     raw = str(value or "").strip()
@@ -721,22 +778,19 @@ def _range_selection(request: Request, brief: dict) -> tuple[int, bool]:
 @app.post("/v/api/v1/play/info")
 async def play_info_route(request: Request):
     body = await _body(request)
-    guid = str(body.get("item_guid") or "")
     store = request.app.state.store
-    identity = _identity(store, guid)
-    if not identity and await _ensure_vlib(store, request.app.state.src, guid):
-        identity = _identity(store, guid)
-    if not identity:
+    ref = await _resolve_play_ref(store, request.app.state.src, body)
+    if not ref:
+        runtime.log(f"play/info unresolved keys={sorted(body)}")
         return await _passthrough(request)
-    _, mg, vg = identity
-    ep = store.resolve_episode(guid)
-    if ep:
-        brief = store.get(ep[0])
+    guid, mg, vg = ref["guid"], ref["media"], ref["video"]
+    if ref["episode"]:
+        brief = store.get(guid)
         if not brief:
             return await _passthrough(request)
-        index = ep[1]
-        info = fake.episode_play_info(brief, index, guid)
-        canonical = ep[0]
+        index = ref["index"]
+        info = fake.episode_play_info(brief, index, ref["episode"])
+        canonical = guid
     else:
         brief = store.get(guid)
         if not brief:
@@ -770,15 +824,12 @@ async def play_info_route(request: Request):
 @app.post("/v/api/v1/stream")
 async def stream_post(request: Request):
     body = await _body(request)
-    mg = str(body.get("media_guid") or body.get("video_guid")
-             or body.get("guid") or "")
     store = request.app.state.store
-    resolved = store.resolve_media(mg)
-    if not resolved and await _ensure_vlib(store, request.app.state.src, mg):
-        resolved = store.resolve_media(mg)
-    if not resolved:
+    ref = await _resolve_play_ref(store, request.app.state.src, body)
+    if not ref:
+        runtime.log(f"stream unresolved keys={sorted(body)}")
         return await _passthrough(request)
-    guid, index = resolved
+    guid, index, mg = ref["guid"], ref["index"], ref["media"]
     brief = store.get(guid)
     if not brief:
         return await _passthrough(request)
@@ -786,7 +837,7 @@ async def stream_post(request: Request):
     meta = hls.get_playlist_meta((guid, line, index))
     data = fake.stream_payload(
         brief, mg,
-        str(body.get("video_guid") or _video_guid_for(guid, index, mg)),
+        str(body.get("video_guid") or ref["video"]),
         meta, line)
     runtime.log(f"stream: {brief.get('title', '')[:30]} ep{index + 1} "
                 f"line={line}/{len(brief.get('line_names') or [])} "
@@ -819,18 +870,12 @@ async def media_range_route(file_hash: str, request: Request):
     Range 代理（支持拖动），HLS 源重定向到本模块 m3u8 播放链路；官方真实
     文件的 hash 永远透传，不受影响。"""
     store = request.app.state.store
-    mg = file_hash
-    resolved = store.resolve_media(file_hash)
-    if not resolved and not store.resolve_episode(file_hash) \
-            and await _ensure_vlib(store, request.app.state.src, file_hash):
-        resolved = store.resolve_media(file_hash)
-    if not resolved:
-        ep = store.resolve_episode(file_hash)
-        if not ep:
-            return await _passthrough(request)
-        resolved = ep
-        mg = fake.ep_media_guid(file_hash)
-    guid, index = resolved
+    ref = _play_ref(store, file_hash)
+    if not ref and await _ensure_vlib(store, request.app.state.src, file_hash):
+        ref = _play_ref(store, file_hash)
+    if not ref:
+        return await _passthrough(request)
+    guid, index, mg = ref["guid"], ref["index"], ref["media"]
     brief = store.get(guid)
     if not brief:
         return await _passthrough(request)
@@ -859,15 +904,12 @@ async def media_range_route(file_hash: str, request: Request):
 @app.post("/v/api/v1/play/play")
 async def play_play(request: Request):
     body = await _body(request)
-    mg = str(body.get("media_guid") or body.get("video_guid")
-             or body.get("guid") or "")
     store = request.app.state.store
-    resolved = store.resolve_media(mg)
-    if not resolved and await _ensure_vlib(store, request.app.state.src, mg):
-        resolved = store.resolve_media(mg)
-    if not resolved:
+    ref = await _resolve_play_ref(store, request.app.state.src, body)
+    if not ref:
+        runtime.log(f"play/play unresolved keys={sorted(body)}")
         return await _passthrough(request)
-    guid, index = resolved
+    guid, index, mg = ref["guid"], ref["index"], ref["media"]
     brief = store.get(guid)
     if not brief:
         return await _passthrough(request)
@@ -904,9 +946,10 @@ async def play_play(request: Request):
     runtime.log(f"play: {brief.get('title', '')[:30]} ep{index + 1} "
                 f"line={line}/{len(brief.get('line_names') or [])} "
                 f"bitrate={body.get('bitrate')!r} auto={not explicit} "
-                f"start={start} ua={_ua(request)[:40]!r}")
+                f"start={start} mg={mg[:8]} {suffix} "
+                f"ua={_ua(request)[:40]!r}")
     return JSONResponse(fake.play_response(
-        mg, str(body.get("video_guid") or _video_guid_for(guid, index, mg)),
+        mg, str(body.get("video_guid") or ref["video"]),
         link, "HLS" if is_hls else "MP4"))
 
 
@@ -935,13 +978,11 @@ async def _warm_line(client, brief: dict, guid: str, index: int,
 async def preset_m3u8(mg: str, request: Request):
     """播放 master：只列当前线路。手机端会逐条预取 master 的所有变体，
     多变体会把它拖到超时；换线由 qualities -> play/play 重新下发单变体。"""
-    resolved = request.app.state.store.resolve_media(mg)
-    if not resolved:
+    target = await _media_target(request, mg)
+    if not target:
+        runtime.log(f"preset miss: {mg[:12]}")
         return Response(status_code=404)
-    guid, index = resolved
-    brief = request.app.state.store.get(guid)
-    if not brief:
-        return Response(status_code=404)
+    guid, index, brief = target
     line, _ = _range_selection(request, brief)
     names = brief.get("line_names") or []
     line = max(0, min(line, len(names) - 1)) if names else 0
@@ -978,13 +1019,11 @@ async def preset_m3u8(mg: str, request: Request):
 
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")
 async def main_m3u8(mg: str, request: Request):
-    resolved = request.app.state.store.resolve_media(mg)
-    if not resolved:
+    target = await _media_target(request, mg)
+    if not target:
+        runtime.log(f"main miss: {mg[:12]}")
         return Response(status_code=404)
-    guid, index = resolved
-    brief = request.app.state.store.get(guid)
-    if not brief:
-        return Response(status_code=404)
+    guid, index, brief = target
     try:
         line = int(request.query_params.get("line", 0))
     except ValueError:
@@ -1089,13 +1128,10 @@ async def variant_playlist(request: Request):
 
 @app.get(f"{ONLINE}/{{mg}}/direct")
 async def direct_media(mg: str, request: Request):
-    resolved = request.app.state.store.resolve_media(mg)
-    if not resolved:
+    target = await _media_target(request, mg)
+    if not target:
         return Response(status_code=404)
-    guid, index = resolved
-    brief = request.app.state.store.get(guid)
-    if not brief:
-        return Response(status_code=404)
+    guid, index, brief = target
     try:
         line = int(request.query_params.get("line", 0))
     except ValueError:

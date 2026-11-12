@@ -248,6 +248,31 @@ class VlibTest(unittest.TestCase):
                          meta["guid"])
         self.assertIsNone(vlib.chart_of_media("unknown-media"))
 
+    def test_play_entries_accept_any_guid_kind(self):
+        """播放四入口（play/info、play/play、stream）必须接受 item/media/video guid。"""
+        meta = charts.chart_cache.get(charts.chart_guid("movie", "movie-3"))
+        with patch("cms.search_all", new=AsyncMock(
+                return_value=[make_title(title=meta["title"])])):
+            with TestClient(appmod.app) as client:
+                info = client.post("/v/api/v1/play/info",
+                                   json={"item_guid": meta["guid"]}).json()["data"]
+                mg = info["media_guid"]
+                self.assertTrue(mg)
+                # 只带 media_guid 调 play/info（部分客户端不传 item_guid）
+                by_media = client.post("/v/api/v1/play/info",
+                                       json={"media_guid": mg}).json()["data"]
+                self.assertEqual(by_media["guid"], meta["guid"])
+                # 只带 item_guid 调 play/play
+                played = client.post("/v/api/v1/play/play",
+                                     json={"item_guid": meta["guid"]}).json()["data"]
+                self.assertIn("/preset.m3u8", played["play_link"])
+                self.assertEqual(played["media_guid"], mg)
+                # 直接带 video_guid 取流
+                stream = client.post("/v/api/v1/stream", json={
+                    "video_guid": by_media["video_guid"]}).json()["data"]
+                self.assertTrue(stream["file_stream"]["guid"])
+                self.assertEqual(client.get(played["play_link"]).status_code, 200)
+
     # ---------------------------------------------------------- 海量分类库
     def test_catalog_window_slices_across_pages(self):
         titles = [make_title(vod_id=f"c{i}", title=f"片{i}") for i in range(60)]
