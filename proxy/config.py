@@ -51,11 +51,9 @@ DEFAULTS = {
     #   - 键不存在 = 该账号未单独配置，按下面的默认策略处理
     #   - libs 存在且为空 = 一个虚拟库都看不到
     #   - sources 存在且为空 = 一条在线片源都不能用
-    # acl_devices:  {fingerprint: {uid,ua,ts}} 设备凭证绑定（自动识别不出来时的兜底）
     "acl_enabled": False,
     "acl_subjects": [],
     "acl_grants": {},
-    "acl_devices": {},
     # 默认策略：未单独配置的账号怎么算。默认放行，和参考项目一致 —— 开启
     # 账号权限不会让任何账号瞬间失去内容，要限制谁再去单独取消勾选。
     "acl_default_visible": True,
@@ -120,25 +118,6 @@ def _clean_grants(raw) -> dict:
                                       if str(x).strip()})
         if item:
             out[uid] = item
-    return out
-
-
-def _clean_devices(raw) -> dict:
-    out: dict = {}
-    if not isinstance(raw, dict):
-        return out
-    for fp, value in list(raw.items())[:400]:
-        fp = str(fp or "").strip()[:64]
-        if not fp or len(fp) < 8 or not isinstance(value, dict):
-            continue
-        uid = str(value.get("uid") or "").strip()[:64]
-        if not uid:
-            continue
-        out[fp] = {
-            "uid": uid,
-            "ua": str(value.get("ua") or "")[:120],
-            "ts": int(value.get("ts") or 0),
-        }
     return out
 
 
@@ -219,7 +198,6 @@ def save(cfg: dict) -> dict:
     clean["acl_enabled"] = bool(clean["acl_enabled"])
     clean["acl_subjects"] = _clean_subjects(clean["acl_subjects"])
     clean["acl_grants"] = _clean_grants(clean["acl_grants"])
-    clean["acl_devices"] = _clean_devices(clean["acl_devices"])
     clean["acl_default_visible"] = bool(clean["acl_default_visible"])
     clean["acl_default_online"] = bool(clean["acl_default_online"])
     raw_keywords = clean["adfilter_keywords"]

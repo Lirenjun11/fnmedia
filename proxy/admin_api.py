@@ -51,15 +51,15 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.14"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.15"
     except OSError:
-        return "0.0.1.14"
+        return "0.0.1.15"
 
 
 def _public_config() -> dict:
     cfg = config.get()
     cfg.pop("admin_token", None)
-    # 设备绑定只在本机有意义，不随导出口令外流；导入时保留现有绑定。
+    # 旧版本留下的设备绑定对本机之外无意义，导出时一并剥掉。
     cfg.pop("acl_devices", None)
     return cfg
 
@@ -443,7 +443,7 @@ async def acl_config(request: Request):
                         "或把默认策略改成放行，再开启账号权限")
     if wanted is not None:
         cfg["acl_enabled"] = wanted
-    for key in ("acl_subjects", "acl_grants", "acl_devices",
+    for key in ("acl_subjects", "acl_grants",
                 "acl_default_visible", "acl_default_online"):
         if key in body:
             cfg[key] = body[key]
@@ -515,53 +515,23 @@ async def acl_add_subject(request: Request):
 
 @router.delete("/acl/subjects/{uid}")
 async def acl_del_subject(uid: str, request: Request):
-    """从清单移除账号，并连带清掉它的授权与设备绑定。
+    """从清单移除账号，并连带清掉它的授权。
 
-    只删 ``acl_subjects`` 是不够的：``acl.subjects()`` 会把「仍有授权」或
-    「仍有设备绑定」的 uid 重新补回清单，表现就是「删了还在」。显式删除
-    视为彻底移除；授权需要保留时请用「清空授权」而不是删账号。
+    只删 ``acl_subjects`` 是不够的：``acl.subjects()`` 会把「仍有授权」的
+    uid 重新补回清单，表现就是「删了还在」。显式删除视为彻底移除；授权需要
+    保留时请用「恢复默认策略」而不是删账号。
     """
     guard(request)
     cfg = config.get()
-    before = dict(cfg.get("acl_grants") or {})
     cfg["acl_subjects"] = [s for s in (cfg.get("acl_subjects") or [])
                            if str(s.get("id")) != uid]
-    grants = dict(before)
+    grants = dict(cfg.get("acl_grants") or {})
     dropped = grants.pop(uid, None) is not None
     cfg["acl_grants"] = grants
-    devices = {fp: rec for fp, rec in (cfg.get("acl_devices") or {}).items()
-               if str((rec or {}).get("uid") or "") != uid}
-    unbind = len(devices) != len(cfg.get("acl_devices") or {})
-    cfg["acl_devices"] = devices
     config.save(cfg)
     acl.invalidate(uid)
-    runtime.log(f"acl: del subject {uid} grants={'yes' if dropped else 'no'} "
-                f"devices={'yes' if unbind else 'no'}")
+    runtime.log(f"acl: del subject {uid} grants={'yes' if dropped else 'no'}")
     return ok(_acl_payload())
-
-
-@router.post("/acl/bind")
-async def acl_bind(request: Request):
-    """把当前请求的设备凭证绑定到指定账号；uid 为空表示解绑。"""
-    guard(request)
-    body = await body_json(request)
-    uid = str(body.get("uid") or "").strip()[:64]
-    fp = acl.device_fp(request)
-    if not fp:
-        return fail("当前请求没有可用的设备凭证")
-    cfg = config.get()
-    devices = dict(cfg.get("acl_devices") or {})
-    if uid:
-        devices[fp] = {"uid": uid, "ua": request.headers.get("user-agent", "")[:120],
-                       "ts": int(time.time())}
-    else:
-        devices.pop(fp, None)
-    cfg["acl_devices"] = devices
-    config.save(cfg)
-    acl.invalidate()
-    runtime.log(f"acl bind: fp={fp[:8]} uid={uid or '-'} total={len(devices)}")
-    return ok({"bound": bool(uid), "fp": fp, "uid": uid,
-               "status": _acl_payload()})
 
 
 @router.post("/acl/discover")

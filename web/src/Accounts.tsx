@@ -13,7 +13,6 @@ interface Props {
 const VIA_TEXT: Record<string, string> = {
   off: '账号权限未启用',
   header: '请求头识别',
-  device: '本机设备绑定',
   session: '官方登录账号（自动识别）',
   unknown: '未识别',
 };
@@ -40,7 +39,6 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
   const [online, setOnline] = useState(true);
   const [busy, setBusy] = useState('');
   const [probe, setProbe] = useState<AclProbe | null>(null);
-  const [bindUid, setBindUid] = useState('');
   const [newId, setNewId] = useState('');
   const [newName, setNewName] = useState('');
   const [showAdd, setShowAdd] = useState(false);
@@ -139,19 +137,6 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
     },
   );
 
-  const bind = () => {
-    if (!bindUid) return;
-    return run('bind', () => api.aclBind(bindUid), (result) => {
-      apply(result.status, active);
-      notify(`当前设备已绑定到 ${bindUid}`, 'ok');
-    });
-  };
-
-  const unbind = () => run('bind', () => api.aclBind(''), (result) => {
-    apply(result.status, active);
-    notify('当前设备绑定已解除', 'ok');
-  });
-
   const addSubject = () => {
     const id = newId.trim();
     if (!id) return;
@@ -169,7 +154,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
     const still = next.subjects.some((s) => s.id === uid);
     notify(still
       ? '这是官方媒体库里的账号，不能删除；如需限制请取消它的全部授权'
-      : '已删除该账号，并清掉了它的授权与设备绑定',
+      : '已删除该账号，并清掉了它的授权',
     still ? 'err' : 'ok');
   });
 
@@ -186,9 +171,6 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
   const subject = status?.subjects.find((s) => s.id === active);
   const grant = status?.grants[active];
   const configured = !!grant;
-  const boundHere = status?.me.fp
-    ? status.devices.some((d) => d.fp === status.me.fp)
-    : false;
 
   return (
     <>
@@ -230,8 +212,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
         <div className="card-title">总开关</div>
         <p className="card-sub">
           身份直接用飞牛影视的登录账号自动识别（读官方库的 token→账号映射），
-          不需要手工绑定；设备绑定只在前一步识别不出来时兜底。管理页自身永不
-          受权限限制，出问题可随时在这里关闭。
+          不需要做任何绑定。管理页自身永不受权限限制，出问题可随时在这里关闭。
         </p>
         <label className="row" style={{ cursor: 'pointer' }}>
           <input
@@ -343,7 +324,7 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
           </div>
         )}
 
-        <div className="grid" style={{ gridTemplateColumns: 'minmax(220px, 0.8fr) minmax(320px, 2fr)' }}>
+        <div className="grid acl-split">
           <div className="stack">
             {!status?.subjects.length && (
               <div className="empty">
@@ -361,34 +342,24 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                 : g.online === false ? '在线禁用'
                   : `${g.libs?.length ?? '默认'}库`;
               return (
-                <div key={item.id} className="row" style={{ gap: 6 }}>
+                <div key={item.id} className="row acl-account">
                   <button
-                    className={`btn sm ${item.id === active ? 'primary' : ''}`}
-                    style={{ flex: 1, display: 'flex', justifyContent: 'space-between',
-                             gap: 8, textAlign: 'left' }}
+                    className={`btn sm acl-account-btn ${item.id === active ? 'primary' : ''}`}
                     onClick={() => setActive(item.id)}
                   >
-                    <span>
+                    <span className="acl-account-name">
                       {item.name}
                       {item.is_admin && (
-                        <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.8 }}>
-                          管理员
-                        </span>
+                        <span className="acl-tag">管理员</span>
                       )}
                       {item.source !== 'manual' && (
-                        <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.8 }}>
-                          官方
-                        </span>
+                        <span className="acl-tag">官方</span>
                       )}
                       {item.source === 'manual' && (
-                        <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.8 }}>
-                          手动
-                        </span>
+                        <span className="acl-tag">手动</span>
                       )}
                     </span>
-                    <span style={{ fontSize: 12, opacity: 0.95, fontWeight: 400 }}>
-                      {summary}
-                    </span>
+                    <span className="acl-account-sum">{summary}</span>
                   </button>
                   {item.source === 'manual' && (
                     <button className="btn sm ghost" disabled={busy === 'del'}
@@ -423,43 +394,19 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
             )}
           </div>
 
-          <div className="stack">
+          <div className="stack acl-panel">
             {!subject ? (
-              <div className="empty"><div>选择左侧账号后配置权限</div></div>
+              <div className="empty"><div>选择账号后配置权限</div></div>
             ) : (
               <>
                 <div className="row">
                   <strong>{subject.name}</strong>
-                  <span className="small">id: {subject.id}</span>
+                  <span className="small acl-id">id: {subject.id}</span>
                   <span className="small">
                     {configured
                       ? `已单独配置：${libs.length} 库 / ${online ? `${sources.length} 源` : '在线已禁用'}`
                       : '未单独配置，按默认策略'}
                   </span>
-                </div>
-
-                <div className="divider" />
-                <div className="row">
-                  <label className="field" style={{ margin: 0 }}>当前设备绑定</label>
-                  <select value={bindUid} style={{ maxWidth: 240 }}
-                          onChange={(e) => setBindUid(e.target.value)}>
-                    <option value="">选择账号…</option>
-                    {status?.subjects.map((s) => (
-                      <option key={s.id} value={s.id}>{s.name}</option>
-                    ))}
-                  </select>
-                  <button className="btn sm info" disabled={!bindUid || busy === 'bind'}
-                          onClick={() => void bind()}>
-                    绑定本设备
-                  </button>
-                  {boundHere && (
-                    <button className="btn sm ghost" disabled={busy === 'bind'}
-                            onClick={() => void unbind()}>解除本机绑定</button>
-                  )}
-                </div>
-                <div className="small">
-                  仅在自动识别失败时用（例如播放器进程不带登录 token）。绑定按
-                  凭证指纹记录，只存哈希；正常情况下不需要绑定。
                 </div>
 
                 <div className="divider" />
@@ -546,35 +493,14 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
       </section>
 
       <section className="card">
-        <div className="card-title">当前已绑定的设备</div>
+        <div className="card-title">说明</div>
         <p className="card-sub">
-          设备指纹只保存哈希，不含任何凭证明文。清理浏览器缓存或重新登录后指纹可能
-          变化，需要重新绑定。
+          身份来自飞牛影视自己的登录凭证：客户端登录哪个账号，就按哪个账号的授权
+          与播放记录处理，不需要在这里做任何绑定。
         </p>
-        {!status?.devices.length ? (
-          <div className="small">暂无设备绑定</div>
-        ) : (
-          <div className="stack">
-            {status.devices.map((d) => (
-              <div key={d.fp} className="row">
-                <span className="badge">{status.grants[d.uid] ? '已授权账号' : '账号无授权'}</span>
-                <code>{d.fp.slice(0, 12)}</code>
-                <span>{d.uid}</span>
-                <span className="small" style={{
-                  maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}>{d.ua || '未知客户端'}</span>
-                <span className="small">
-                  {d.ts ? new Date(d.ts * 1000).toLocaleString() : ''}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="divider" />
         <div className="small">
-          提示：账号权限是「家庭内软管控」，能防止家人误入未授权内容，
-          不防御能直接改写请求头或拿到播放地址的技术用户。
+          账号权限是「家庭内软管控」，能防止家人误入未授权内容，不防御能直接改写
+          请求头或拿到播放地址的技术用户。
         </div>
       </section>
     </>

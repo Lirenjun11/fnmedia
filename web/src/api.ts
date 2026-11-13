@@ -50,7 +50,6 @@ export interface Config {
   acl_enabled: boolean;
   acl_subjects: AclSubject[];
   acl_grants: Record<string, AclGrant>;
-  acl_devices?: Record<string, { uid: string; ua: string; ts: number }>;
 }
 
 export interface AclSubject {
@@ -94,7 +93,6 @@ export interface AclStatus {
   defaults: { visible: boolean; online: boolean };
   subjects: AclSubject[];
   grants: Record<string, AclGrant>;
-  devices: { fp: string; uid: string; ua: string; ts: number }[];
   me: AclMe;
   discover: {
     db: string;
@@ -322,9 +320,6 @@ export const api = {
     request<AclStatus>('/v/api/ext/acl/subjects', json('POST', { id, name })),
   aclDelSubject: (id: string) =>
     request<AclStatus>(`/v/api/ext/acl/subjects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  aclBind: (uid: string) =>
-    request<{ bound: boolean; fp: string; uid: string; status: AclStatus }>(
-      '/v/api/ext/acl/bind', json('POST', { uid })),
   aclDiscover: () =>
     request<AclProbe['discover']>('/v/api/ext/acl/discover', json('POST', {})),
   checkUpdate: (force = false) =>

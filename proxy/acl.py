@@ -16,9 +16,8 @@
 1. 网关/客户端注入的用户头（``x-user-id`` 等），值直接当账号 id；
 2. 官方登录会话：请求里的 token（``Authorization`` / ``Trim-MC-token``）
    在 ``trimactivity.db.user_token`` 里映射到 ``user_guid``，再回
-   ``trimmedia.db.user`` 取用户名 —— **全自动，不用管理员配任何东西**；
-3. 管理页「绑定当前设备」：前两步都识别不出来时的兜底（例如播放器进程
-   没带 token）。
+   ``trimmedia.db.user`` 取用户名 —— **全自动，不用管理员配任何东西**。
+   识别不出来的客户端按「未识别」处理，走默认策略（默认放行）。
 """
 from __future__ import annotations
 
@@ -73,7 +72,7 @@ _ORDER_COLS = ("update_time", "updated_at", "mtime", "create_time", "id")
 class Identity:
     uid: str = ""
     name: str = ""
-    via: str = ""          # off | header | device | session | unknown
+    via: str = ""          # off | header | session | unknown
     reason: str = ""       # 未识别原因，用于日志与前端横幅
     fp: str = ""           # 设备指纹（哈希），仅诊断用
 
@@ -507,7 +506,6 @@ def identify(request, force: bool = False) -> Identity:
         if hit and now - hit[0] < _CACHE_TTL:
             return hit[1]
 
-    cfg = config.get()
     ident: Identity
     # 2) 官方登录 token → 官方会话表 → user_guid（全自动，无需配置）。
     uid, reason = _lookup_session(request)
@@ -516,17 +514,9 @@ def identify(request, force: bool = False) -> Identity:
                          fp=cache_key)
         _log_ident(ident)
     else:
-        # 3) 管理页「绑定当前设备」：会话反查不出来时的兜底。
-        rec = (cfg.get("acl_devices") or {}).get(cache_key)
-        if isinstance(rec, dict) and rec.get("uid"):
-            uid = str(rec["uid"])
-            ident = Identity(uid=uid, name=_subject_name(uid), via="device",
-                             fp=cache_key)
-            _log_ident(ident)
-        else:
-            ident = Identity(via="unknown", reason=reason or "no_mapping",
-                             fp=cache_key)
-            _log_ident(ident)
+        ident = Identity(via="unknown", reason=reason or "no_mapping",
+                         fp=cache_key)
+        _log_ident(ident)
     if cache_key:
         with _LOCK:
             if len(_ID_CACHE) > 500:
@@ -704,11 +694,6 @@ def subjects() -> list[dict]:
         if uid and uid not in seen:
             seen.add(uid)
             out.append({"id": uid, "name": uid, "source": "manual"})
-    for rec in (config.get().get("acl_devices") or {}).values():
-        uid = str((rec or {}).get("uid") or "")
-        if uid and uid not in seen:
-            seen.add(uid)
-            out.append({"id": uid, "name": uid, "source": "manual"})
     return out[:200]
 
 
@@ -750,11 +735,6 @@ def status() -> dict:
                      "online": default_online()},
         "subjects": subjects_list,
         "grants": grants,
-        "devices": [
-            {"fp": fp, "uid": rec.get("uid"), "ua": rec.get("ua"),
-             "ts": rec.get("ts")}
-            for fp, rec in (cfg.get("acl_devices") or {}).items()
-        ],
         "me": {
             "uid": ident.uid, "name": ident.name, "via": ident.via,
             "reason": ident.reason, "fp": ident.fp,

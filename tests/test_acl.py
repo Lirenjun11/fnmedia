@@ -45,7 +45,6 @@ class AclTest(unittest.TestCase):
             "acl_enabled": cfg.get("acl_enabled"),
             "acl_subjects": list(cfg.get("acl_subjects") or []),
             "acl_grants": dict(cfg.get("acl_grants") or {}),
-            "acl_devices": dict(cfg.get("acl_devices") or {}),
             "acl_default_visible": cfg.get("acl_default_visible"),
             "acl_default_online": cfg.get("acl_default_online"),
         }
@@ -62,7 +61,6 @@ class AclTest(unittest.TestCase):
             "acl_enabled": False,
             "acl_subjects": [{"id": "u1", "name": "客厅", "source": "manual"}],
             "acl_grants": {},
-            "acl_devices": {},
             "acl_default_visible": True,
             "acl_default_online": True,
         })
@@ -75,18 +73,17 @@ class AclTest(unittest.TestCase):
         config.save(cfg)
         acl.invalidate()
 
-    def enable(self, grants=None, devices=None, visible=True, online=True):
+    def enable(self, grants=None, visible=True, online=True):
         cfg = config.get()
         cfg["acl_enabled"] = True
         cfg["acl_grants"] = grants or {}
-        cfg["acl_devices"] = devices or {}
         cfg["acl_default_visible"] = visible
         cfg["acl_default_online"] = online
         config.save(cfg)
         acl.invalidate()
 
     def as_user(self, uid):
-        return acl.push(acl.Identity(uid=uid, name=uid, via="device"))
+        return acl.push(acl.Identity(uid=uid, name=uid, via="session"))
 
     # ---------------------------------------------------------- 基础行为
     def test_disabled_keeps_legacy_source_live_behaviour(self):
@@ -200,14 +197,6 @@ class AclTest(unittest.TestCase):
         ident = acl.identify(FakeRequest({"x-user-id": "u9"}))
         self.assertEqual((ident.uid, ident.via), ("u9", "header"))
 
-    def test_device_binding_identity(self):
-        req = FakeRequest({"cookie": "fnos-token=abc"}, host="10.0.0.2")
-        fp = acl.device_fp(req)
-        self.enable(grants={"u1": {"libs": [], "sources": []}},
-                    devices={fp: {"uid": "u1", "ua": "test", "ts": 1}})
-        ident = acl.identify(req)
-        self.assertEqual((ident.uid, ident.via), ("u1", "device"))
-
     def test_unknown_without_credentials(self):
         self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": []}},
                     visible=False, online=False)
@@ -241,12 +230,11 @@ class AclTest(unittest.TestCase):
             "u1": {"libs": ["chart:movie", "chart:movie", ""],
                    "sources": ["s_1", "s_1"]},
         }
-        cfg["acl_devices"] = {"short": {"uid": "u1"},
-                              "fp1234567890": {"uid": "u2", "ua": "ua", "ts": 3}}
         saved = config.save(cfg)
         self.assertEqual(saved["acl_grants"]["u1"]["libs"], ["chart:movie"])
         self.assertEqual(saved["acl_grants"]["u1"]["sources"], ["s_1"])
-        self.assertEqual(list(saved["acl_devices"]), ["fp1234567890"])
+        # 设备绑定已移除；旧配置里残留的键不会重新落盘。
+        self.assertNotIn("acl_devices", saved)
 
     # ---------------------------------------------------------- 接口
     def test_mediadb_list_only_returns_granted_libs(self):
@@ -305,7 +293,7 @@ class AclTest(unittest.TestCase):
                            headers={"x-user-id": "u1"})
         self.assertEqual(seen, ["s_2"])
 
-    def test_admin_grant_and_bind_endpoints(self):
+    def test_admin_grant_endpoint(self):
         token = config.token()
         headers = {"x-admin-token": token}
         with TestClient(appmod.app) as client:
@@ -316,10 +304,6 @@ class AclTest(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             data = resp.json()["data"]
             self.assertEqual(data["grants"]["u1"]["sources"], ["s_1"])
-            resp = client.post("/v/api/ext/acl/bind", headers=headers,
-                               json={"uid": "u1"})
-            self.assertEqual(resp.status_code, 200)
-            self.assertTrue(resp.json()["data"]["bound"])
 
     def test_enable_requires_grant_when_defaults_deny(self):
         """默认全禁 + 一条授权都没有 = 开启即全员无内容，必须拦住。"""
@@ -362,9 +346,8 @@ class AclTest(unittest.TestCase):
                 self.assertEqual(resp.status_code, 200, body)
                 self.assertTrue(resp.json()["data"]["enabled"], body)
 
-    def test_delete_subject_also_drops_grants_and_devices(self):
-        self.enable(devices={"fp1234567890": {"uid": "u1", "ua": "ua", "ts": 1}},
-                    grants={"u1": {"libs": ["chart:movie"], "sources": ["s_1"]}})
+    def test_delete_subject_also_drops_grants(self):
+        self.enable(grants={"u1": {"libs": ["chart:movie"], "sources": ["s_1"]}})
         token = config.token()
         with TestClient(appmod.app) as client:
             resp = client.delete("/v/api/ext/acl/subjects/u1",
@@ -374,10 +357,8 @@ class AclTest(unittest.TestCase):
         # 只删 acl_subjects 会被「仍有授权的 uid」重新补回清单，必须连带清掉。
         self.assertNotIn("u1", [s["id"] for s in data["subjects"]])
         self.assertNotIn("u1", data["grants"])
-        self.assertEqual(data["devices"], [])
 
-    def test_export_omits_device_bindings(self):
-        self.enable(devices={"fp1234567890": {"uid": "u1", "ua": "ua", "ts": 1}})
+    def test_export_has_no_device_bindings(self):
         token = config.token()
         with TestClient(appmod.app) as client:
             data = client.get("/v/api/ext/export",
@@ -503,9 +484,8 @@ class OfficialSchemaTest(unittest.TestCase):
         cfg = config.get()
         self._cfg = {"acl_enabled": cfg.get("acl_enabled"),
                      "acl_grants": dict(cfg.get("acl_grants") or {}),
-                     "acl_devices": dict(cfg.get("acl_devices") or {}),
-                     "acl_subjects": list(cfg.get("acl_subjects") or [])}
-        cfg.update({"acl_enabled": True, "acl_devices": {},
+                              "acl_subjects": list(cfg.get("acl_subjects") or [])}
+        cfg.update({"acl_enabled": True,
                     "acl_grants": {"u-guid-1": {"libs": ["chart:movie"],
                                                 "sources": []},
                                    "u-guid-2": {"libs": [], "sources": []}},
