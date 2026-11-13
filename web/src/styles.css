@@ -58,6 +58,9 @@ a { color: var(--brand); }
   background: var(--surface); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 20px;
   position: sticky; top: 0; height: 100vh;
+  /* 窗口矮时（飞牛桌面窗口模式）导航必须能滚，否则被裁掉还看不到滚动条 */
+  overflow-y: auto; overflow-x: hidden;
+  overscroll-behavior: contain;
 }
 .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px; }
 .brand-mark {
@@ -315,6 +318,7 @@ input[type=checkbox].check { width: 16px; height: 16px; accent-color: var(--bran
   .layout { flex-direction: column; }
   .sidebar {
     position: fixed; bottom: 0; left: 0; right: 0; top: auto; width: 100%; height: auto;
+    overflow: visible;
     padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); z-index: 20;
     border-right: 0; border-top: 1px solid var(--line); box-shadow: 0 -8px 24px rgba(20,32,60,.08);
   }
@@ -323,6 +327,7 @@ input[type=checkbox].check { width: 16px; height: 16px; accent-color: var(--bran
   /* 导航项较多，窄屏改为可横向滑动，避免文字挤压/换行 */
   .nav {
     justify-content: flex-start; gap: 2px; overflow-x: auto;
+    overflow-y: hidden; flex: none; min-height: 0;
     scrollbar-width: none; -webkit-overflow-scrolling: touch;
   }
   .nav::-webkit-scrollbar { display: none; }
