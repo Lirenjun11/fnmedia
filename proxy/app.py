@@ -1228,6 +1228,16 @@ async def segment(request: Request):
             key_url = hls.ensure_public_target(key_url)
     except ValueError:
         return Response(status_code=400)
+    # 非加密分片：能直连就 302，判定不过或曾直连失败都回退原来的代理逻辑。
+    # 清单仍由本模块改写，因此广告过滤、线路优选、续播全部保持不变。
+    if not key_url:
+        direct = await hls.redirect_target(
+            token, url, request.app.state.src, acl_on=acl.enabled())
+        if direct:
+            return Response(status_code=302, headers={
+                "Location": direct,
+                "Cache-Control": "no-store",
+            })
     if key_url:
         try:
             key = await hls.fetch_key(request.app.state.src, key_url)

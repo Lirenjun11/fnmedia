@@ -718,6 +718,96 @@ async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
                              media_type=out_headers.get("content-type"))
 
 
+# --------------------------------------------------------------- 分片直连
+_REDIRECT_PROBE: dict[str, tuple[float, bool, str]] = {}
+_REDIRECT_SEEN: dict[str, tuple[float, int]] = {}
+_PROBE_OK_TTL = 600.0
+_PROBE_FAIL_TTL = 120.0
+_RETRY_WINDOW = 5.0
+
+
+def _private_target(url: str) -> bool:
+    """内网 / 回环目标不能交给播放器直连：播放器未必在 NAS 网段。"""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").strip("[]")
+    if not host:
+        return True
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        addrs = netguard._addresses(host, port)  # noqa: SLF001 - 同项目复用
+    except OSError:
+        return True
+    return any(addr.is_private or addr.is_loopback for addr in addrs)
+
+
+async def _probe_direct(client: httpx.AsyncClient,
+                        url: str) -> tuple[bool, str]:
+    """模拟播放器直连：不带 Referer，HEAD 不通再 Range 取 1 字节。
+
+    源站靠 Referer 防盗链时这里会拿到 403，判定为「不能 302」；
+    跟随源站自身重定向后返回最终地址，播放器少跳一次。
+    """
+    try:
+        resp = await client.head(url, headers={"User-Agent": _UA}, timeout=3.0)
+        return resp.status_code in (200, 206), str(resp.url)
+    except Exception:  # noqa: BLE001 - HEAD 不被支持时换 Range GET
+        pass
+    try:
+        req = client.build_request(
+            "GET", url, headers={"User-Agent": _UA, "Range": "bytes=0-0"})
+        resp = await client.send(req, stream=True)
+        try:
+            return resp.status_code in (200, 206), str(resp.url)
+        finally:
+            await resp.aclose()
+    except Exception:  # noqa: BLE001 - 探测失败一律回退代理
+        return False, url
+
+
+async def redirect_target(token: str, url: str, client,
+                          key_url: str = "", acl_on: bool = False) -> str:
+    """能直连就返回 Location；不能则返回空串，调用方走原来的代理逻辑。
+
+    判定必须在返回 302 **之前**完成：302 之后请求不再回到本服务，
+    没有失败信号可用来「再解析返回」。
+    """
+    cfg = config.get()
+    if not cfg.get("seg_redirect", True) or key_url or acl_on:
+        return ""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return ""
+    blocked = [str(x).lower() for x in
+               (cfg.get("seg_redirect_block_hosts") or []) if str(x).strip()]
+    if host in blocked or any(host.endswith("." + item) for item in blocked):
+        return ""
+    now = time.monotonic()
+    # 重试兜底：302 失败后播放器会重新请求同一个分片 URL；第二次起强制
+    # 代理，并把该域名标记为不可直连，避免后续分片继续踩坑。
+    seen_ts, seen_n = _REDIRECT_SEEN.get(token, (0.0, 0))
+    if now - seen_ts < _RETRY_WINDOW:
+        if seen_n >= 1:
+            _REDIRECT_PROBE[host] = (now, False, "")
+            return ""
+        _REDIRECT_SEEN[token] = (seen_ts, seen_n + 1)
+    else:
+        _REDIRECT_SEEN[token] = (now, 1)
+    if len(_REDIRECT_SEEN) > 512:
+        _REDIRECT_SEEN.clear()
+    hit = _REDIRECT_PROBE.get(host)
+    ttl = _PROBE_OK_TTL if hit and hit[1] else _PROBE_FAIL_TTL
+    if hit and now - hit[0] < ttl:
+        return hit[2] if hit[1] else ""
+    if _private_target(url):
+        _REDIRECT_PROBE[host] = (now, False, "")
+        return ""
+    ok, final = await _probe_direct(client, url)
+    _REDIRECT_PROBE[host] = (now, ok, final if ok else "")
+    runtime.log(f"seg redirect probe: host={host} ok={int(ok)}")
+    return final if ok else ""
+
+
 def _poster_fallback() -> Response:
     svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="2" height="3">'
            b'<rect width="2" height="3" fill="#1b2130"/></svg>')

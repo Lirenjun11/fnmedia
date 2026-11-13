@@ -32,6 +32,10 @@ DEFAULTS = {
     "borrow_official": True,
     "auto_best_source": True,
     "allow_intranet": True,
+    # 分片直连：能直连就 302，判定不过就回退到原来的代理逻辑。
+    # 加密分片、内网目标、ACL 开启、黑名单域名始终走代理。
+    "seg_redirect": True,
+    "seg_redirect_block_hosts": [],
     "douban_enabled": False,
     "playstate": {},
     "update_repo": "Lirenjun11/fnmedia",
@@ -201,6 +205,13 @@ def save(cfg: dict) -> dict:
     clean["online_first"] = bool(clean["online_first"])
     clean["merge_sources"] = bool(clean["merge_sources"])
     clean["allow_intranet"] = bool(clean["allow_intranet"])
+    clean["seg_redirect"] = bool(clean["seg_redirect"])
+    raw_block = clean["seg_redirect_block_hosts"]
+    if not isinstance(raw_block, list):
+        raw_block = []
+    clean["seg_redirect_block_hosts"] = sorted({
+        str(host).strip().lower()[:120] for host in raw_block[:64]
+        if str(host).strip()})[:32]
     clean["adfilter_enabled"] = bool(clean["adfilter_enabled"])
     clean["adfilter_markers"] = bool(clean["adfilter_markers"])
     clean["adfilter_head_guard"] = bool(clean["adfilter_head_guard"])

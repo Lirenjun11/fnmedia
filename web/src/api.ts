@@ -36,6 +36,8 @@ export interface Config {
   borrow_official: boolean;
   auto_best_source: boolean;
   allow_intranet: boolean;
+  seg_redirect: boolean;
+  seg_redirect_block_hosts: string[];
   douban_enabled: boolean;
   adfilter_enabled: boolean;
   adfilter_markers: boolean;

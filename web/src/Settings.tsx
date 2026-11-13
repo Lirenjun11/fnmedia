@@ -10,6 +10,9 @@ interface Props {
 export function PlaybackPage({ boot, refresh, notify }: Props) {
   const [form, setForm] = useState<Config>({ ...boot.config });
   const [saving, setSaving] = useState(false);
+  const [blockHosts, setBlockHosts] = useState(
+    (boot.config.seg_redirect_block_hosts || []).join('\n'),
+  );
 
   const set = (key: keyof Config, value: number | boolean) =>
     setForm((current) => ({ ...current, [key]: value }));
@@ -26,6 +29,12 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
         online_first: Boolean(form.online_first),
         merge_sources: Boolean(form.merge_sources),
         auto_best_source: Boolean(form.auto_best_source),
+        seg_redirect: Boolean(form.seg_redirect),
+        seg_redirect_block_hosts: blockHosts
+          .split(/[\n,]/)
+          .map((host) => host.trim().toLowerCase())
+          .filter(Boolean)
+          .slice(0, 32),
       });
       await refresh();
       notify('设置已保存并即时生效', 'ok');
@@ -101,6 +110,23 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
           />
           <span>起播时自动优选最快线路（并发探测 1.5 秒预算）</span>
         </label>
+        <div className="divider" />
+        <label className="row" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.seg_redirect}
+            onChange={(e) => set('seg_redirect', e.target.checked)}
+          />
+          <span>分片能直连就直连（302），不能直连自动回退代理</span>
+        </label>
+        <p className="card-sub">
+          只对非加密分片、公网目标生效，先做一次不带 Referer 的探测；源站防盗链或
+          目标不可达时仍按原来的代理方式返回。清单始终由本模块改写，广告过滤不受影响。
+          账号权限开启时自动禁用直连。
+        </p>
+        <label className="field">强制走代理的域名（每行一个，也可用逗号分隔）</label>
+        <textarea rows={2} value={blockHosts}
+                  placeholder={'例如：cdn.example.com'}
+                  onChange={(e) => setBlockHosts(e.target.value)} />
         <div className="row end mt">
           <button className="btn primary" disabled={saving} onClick={() => void save()}>
             {saving ? '保存中…' : '保存设置'}
