@@ -68,6 +68,14 @@ export default function App() {
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { void checkUpdate(); }, [checkUpdate]);
+  // 手机端底部导航可横向滑动：切页后把当前项滚到可见区域，
+  // 否则从深层页面返回时当前标签可能停在屏幕外。
+  useEffect(() => {
+    const el = document.querySelector('.nav-item.active');
+    if (el && window.matchMedia('(max-width: 860px)').matches) {
+      el.scrollIntoView({ block: 'nearest', inline: 'center' });
+    }
+  }, [page]);
 
   const hasUpdate = !!updateInfo?.has_update;
 
@@ -100,7 +108,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div>v{boot?.version || '0.0.1.15'} · 零内置源</div>
+          <div>v{boot?.version || '0.0.1.16'} · 零内置源</div>
         </div>
       </aside>
 
@@ -209,7 +217,7 @@ function Overview({ boot, onGo }: { boot: Bootstrap | null; onGo: () => void }) 
       <div className="card">
         <div className="card-title">运行信息</div>
         <div className="pill-row mt">
-          <span className="badge brand">v{boot?.version || '0.0.1.15'}</span>
+          <span className="badge brand">v{boot?.version || '0.0.1.16'}</span>
           <span className="badge">运行 {Math.round((boot?.uptime ?? 0) / 60)} 分钟</span>
           <span className="badge ok">上游接管正常</span>
           {boot?.acl?.enabled ? (

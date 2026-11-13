@@ -215,7 +215,7 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
             <p>前往「订阅配置」拉取一份配置，或点击上方「添加视频源」手动添加。</p>
           </div>
         ) : (
-          <div className="table-wrap mt">
+          <div className="table-wrap stack-table mt">
             <table>
               <thead>
                 <tr>
@@ -243,22 +243,22 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
                                checked={selected.has(s.id)}
                                onChange={() => toggleSelect(s.id)} />
                       </td>
-                      <td>{s.name}</td>
-                      <td className="api">{s.key || '—'}</td>
-                      <td className="api" title={s.api}>{s.api}</td>
-                      <td className="api" title={s.detail || ''}>{s.detail || '—'}</td>
-                      <td>
+                      <td data-label="名称">{s.name}</td>
+                      <td className="api" data-label="KEY">{s.key || '—'}</td>
+                      <td className="api" data-label="API" title={s.api}>{s.api}</td>
+                      <td className="api" data-label="DETAIL" title={s.detail || ''}>{s.detail || '—'}</td>
+                      <td data-label="状态">
                         <span className={`badge ${s.enabled ? 'ok' : 'warn'}`}>
                           {s.enabled ? '启用中' : '已禁用'}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="有效性">
                         {!result ? <span className="small">未检测</span>
                           : result.ok
                             ? <span className="badge ok">{result.count} 条 · {result.elapsed_ms ?? 0}ms</span>
                             : <span className="badge danger">不可用</span>}
                       </td>
-                      <td>
+                      <td data-label="操作">
                         <div className="row">
                           <button className="btn sm" disabled={busy === `toggle-${s.id}`}
                                   onClick={() => void toggleOne(s.id, !s.enabled)}>
