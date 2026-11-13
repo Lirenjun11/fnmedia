@@ -73,7 +73,11 @@ async def _vlib_worker(app: FastAPI) -> None:
                     await charts.chart_cache.refresh(app.state.src)
                 if cfg.get("vlib_catalog", True) \
                         and config.enabled_sources() \
-                        and catalog_mod.catalog.stale():
+                        and (catalog_mod.catalog.stale()
+                             or (vlib.split_by_source()
+                                 and catalog_mod.catalog.legacy_routes())):
+                    # 从 0.0.1.19 升级时旧路由是 <sid>:movie，按源拆库后
+                    # 查 <sid>:<type_id> 会全部落空，启动时强制重建一次。
                     await catalog_mod.catalog.refresh_routes(
                         app.state.src,
                         vlib.mapped_sources() or config.enabled_sources(),

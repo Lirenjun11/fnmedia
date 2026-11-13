@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, type AdPreview, type Bootstrap, type Config, type UpdateInfo } from './api';
+import { api, type AdPreview, type Bootstrap, type Config, type UpdateInfo, type VlibClass } from './api';
 import type { Notify } from './App';
 interface Props {
   boot: Bootstrap;
@@ -471,12 +471,40 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
     vlib_refresh_hours: Number(boot.config.vlib_refresh_hours ?? 6),
     vlib_sources: [...(boot.config.vlib_sources || [])],
     vlib_categories: [...(boot.config.vlib_categories || [])],
+    vlib_class_ids: { ...(boot.config.vlib_class_ids || {}) } as Record<string, string[]>,
     vlib_split: boot.config.vlib_split || 'source_category',
   });
   const [status, setStatus] = useState(boot.vlib);
   const [busy, setBusy] = useState('');
+  const [classOptions, setClassOptions] = useState<Record<string, VlibClass[]>>({});
+  const sourceKey = form.vlib_sources.join(',');
 
-  const set = (key: keyof typeof form, value: number | boolean | string | string[]) =>
+  useEffect(() => {
+    const sids = sourceKey ? sourceKey.split(',') : [];
+    if (!sids.length) { setClassOptions({}); return; }
+    let alive = true;
+    void api.vlibClasses(sids).then((res) => {
+      if (alive) setClassOptions(res.classes || {});
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [sourceKey]);
+
+  async function reloadClasses() {
+    if (!form.vlib_sources.length) return;
+    setBusy('classes');
+    try {
+      const res = await api.vlibClasses(form.vlib_sources, true);
+      setClassOptions(res.classes || {});
+      notify('已重新读取片源分类', 'ok');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '读取失败', 'err');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  const set = (key: keyof typeof form,
+               value: number | boolean | string | string[] | Record<string, string[]>) =>
     setForm((current) => ({ ...current, [key]: value }));
 
   function toggleId(key: 'vlib_sources' | 'vlib_categories', id: string) {
@@ -487,7 +515,33 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
     });
   }
 
+  function selectedClasses(sid: string): string[] {
+    const saved = form.vlib_class_ids[sid];
+    return saved !== undefined ? saved
+      : (classOptions[sid] || []).filter((c) => !c.junk).map((c) => c.id);
+  }
+
+  function toggleClass(sid: string, cid: string) {
+    setForm((current) => {
+      const opts = classOptions[sid] || [];
+      const saved = current.vlib_class_ids[sid];
+      const cur = saved !== undefined ? saved
+        : opts.filter((c) => !c.junk).map((c) => c.id);
+      const next = cur.includes(cid) ? cur.filter((x) => x !== cid) : [...cur, cid];
+      return { ...current,
+        vlib_class_ids: { ...current.vlib_class_ids, [sid]: next } };
+    });
+  }
+
   async function save() {
+    if (form.vlib_split === 'source_category') {
+      const empty = form.vlib_sources.find((sid) =>
+        selectedClasses(sid).length === 0 && (classOptions[sid] || []).length > 0);
+      if (empty) {
+        notify('每个勾选的片源至少要选一个分类，或取消勾选该片源', 'err');
+        return;
+      }
+    }
     setBusy('save');
     try {
       await api.patchConfig({
@@ -497,6 +551,7 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
         vlib_refresh_hours: Number(form.vlib_refresh_hours),
         vlib_sources: form.vlib_sources,
         vlib_categories: form.vlib_categories,
+        vlib_class_ids: form.vlib_class_ids,
         vlib_split: form.vlib_split,
       });
       await refresh();
@@ -559,7 +614,8 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
         </label>
         <p className="card-sub">
           从资源站 Apple CMS 分类表里按「最近更新」深翻，每页直连详情接口，
-          点开即可播放，无需再搜索。脏类（解说/预告/短剧/福利等）自动剔除。
+          点开即可播放，无需再搜索。按源 × 分类拆分时可逐类勾选源站原始分类，
+          解说 / 预告 / 福利等脏类默认不勾。
         </p>
         <div className="grid mt">
           <div>
@@ -589,24 +645,78 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
         {boot.sources.filter((s) => s.enabled).length === 0 && (
           <p className="hint">当前没有启用的片源，请先在「片源配置」启用。</p>
         )}
-        <label className="field mt">显示分类（不选 = 四类全开）</label>
-        <div className="row">
-          {VLIB_CATS.map((cat) => (
-            <label key={cat.key} className="row" style={{ cursor: 'pointer', gap: 6 }}>
-              <input className="check" type="checkbox"
-                     checked={form.vlib_categories.includes(cat.key)}
-                     onChange={() => toggleId('vlib_categories', cat.key)} />
-              <span>{cat.label}</span>
-            </label>
-          ))}
-        </div>
+        {form.vlib_split === 'source_category' ? (
+          <>
+            <div className="row" style={{ justifyContent: 'space-between' }}>
+              <label className="field" style={{ margin: 0 }}>
+                该片源的全部分类（从 ac=list 读取，勾选后逐类生成库卡片）
+              </label>
+              <button className="btn sm ghost" disabled={!!busy || !form.vlib_sources.length}
+                      onClick={() => void reloadClasses()}>
+                {busy === 'classes' ? '读取中…' : '重新读取分类'}
+              </button>
+            </div>
+            {form.vlib_sources.length === 0 && (
+              <p className="hint">先在上方勾选片源，这里会列出该片源的所有分类。</p>
+            )}
+            <div className="stack mt">
+              {form.vlib_sources.map((sid) => {
+                const source = boot.sources.find((x) => x.id === sid);
+                const opts = classOptions[sid] || [];
+                const picked = selectedClasses(sid);
+                return (
+                  <div key={sid} className="stack">
+                    <div className="row">
+                      <span className="badge ok">{source?.name || sid}</span>
+                      <span className="small">
+                        {opts.length
+                          ? `${opts.length} 个分类，已选 ${picked.length} 个`
+                          : '分类读取中或该源不支持分类表…'}
+                      </span>
+                    </div>
+                    <div className="grid">
+                      {opts.map((c) => (
+                        <label key={c.id} className="row" style={{ cursor: 'pointer', gap: 6 }}>
+                          <input className="check" type="checkbox"
+                                 checked={picked.includes(c.id)}
+                                 onChange={() => toggleClass(sid, c.id)} />
+                          <span>{c.name}{c.junk ? '（已过滤）' : ''}</span>
+                          <span className="small">{c.id}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <p className="hint">
+              解说 / 预告 / 福利等脏类也会列出但默认不勾，需要时可手动勾选。
+              卡片数量 = 各片源已选分类数之和，一个片源最多取 40 个分类。
+            </p>
+          </>
+        ) : (
+          <>
+            <label className="field mt">显示归类（不选 = 四类全开）</label>
+            <div className="row">
+              {VLIB_CATS.map((cat) => (
+                <label key={cat.key} className="row" style={{ cursor: 'pointer', gap: 6 }}>
+                  <input className="check" type="checkbox"
+                         checked={form.vlib_categories.includes(cat.key)}
+                         onChange={() => toggleId('vlib_categories', cat.key)} />
+                  <span>{cat.label}</span>
+                </label>
+              ))}
+            </div>
+            <p className="hint">此模式沿用归并后的四大类，不读取源站原始分类。</p>
+          </>
+        )}
         <label className="field mt">库卡片形态</label>
         <div className="stack">
           <label className="row" style={{ cursor: 'pointer' }}>
             <input className="check" type="radio" name="vlib_split"
                    checked={form.vlib_split === 'source_category'}
                    onChange={() => set('vlib_split', 'source_category')} />
-            <span>按源 × 分类拆分：每个源生成一组分类库卡片（如「源名 · 电影」）</span>
+            <span>按源 × 原始分类拆分：每个源按它的分类表逐类生成一张卡片（如「源名 · 动作片」）</span>
           </label>
           <label className="row" style={{ cursor: 'pointer' }}>
             <input className="check" type="radio" name="vlib_split"
@@ -617,7 +727,7 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
         </div>
         <p className="hint">
           保存后会在后台立即重建分类路由，稍等片刻重新进入飞牛影视即可看到。
-          卡片数量 = 选中源数 × 显示分类数，建议不超过 6 个源。
+          卡片数量 = 各片源已选分类数之和，建议不超过 6 个源、每源 40 个分类。
         </p>
 
         <div className="row end mt">
@@ -662,16 +772,20 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
                   </span>
                 ))}
               </div>
-              {Object.entries(bySource).map(([sid, cats]) => {
+              {Object.entries(bySource).map(([sid, classes]) => {
                 const name = status?.mapping?.sources.find((s) => s.id === sid)?.name || sid;
+                const rows = Object.values(classes);
                 return (
                   <div className="row" key={sid}>
                     <span className="badge ok">{name}</span>
-                    {VLIB_CATS.filter((c) => cats[c.key]).map((c) => (
-                      <span className="badge" key={c.key}>
-                        {c.label} {cats[c.key].total}
+                    {rows.slice(0, 10).map((r, i) => (
+                      <span className="badge" key={`${sid}-${i}`}>
+                        {r.name || '未命名'} {r.total}
                       </span>
                     ))}
+                    {rows.length > 10 && (
+                      <span className="small">等 {rows.length} 个分类</span>
+                    )}
                   </div>
                 );
               })}

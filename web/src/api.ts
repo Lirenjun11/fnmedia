@@ -50,6 +50,7 @@ export interface Config {
   vlib_refresh_hours: number;
   vlib_sources: string[];
   vlib_categories: string[];
+  vlib_class_ids: Record<string, string[]>;
   vlib_split: string;
   acl_enabled: boolean;
   acl_subjects: AclSubject[];
@@ -143,6 +144,14 @@ export interface VlibRouteInfo {
   name: string;
   source: string;
   total: number;
+  mdb?: string;
+}
+
+export interface VlibClass {
+  id: string;
+  name: string;
+  junk: boolean;
+  mdb: string;
 }
 
 export interface VlibStatus {
@@ -168,6 +177,8 @@ export interface VlibStatus {
     configured_sources: string[];
     sources: { id: string; name: string }[];
     categories: string[];
+    class_ids?: Record<string, string[]>;
+    classes_loaded?: Record<string, number>;
     split: string;
     configured_split: string;
   };
@@ -313,6 +324,9 @@ export const api = {
   adfilterPreview: () =>
     request<{ previews: AdPreview[] }>('/v/api/ext/adfilter/preview'),
   vlibStatus: () => request<VlibStatus>('/v/api/ext/vlib/status'),
+  vlibClasses: (sids: string[], force = false) =>
+    request<{ classes: Record<string, VlibClass[]>; loaded: string[] }>(
+      `/v/api/ext/vlib/classes?sids=${encodeURIComponent(sids.join(','))}${force ? '&force=1' : ''}`),
   vlibRefresh: (what: 'all' | 'charts' | 'catalog' = 'all') =>
     request<VlibStatus>('/v/api/ext/vlib/refresh', json('POST', { what })),
   vlibClear: () => request<VlibStatus>('/v/api/ext/vlib/cache', { method: 'DELETE' }),

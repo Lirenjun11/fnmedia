@@ -51,9 +51,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.19"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.20"
     except OSError:
-        return "0.0.1.19"
+        return "0.0.1.20"
 
 
 def _public_config() -> dict:
@@ -142,7 +142,8 @@ async def patch_config(request: Request):
     result = config.patch(body)
     # 片源映射变更后立即后台重建路由，不必等 6 小时定时刷新；
     # 失败保留旧路由，不阻塞管理页保存。
-    if any(k in body for k in ("vlib_sources", "vlib_categories", "vlib_split")):
+    if any(k in body for k in ("vlib_sources", "vlib_categories",
+                              "vlib_class_ids", "vlib_split")):
         asyncio.create_task(catalog.catalog.refresh_routes(
             request.app.state.src,
             vlib.mapped_sources() or config.enabled_sources(),
@@ -582,6 +583,9 @@ def vlib_status() -> dict:
                          "name": str(s.get("name") or "")}
                         for s in vlib.mapped_sources()],
             "categories": [row[0] for row in vlib.mapped_categories()],
+            "class_ids": dict(cfg.get("vlib_class_ids") or {}),
+            "classes_loaded": {sid: len(rows) for sid, rows in
+                               catalog.catalog.all_classes().items()},
             "split": "source_category" if vlib.split_by_source() else "category",
             "configured_split": str(cfg.get("vlib_split") or "category"),
         },
@@ -592,6 +596,27 @@ def vlib_status() -> dict:
 async def vlib_status_route(request: Request):
     guard(request)
     return ok(vlib_status())
+
+
+@router.get("/vlib/classes")
+async def vlib_classes(request: Request):
+    """列出片源 ac=list 返回的全部分类（含脏类标记），结果带缓存。
+
+    sids 由管理页传入当前勾选的源（即使还没保存配置也能读）；未传时
+    用已保存的映射源。force=1 强制重新拉一次源站分类表。
+    """
+    guard(request)
+    sids = [x.strip() for x in str(
+        request.query_params.get("sids") or "").split(",") if x.strip()]
+    force = request.query_params.get("force") == "1"
+    pool = config.all_sources()
+    sources = ([s for s in pool if str(s.get("id") or "") in sids]
+               if sids else vlib.mapped_sources())
+    if sources:
+        await catalog.catalog.load_classes(request.app.state.src, sources,
+                                           force=force)
+    return ok({"classes": catalog.catalog.all_classes(),
+               "loaded": [str(s.get("id") or "") for s in sources]})
 
 
 @router.post("/vlib/refresh")

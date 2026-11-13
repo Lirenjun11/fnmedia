@@ -67,10 +67,16 @@ def catalog_mdb(cat: str) -> str:
     return "Mix"
 
 
+def is_junk(type_name: str) -> bool:
+    """解说 / 预告 / 福利等不宜展示的脏类；名字识别不出不算脏类。"""
+    name = str(type_name or "").strip()
+    return not name or any(word in name for word in _JUNK_WORDS)
+
+
 def bucket_of(type_name: str) -> str | None:
     """分类名 → 四大类；命中脏类返回 None。"""
     name = str(type_name or "").strip()
-    if not name or any(word in name for word in _JUNK_WORDS):
+    if is_junk(name):
         return None
     if any(word in name for word in _ANIME_WORDS):
         return "anime"
@@ -81,6 +87,31 @@ def bucket_of(type_name: str) -> str | None:
     if any(word in name for word in _MOVIE_WORDS):
         return "movie"
     return None
+
+
+def class_rows(payload) -> list[dict]:
+    """``ac=list`` 原始分类表 → 统一结构，**保留每个 type_id 不归并**。
+
+    脏类只是打标记（默认不勾选），不再悄悄丢掉；名字识别不出四大类的
+    分类（如「4K 专区」「Netflix」）也照常列出，类型按 Mix 处理。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in _classes(payload):
+        tid = str(row.get("type_id") or "").strip()
+        name = str(row.get("type_name") or "").strip()
+        if not tid or not name or tid in seen:
+            continue
+        seen.add(tid)
+        bucket = bucket_of(name)
+        out.append({
+            "id": tid, "name": name,
+            # 保留源站原字段名，兼容直接传原始 ac=list 行的调用方。
+            "type_id": tid, "type_name": name,
+            "junk": is_junk(name),
+            "mdb": {"movie": "Movie", "tv": "TV"}.get(bucket, "Mix"),
+        })
+    return out
 
 
 def _classes(payload) -> list[dict]:
@@ -141,6 +172,7 @@ class Catalog:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._routes: dict[str, dict] = {}
+        self._classes: dict[str, list[dict]] = {}
         self._updated_at = 0.0
         self._last_attempt = 0.0
         self._refreshing = False
@@ -158,6 +190,13 @@ class Catalog:
             if isinstance(routes, dict):
                 self._routes = {k: v for k, v in routes.items()
                                 if isinstance(v, dict) and v.get("type_id")}
+            raw_classes = data.get("classes")
+            if isinstance(raw_classes, dict):
+                self._classes = {
+                    str(sid): [r for r in rows
+                               if isinstance(r, dict) and r.get("id")]
+                    for sid, rows in raw_classes.items()
+                    if isinstance(rows, list)}
             self._updated_at = float(data.get("updated_at") or 0)
 
     def _persist(self) -> None:
@@ -167,10 +206,41 @@ class Catalog:
             tmp.write_text(json.dumps({
                 "updated_at": self._updated_at,
                 "routes": self._routes,
+                "classes": self._classes,
             }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
             tmp.replace(STATE)
         except OSError:
             pass
+
+    # ---------- 源站原始分类表 ----------
+    def classes(self, sid: str) -> list[dict]:
+        return list(self._classes.get(str(sid or "")) or [])
+
+    def all_classes(self) -> dict[str, list[dict]]:
+        return {sid: list(rows) for sid, rows in self._classes.items()}
+
+    async def load_classes(self, client, sources: list[dict],
+                           force: bool = False) -> dict[str, list[dict]]:
+        """按需拉取源站 ``ac=list`` 的全部分类并缓存，供管理页勾选。"""
+        targets = [s for s in sources[:8]
+                   if force or not self._classes.get(str(s.get("id") or ""))]
+        if targets:
+            async def fetch(source: dict):
+                payload = await client_get_classes(client, source)
+                return str(source.get("id") or ""), class_rows(payload)
+            results = await asyncio.gather(
+                *(fetch(s) for s in targets), return_exceptions=True)
+            changed = False
+            for result in results:
+                if not isinstance(result, tuple):
+                    continue
+                sid, rows = result
+                if sid and rows:
+                    self._classes[sid] = rows
+                    changed = True
+            if changed:
+                self._persist()
+        return self.all_classes()
 
     # ---------- 读取 ----------
     def route(self, cat: str) -> dict | None:
@@ -205,11 +275,12 @@ class Catalog:
         for key, row in self._routes.items():
             info = {"name": row.get("type_name", ""),
                     "source": row.get("source_name", ""),
+                    "mdb": row.get("mdb", "Mix"),
                     "total": self.total(key)}
             routes[key] = info
             if ":" in key:
-                sid, _, cat = key.partition(":")
-                by_source.setdefault(sid, {})[cat] = info
+                sid, _, tid = key.partition(":")
+                by_source.setdefault(sid, {})[tid] = info
         return {
             "updated_at": int(self._updated_at),
             "refreshing": self._refreshing,
@@ -217,8 +288,15 @@ class Catalog:
             "by_source": by_source,
         }
 
+    def legacy_routes(self) -> bool:
+        """是否存在旧版「<sid>:四大类」路由，需要重建为 <sid>:<type_id>。"""
+        cats = {row[0] for row in CATALOG_CATEGORIES}
+        return any(":" in key and key.partition(":")[2] in cats
+                   for key in self._routes)
+
     def reset(self) -> None:
         self._routes = {}
+        self._classes.clear()
         self._updated_at = 0.0
         self._pages.clear()
         try:
@@ -236,10 +314,10 @@ class Catalog:
         try:
             table = await self._discover(client, sources, split)
             if table:
-                # 两种模式的 key 不能共存：切模式时清掉另一套，避免旧路由
-                # 继续给已经不存在的库供数据。
+                # 重建时清掉本模式下的全部旧路由，避免分类维度变化后
+                # 旧的 <sid>:<四大类> 路由残留成幽灵库。
                 for key in list(self._routes):
-                    if (":" in key) != bool(split):
+                    if (":" in key) == bool(split):
                         self._routes.pop(key, None)
                 self._routes.update(table)
                 self._updated_at = time.time()
@@ -255,14 +333,19 @@ class Catalog:
                         sources: list[dict], split: bool = False) -> dict[str, dict]:
         async def fetch(source: dict):
             payload = await client_get_classes(client, source)
-            classes = _classes(payload)
-            return (source, classes) if classes else None
+            rows = class_rows(payload)
+            return (source, rows) if rows else None
 
         results = await asyncio.gather(
             *(fetch(s) for s in sources[:8]), return_exceptions=True)
         classes_by_source = [row for row in results if isinstance(row, tuple)]
         if not classes_by_source:
             return {}
+        # 顺手缓存每个源的全部分类，管理页直接列出，不必再打一次源站。
+        for source, rows in classes_by_source:
+            sid = str(source.get("id") or "")
+            if sid and rows:
+                self._classes[sid] = rows
         if split:
             return await self._discover_by_source(client, classes_by_source)
 
@@ -271,7 +354,7 @@ class Catalog:
             best = None
             for source, classes in classes_by_source[:2]:
                 candidates = [row for row in classes
-                              if bucket_of(str(row.get("type_name") or "")) == cat][:2]
+                              if bucket_of(row["name"]) == cat][:2]
                 for row in candidates:
                     info = await self._probe(client, source, row)
                     if not info:
@@ -288,42 +371,44 @@ class Catalog:
 
     async def _discover_by_source(self, client,
                                   classes_by_source) -> dict[str, dict]:
-        """按「源 × 分类」各建一条路由，key 为 ``<源id>:<分类>``。
+        """按「源 × 该源原始分类」逐类建路由，key 为 ``<sid>:<type_id>``。
 
-        每类只探第一个候选子类，并发受限；6 源 × 4 类最多 24 次请求，
-        6 小时一次，不会打爆资源站。
+        默认取该源全部非脏分类；配置了 ``vlib_class_ids`` 时只取选中的
+        type_id（用户显式勾选脏类也能出）。每源最多 40 类、总并发 8。
         """
+        picked_all = config.get().get("vlib_class_ids") or {}
         sem = asyncio.Semaphore(8)
 
-        async def probe_one(source, row, sid, cat):
+        async def probe_one(source, row, sid, tid):
             async with sem:
-                return sid, cat, await self._probe(client, source, row)
+                return sid, tid, await self._probe(client, source, row)
 
         tasks = []
-        for source, classes in classes_by_source[:6]:
+        for source, rows in classes_by_source[:6]:
             sid = str(source.get("id") or "")
             if not sid:
                 continue
-            for cat, _, _ in CATALOG_CATEGORIES:
-                candidates = [row for row in classes
-                              if bucket_of(str(row.get("type_name") or "")) == cat][:1]
-                for row in candidates:
-                    tasks.append(probe_one(source, row, sid, cat))
-        best: dict[str, dict] = {}
-        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            picked = picked_all.get(sid)
+            if isinstance(picked, list) and picked:
+                wanted = {str(x) for x in picked}
+                chosen = [r for r in rows if str(r["id"]) in wanted]
+            else:
+                chosen = [r for r in rows if not r.get("junk")]
+            for row in chosen[:40]:
+                tasks.append(probe_one(source, row, sid, str(row["id"])))
+        routes: dict[str, dict] = {}
+        for result in await asyncio.gather(*tasks[:120],
+                                           return_exceptions=True):
             if not isinstance(result, tuple):
                 continue
-            sid, cat, info = result
-            if not info:
-                continue
-            key = f"{sid}:{cat}"
-            if key not in best or info["total"] > best[key]["total"]:
-                best[key] = info
-        return best
+            sid, tid, info = result
+            if info:
+                routes[f"{sid}:{tid}"] = info
+        return routes
 
     async def _probe(self, client: httpx.AsyncClient, source: dict,
                      row: dict) -> dict | None:
-        type_id = str(row.get("type_id"))
+        type_id = str(row.get("id") or row.get("type_id") or "")
         payload = await _get_json(client, source["api"],
                                   {"ac": "detail", "t": type_id, "pg": 1},
                                   _PROBE_TIMEOUT)
@@ -343,7 +428,9 @@ class Catalog:
             "source_name": source.get("name") or source.get("id") or "",
             "api": source["api"],
             "type_id": type_id,
-            "type_name": str(row.get("type_name") or ""),
+            "type_name": str(row.get("name") or row.get("type_name") or ""),
+            "mdb": str(row.get("mdb") or "Mix"),
+            "junk": bool(row.get("junk")),
             "pages": max(1, pagecount or (total + PER_PAGE - 1) // PER_PAGE),
             "total": max(len(titles), total),
             "posters": [t.poster for t in titles[:8] if t.poster],

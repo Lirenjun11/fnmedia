@@ -352,10 +352,10 @@ class VlibSourceMappingTest(unittest.TestCase):
     def setUp(self):
         cfg = config.get()
         self._orig = {k: cfg.get(k) for k in (
-            "sources", "vlib_sources", "vlib_categories", "vlib_split",
-            "vlib_enabled", "vlib_charts", "vlib_catalog", "enabled_limit",
-            "acl_enabled", "acl_grants", "acl_default_visible",
-            "acl_default_online")}
+            "sources", "vlib_sources", "vlib_categories", "vlib_class_ids",
+            "vlib_split", "vlib_enabled", "vlib_charts", "vlib_catalog",
+            "enabled_limit", "acl_enabled", "acl_grants",
+            "acl_default_visible", "acl_default_online")}
         cfg.update({
             "sources": [
                 {"id": "s_1", "name": "源一",
@@ -365,6 +365,7 @@ class VlibSourceMappingTest(unittest.TestCase):
             ],
             "vlib_sources": ["s_1"],
             "vlib_categories": ["movie", "tv"],
+            "vlib_class_ids": {},
             "vlib_split": "source_category",
             "vlib_enabled": True, "vlib_charts": False, "vlib_catalog": True,
             "enabled_limit": 10, "acl_enabled": False, "acl_grants": {},
@@ -372,15 +373,25 @@ class VlibSourceMappingTest(unittest.TestCase):
         })
         config.save(cfg)
         catalog.catalog._routes = {}
+        catalog.catalog._classes = {
+            "s_1": [
+                {"id": "1", "name": "动作片", "junk": False, "mdb": "Movie"},
+                {"id": "2", "name": "国产剧", "junk": False, "mdb": "TV"},
+                {"id": "9", "name": "电影解说", "junk": True, "mdb": "Mix"},
+            ],
+            "s_2": [
+                {"id": "3", "name": "喜剧片", "junk": False, "mdb": "Movie"},
+            ],
+        }
         catalog.catalog._updated_at = time.time()
         catalog.catalog._pages.clear()
-        for sid in ("s_1", "s_2"):
-            for cat in ("movie", "tv"):
-                catalog.catalog._routes[f"{sid}:{cat}"] = {
+        for sid, ids in (("s_1", ("1", "2")), ("s_2", ("3",))):
+            for tid in ids:
+                catalog.catalog._routes[f"{sid}:{tid}"] = {
                     "source_id": sid, "source_name": sid,
-                    "api": "https://a.invalid/api", "type_id": "1",
-                    "type_name": "动作片", "pages": 1, "total": 8,
-                    "posters": []}
+                    "api": "https://a.invalid/api", "type_id": tid,
+                    "type_name": "动作片", "mdb": "Movie",
+                    "pages": 1, "total": 8, "posters": []}
         vlib._BINDS.clear()
         vlib._FAILED.clear()
         vlib._INFLIGHT.clear()
@@ -399,14 +410,14 @@ class VlibSourceMappingTest(unittest.TestCase):
         self.assertEqual(len(libs), 2)
         self.assertTrue(all("源一" in row["title"] for row in libs))
         self.assertEqual({vlib.lib_key(row["guid"]) for row in libs},
-                         {"src:s_1:movie", "src:s_1:tv"})
+                         {"src:s_1:1", "src:s_1:2"})
 
     def test_guid_and_library_keys_are_recoverable(self):
-        guid = vlib.source_lib_guid("s_1", "movie")
-        self.assertEqual(vlib.source_lib_of(guid), ("s_1", "movie"))
+        guid = vlib.source_lib_guid("s_1", "1")
+        self.assertEqual(vlib.source_lib_of(guid), ("s_1", "1"))
         self.assertTrue(vlib.is_virtual_lib(guid))
         self.assertIn(guid, vlib.lib_guids())
-        self.assertIn("src:s_1:movie",
+        self.assertIn("src:s_1:1",
                       [row["key"] for row in vlib.library_keys()])
 
     def test_account_source_grant_filters_libraries(self):
@@ -449,7 +460,7 @@ class VlibSourceMappingTest(unittest.TestCase):
         self.assertEqual(config.get()["vlib_sources"], ["s_1"])
 
     def test_mapped_library_detail_root_and_item_list(self):
-        guid = vlib.source_lib_guid("s_1", "movie")
+        guid = vlib.source_lib_guid("s_1", "1")
         titles = [make_title(vod_id="m1", title="映射片")]
 
         async def fake_page(client, route, page):
@@ -478,6 +489,9 @@ class VlibSourceMappingTest(unittest.TestCase):
         self.assertTrue(all("源一" in r["title"] for r in virtual))
 
     def test_split_route_refresh_keys_by_source(self):
+        catalog.catalog._routes["s_1:movie"] = {
+            "type_id": "1", "source_id": "s_1", "total": 5}
+        self.assertTrue(catalog.catalog.legacy_routes())
         sources = [{"id": "s_1", "name": "源一",
                     "api": "https://a.invalid/api"},
                    {"id": "s_2", "name": "源二",
@@ -501,10 +515,53 @@ class VlibSourceMappingTest(unittest.TestCase):
                 patch.object(catalog.catalog, "_probe", new=fake_probe):
             status = asyncio.run(catalog.catalog.refresh_routes(
                 None, sources, split=True))
-        self.assertIn("s_1:movie", status["routes"])
-        self.assertIn("s_2:variety", status["routes"])
+        self.assertIn("s_1:1", status["routes"])
+        self.assertIn("s_2:4", status["routes"])
         self.assertNotIn("movie", status["routes"])
+        self.assertNotIn("s_1:movie", status["routes"])
+        self.assertFalse(catalog.catalog.legacy_routes())
         self.assertIn("s_1", status["by_source"])
+        self.assertEqual([r["id"] for r in catalog.catalog.classes("s_1")],
+                         ["1", "2", "3", "4"])
+
+    def test_class_rows_keeps_every_source_category(self):
+        rows = catalog.class_rows({"class": [
+            {"type_id": 1, "type_name": "动作片"},
+            {"type_id": 2, "type_name": "国产剧"},
+            {"type_id": 3, "type_name": "电影解说"},
+            {"type_id": 4, "type_name": "Netflix"},
+        ]})
+        self.assertEqual([r["id"] for r in rows], ["1", "2", "3", "4"])
+        self.assertEqual([r["junk"] for r in rows],
+                         [False, False, True, False])
+        self.assertEqual([r["mdb"] for r in rows],
+                         ["Movie", "TV", "Mix", "Mix"])
+
+    def test_selected_classes_honours_explicit_ids(self):
+        cfg = config.get()
+        cfg["vlib_class_ids"] = {"s_1": ["9"]}
+        config.save(cfg)
+        rows = vlib.selected_classes("s_1")
+        self.assertEqual([r["id"] for r in rows], ["9"])
+        self.assertTrue(all(r["junk"] for r in rows))
+        self.assertIn("src:s_1:9",
+                      [r["key"] for r in vlib.library_keys()])
+
+    def test_load_classes_fetches_and_caches(self):
+        catalog.catalog._classes.clear()
+
+        async def fake_classes(client, source):
+            return {"code": 1, "class": [
+                {"type_id": 11, "type_name": "动作片"},
+                {"type_id": 12, "type_name": "福利片"},
+            ]}
+
+        sources = [{"id": "s_1", "name": "源一",
+                    "api": "https://a.invalid/api"}]
+        with patch("catalog.client_get_classes", new=fake_classes):
+            rows = asyncio.run(catalog.catalog.load_classes(None, sources))
+        self.assertEqual([r["id"] for r in rows["s_1"]], ["11", "12"])
+        self.assertTrue(rows["s_1"][1]["junk"])
 
 
 if __name__ == "__main__":

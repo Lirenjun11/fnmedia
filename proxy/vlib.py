@@ -41,10 +41,6 @@ CHART_CAT_OF = {guid: cat for cat, guid in CHART_LIB_GUIDS.items()}
 CATALOG_CAT_OF = {guid: cat for cat, guid in CATALOG_LIB_GUIDS.items()}
 
 # --------------------------------------------------------------- 片源映射
-_CAT_LABELS = {"movie": "电影", "tv": "剧集",
-               "anime": "动漫", "variety": "综艺"}
-
-
 def mapped_sources() -> list[dict]:
     """配置里选中进虚拟库的源（已启用、仍存在）。空 = 沿用旧的 4+4 库。"""
     cfg = config.get()
@@ -57,6 +53,7 @@ def mapped_sources() -> list[dict]:
 
 
 def mapped_categories() -> list[tuple]:
+    """归并四大类：只服务榜单四库与「只保留 4 张分类库」模式。"""
     wanted = [str(x).strip() for x in (config.get().get("vlib_categories") or [])
               if str(x).strip()]
     return [row for row in catalog.CATALOG_CATEGORIES
@@ -73,36 +70,55 @@ def split_by_source() -> bool:
         config.get().get("vlib_split") == "source_category"
 
 
-def source_lib_guid(sid: str, cat: str) -> str:
-    return hashlib.md5(f"fnmedia-vlib:src:{sid}:{cat}".encode()).hexdigest()
+def selected_classes(sid: str) -> list[dict]:
+    """该源要显示哪些原始分类：显式配置优先，否则全部非脏分类。"""
+    rows = catalog.catalog.classes(sid)
+    picked = (config.get().get("vlib_class_ids") or {}).get(sid)
+    if isinstance(picked, list) and picked:
+        wanted = {str(x) for x in picked}
+        rows = [r for r in rows if str(r.get("id")) in wanted]
+    else:
+        rows = [r for r in rows if not r.get("junk")]
+    return rows[:40]
 
 
-def source_lib_key(sid: str, cat: str) -> str:
-    return f"src:{sid}:{cat}"
+def source_lib_guid(sid: str, cls_id: str) -> str:
+    return hashlib.md5(f"fnmedia-vlib:src:{sid}:{cls_id}".encode()).hexdigest()
+
+
+def source_lib_key(sid: str, cls_id: str) -> str:
+    return f"src:{sid}:{cls_id}"
 
 
 def source_lib_pairs() -> list[tuple]:
-    """当前配置可能生成的所有 (源, (分类键, 标题, mdb 类型)) 组合。"""
-    return [(s, row) for s in mapped_sources()
-            for row in mapped_categories()]
+    """当前配置可能生成的所有 (源, 源站原始分类) 组合。"""
+    return [(s, cls) for s in mapped_sources()
+            for cls in selected_classes(str(s.get("id") or ""))]
 
 
 def source_lib_of(guid: str):
-    """库 guid 反查 (sid, cat)。纯函数由配置确定性重建，无需持久化映射。"""
-    for source, (cat, _, _) in source_lib_pairs():
+    """库 guid 反查 (sid, type_id)；由配置 + 分类缓存确定性重建。"""
+    for source, cls in source_lib_pairs():
         sid = str(source.get("id") or "")
-        if source_lib_guid(sid, cat) == guid:
-            return sid, cat
+        if source_lib_guid(sid, str(cls["id"])) == guid:
+            return sid, str(cls["id"])
     return None
 
 
-def source_lib_title(sid: str, cat: str) -> str:
+def class_of(sid: str, cls_id: str) -> dict:
+    for row in catalog.catalog.classes(sid):
+        if str(row.get("id")) == str(cls_id):
+            return row
+    return {"id": str(cls_id), "name": str(cls_id), "mdb": "Mix"}
+
+
+def source_lib_title(sid: str, cls_id: str) -> str:
     name = sid
     for source in mapped_sources():
         if str(source.get("id") or "") == sid:
             name = str(source.get("name") or sid)
             break
-    return f"{name} · {_CAT_LABELS.get(cat, cat)}"
+    return f"{name} · {class_of(sid, cls_id)['name']}"
 
 
 _BIND_FILE = config.STATE_DIR / "chart_bindings.json"
@@ -159,22 +175,24 @@ def libraries() -> list[dict]:
     if not catalog_enabled():
         return out
     if split_by_source():
-        for source, (cat, _, mdb) in source_lib_pairs():
+        for source, cls in source_lib_pairs():
             sid = str(source.get("id") or "")
+            cid = str(cls["id"])
             # 账号授权了哪些源，就自动看到这些源的分类库；显式库清单
             # 仍能逐个取消（lib_allowed 在显式配置时按列表判定）。
             if not acl.provider_allowed(sid):
                 continue
-            if not acl.lib_allowed(source_lib_key(sid, cat)):
+            if not acl.lib_allowed(source_lib_key(sid, cid)):
                 continue
-            route = catalog.catalog.route(f"{sid}:{cat}")
+            route = catalog.catalog.route(f"{sid}:{cid}")
             if not route or not route.get("total"):
                 continue
             posters = [fake.poster_path(url)
                        for url in (route.get("posters") or [])][:8]
             posters = [p for p in posters if p]
-            out.append(_lib_card(source_lib_guid(sid, cat),
-                                 source_lib_title(sid, cat), mdb, posters))
+            out.append(_lib_card(source_lib_guid(sid, cid),
+                                 source_lib_title(sid, cid),
+                                 str(cls.get("mdb") or "Mix"), posters))
         return out
     for cat, title, mdb in mapped_categories():
         if not acl.lib_allowed(f"catalog:{cat}"):
@@ -234,11 +252,12 @@ def library_keys() -> list[dict]:
         out.append({"key": f"catalog:{cat}", "title": title,
                     "guid": CATALOG_LIB_GUIDS[cat], "kind": "catalog"})
     if split_by_source():
-        for source, (cat, _, _) in source_lib_pairs():
+        for source, cls in source_lib_pairs():
             sid = str(source.get("id") or "")
-            out.append({"key": source_lib_key(sid, cat),
-                        "title": source_lib_title(sid, cat),
-                        "guid": source_lib_guid(sid, cat),
+            cid = str(cls["id"])
+            out.append({"key": source_lib_key(sid, cid),
+                        "title": source_lib_title(sid, cid),
+                        "guid": source_lib_guid(sid, cid),
                         "kind": "source",
                         "group": str(source.get("name") or sid)})
     return out
@@ -247,8 +266,8 @@ def library_keys() -> list[dict]:
 def lib_guids() -> set[str]:
     guids = set(CHART_CAT_OF) | set(CATALOG_CAT_OF)
     if split_by_source():
-        guids |= {source_lib_guid(str(s.get("id") or ""), cat)
-                  for s, (cat, _, _) in source_lib_pairs()}
+        guids |= {source_lib_guid(str(s.get("id") or ""), str(cls["id"]))
+                  for s, cls in source_lib_pairs()}
     return guids
 
 
@@ -256,15 +275,15 @@ def library_detail(guid: str) -> dict | None:
     """``GET /v/api/v1/mdb/{guid}`` 的库详情；非虚拟库或无权限返回 None。"""
     mapped = source_lib_of(guid) if split_by_source() else None
     if mapped:
-        sid, cat = mapped
-        route = catalog.catalog.route(f"{sid}:{cat}")
-        if (not acl.lib_allowed(source_lib_key(sid, cat))
+        sid, cid = mapped
+        route = catalog.catalog.route(f"{sid}:{cid}")
+        if (not acl.lib_allowed(source_lib_key(sid, cid))
                 or not acl.provider_allowed(sid)
                 or not catalog_enabled()
                 or not route or not route.get("total")):
             return None
-        title = source_lib_title(sid, cat)
-        mdb = catalog.catalog_mdb(cat)
+        title = source_lib_title(sid, cid)
+        mdb = str(class_of(sid, cid).get("mdb") or "Mix")
         posters = [fake.poster_path(url)
                    for url in (route.get("posters") or [])][:8]
     elif guid in CHART_CAT_OF:
@@ -348,14 +367,15 @@ def sum_counts() -> dict[str, int]:
     if not catalog_enabled():
         return counts
     if split_by_source():
-        for source, (cat, _, _) in source_lib_pairs():
+        for source, cls in source_lib_pairs():
             sid = str(source.get("id") or "")
-            if (not acl.lib_allowed(source_lib_key(sid, cat))
+            cid = str(cls["id"])
+            if (not acl.lib_allowed(source_lib_key(sid, cid))
                     or not acl.provider_allowed(sid)):
                 continue
-            n = catalog.catalog.total(f"{sid}:{cat}")
+            n = catalog.catalog.total(f"{sid}:{cid}")
             if n:
-                counts[source_lib_guid(sid, cat)] = n
+                counts[source_lib_guid(sid, cid)] = n
         return counts
     for cat, _, _ in mapped_categories():
         if not acl.lib_allowed(f"catalog:{cat}"):
@@ -414,7 +434,7 @@ def chart_card(item: dict) -> dict:
 
 
 def catalog_card(brief: dict, cat: str, lib_guid: str = "",
-                 lib_title: str = "") -> dict:
+                 lib_title: str = "", ancestor_category: str = "") -> dict:
     guid = brief["guid"]
     row = fake.search_card(brief)
     title = (brief.get("title") or "").strip()
@@ -422,7 +442,7 @@ def catalog_card(brief: dict, cat: str, lib_guid: str = "",
     row["title"] = title + (f" ·{remarks}" if remarks else "")
     row["ancestor_guid"] = lib_guid or CATALOG_LIB_GUIDS[cat]
     row["ancestor_name"] = lib_title or catalog.catalog_title(cat)
-    row["ancestor_category"] = catalog.catalog_mdb(cat)
+    row["ancestor_category"] = ancestor_category or catalog.catalog_mdb(cat)
     playstate.apply(row, guid)
     return row
 
@@ -702,15 +722,16 @@ async def item_list(store: cms.TitleStore, client, body: dict,
         return await _catalog_listing(store, client, body, cat, cat)
     mapped = source_lib_of(guid) if split_by_source() else None
     if mapped:
-        sid, cat = mapped
-        key = f"{sid}:{cat}"
-        title = source_lib_title(sid, cat)
+        sid, cid = mapped
+        key = f"{sid}:{cid}"
+        title = source_lib_title(sid, cid)
+        mdb = str(class_of(sid, cid).get("mdb") or "Mix")
         route = catalog.catalog.route(key)
-        if (not acl.lib_allowed(source_lib_key(sid, cat))
+        if (not acl.lib_allowed(source_lib_key(sid, cid))
                 or not acl.provider_allowed(sid) or not route):
-            return _listing(title, catalog.catalog_mdb(cat), 0, [])
-        return await _catalog_listing(store, client, body, key, cat,
-                                      guid, title)
+            return _listing(title, mdb, 0, [])
+        return await _catalog_listing(store, client, body, key, cid,
+                                      guid, title, mdb)
     return None
 
 
@@ -731,11 +752,11 @@ async def _chart_listing(body: dict, cat: str) -> dict:
 
 async def _catalog_listing(store: cms.TitleStore, client, body: dict,
                            route_key: str, cat: str, lib_guid: str = "",
-                           lib_title: str = "") -> dict:
+                           lib_title: str = "", mdb: str = "") -> dict:
     title = lib_title or catalog.catalog_title(cat)
-    mdb = catalog.catalog_mdb(cat)
+    category = mdb or catalog.catalog_mdb(cat)
     if not catalog_enabled():
-        return _listing(title, mdb, 0, [])
+        return _listing(title, category, 0, [])
     page_size, start, end = _page_args(body, catalog.catalog.total(route_key))
     if (catalog.catalog.needs_rebuild(route_key)
             and not catalog.catalog._refreshing):
@@ -748,8 +769,8 @@ async def _catalog_listing(store: cms.TitleStore, client, body: dict,
     titles, total = await catalog.catalog.window(client, route_key, start,
                                                  max(1, end - start))
     briefs = store.remember(titles) if titles else []
-    return _listing(title, mdb, total,
-                    [catalog_card(brief, cat, lib_guid, title)
+    return _listing(title, category, total,
+                    [catalog_card(brief, cat, lib_guid, title, category)
                      for brief in briefs])
 
 

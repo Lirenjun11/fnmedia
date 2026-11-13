@@ -55,6 +55,9 @@ DEFAULTS = {
     #                  仅在 vlib_sources 非空时生效，空配置仍是旧 4+4 库
     "vlib_sources": [],
     "vlib_categories": [],
+    # vlib_class_ids: {源id: [该源 ac=list 里的 type_id]}；某源缺失或为空
+    #   = 该源全部非脏分类。仅在按源×分类拆库时生效。
+    "vlib_class_ids": {},
     "vlib_split": "source_category",
     # ---- 账号权限（默认关闭；关闭时全链路短路，行为与旧版一致）----
     # acl_subjects: [{id,name,source}] 授权主体（fnOS 账号）
@@ -239,6 +242,15 @@ def save(cfg: dict) -> dict:
     wanted_cats = {str(x).strip() for x in raw_cats}
     clean["vlib_categories"] = [
         c for c in ("movie", "tv", "anime", "variety") if c in wanted_cats]
+    raw_class_ids = clean["vlib_class_ids"]
+    clean["vlib_class_ids"] = {}
+    if isinstance(raw_class_ids, dict):
+        for sid, ids in list(raw_class_ids.items())[:32]:
+            sid = str(sid or "").strip()[:40]
+            if not sid or sid not in known_ids or not isinstance(ids, list):
+                continue
+            clean["vlib_class_ids"][sid] = [
+                str(x).strip()[:40] for x in ids[:64] if str(x).strip()][:64]
     clean["vlib_split"] = ("source_category"
                            if clean["vlib_split"] == "source_category"
                            else "category")
