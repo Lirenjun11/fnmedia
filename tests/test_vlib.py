@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+import acl
 import app as appmod
 import catalog
 import cms
@@ -343,6 +344,167 @@ class VlibTest(unittest.TestCase):
                                                   "variety"},
                          {"movie", "tv", "anime", "variety"})
         self.assertEqual(catalog.catalog.route("movie")["type_id"], "1")
+
+
+class VlibSourceMappingTest(unittest.TestCase):
+    """片源映射：只有选中的源进虚拟库，且按账号授权自动过滤。"""
+
+    def setUp(self):
+        cfg = config.get()
+        self._orig = {k: cfg.get(k) for k in (
+            "sources", "vlib_sources", "vlib_categories", "vlib_split",
+            "vlib_enabled", "vlib_charts", "vlib_catalog", "enabled_limit",
+            "acl_enabled", "acl_grants", "acl_default_visible",
+            "acl_default_online")}
+        cfg.update({
+            "sources": [
+                {"id": "s_1", "name": "源一",
+                 "api": "https://a.invalid/api", "enabled": True},
+                {"id": "s_2", "name": "源二",
+                 "api": "https://b.invalid/api", "enabled": True},
+            ],
+            "vlib_sources": ["s_1"],
+            "vlib_categories": ["movie", "tv"],
+            "vlib_split": "source_category",
+            "vlib_enabled": True, "vlib_charts": False, "vlib_catalog": True,
+            "enabled_limit": 10, "acl_enabled": False, "acl_grants": {},
+            "acl_default_visible": True, "acl_default_online": True,
+        })
+        config.save(cfg)
+        catalog.catalog._routes = {}
+        catalog.catalog._updated_at = time.time()
+        catalog.catalog._pages.clear()
+        for sid in ("s_1", "s_2"):
+            for cat in ("movie", "tv"):
+                catalog.catalog._routes[f"{sid}:{cat}"] = {
+                    "source_id": sid, "source_name": sid,
+                    "api": "https://a.invalid/api", "type_id": "1",
+                    "type_name": "动作片", "pages": 1, "total": 8,
+                    "posters": []}
+        vlib._BINDS.clear()
+        vlib._FAILED.clear()
+        vlib._INFLIGHT.clear()
+
+    def tearDown(self):
+        catalog.catalog.reset()
+        charts.chart_cache.reset()
+        vlib._BINDS.clear()
+        vlib._FAILED.clear()
+        cfg = config.get()
+        cfg.update(self._orig)
+        config.save(cfg)
+
+    def test_only_mapped_source_creates_libraries(self):
+        libs = vlib.libraries()
+        self.assertEqual(len(libs), 2)
+        self.assertTrue(all("源一" in row["title"] for row in libs))
+        self.assertEqual({vlib.lib_key(row["guid"]) for row in libs},
+                         {"src:s_1:movie", "src:s_1:tv"})
+
+    def test_guid_and_library_keys_are_recoverable(self):
+        guid = vlib.source_lib_guid("s_1", "movie")
+        self.assertEqual(vlib.source_lib_of(guid), ("s_1", "movie"))
+        self.assertTrue(vlib.is_virtual_lib(guid))
+        self.assertIn(guid, vlib.lib_guids())
+        self.assertIn("src:s_1:movie",
+                      [row["key"] for row in vlib.library_keys()])
+
+    def test_account_source_grant_filters_libraries(self):
+        cfg = config.get()
+        cfg.update({"acl_enabled": True,
+                    "acl_grants": {"u1": {"sources": ["s_2"]}}})
+        config.save(cfg)
+        token = acl.push(acl.Identity(uid="u1", name="u1", via="header"))
+        try:
+            self.assertEqual(vlib.libraries(), [])
+        finally:
+            acl.reset(token)
+
+    def test_chart_binding_uses_only_mapped_sources(self):
+        seed_charts()
+        meta = charts.chart_cache.get(charts.chart_guid("movie", "movie-0"))
+        seen = {}
+
+        async def fake_search(client, sources, word, **kwargs):
+            seen["sources"] = sources
+            return []
+
+        with patch("cms.search_all", new=fake_search):
+            asyncio.run(vlib.ensure_bound(cms.TitleStore(), None,
+                                          meta["guid"]))
+        self.assertEqual([s["id"] for s in seen["sources"]], ["s_1"])
+
+    def test_empty_mapping_keeps_legacy_behavior(self):
+        cfg = config.get()
+        cfg["vlib_sources"] = []
+        config.save(cfg)
+        self.assertFalse(vlib.split_by_source())
+        self.assertEqual(len(set(vlib.lib_guids())), 8)
+        self.assertEqual(vlib.mapped_sources(), [])
+
+    def test_config_drops_unknown_source_ids(self):
+        cfg = config.get()
+        cfg["vlib_sources"] = ["s_1", "ghost"]
+        config.save(cfg)
+        self.assertEqual(config.get()["vlib_sources"], ["s_1"])
+
+    def test_mapped_library_detail_root_and_item_list(self):
+        guid = vlib.source_lib_guid("s_1", "movie")
+        titles = [make_title(vod_id="m1", title="映射片")]
+
+        async def fake_page(client, route, page):
+            return titles if page == 1 else []
+
+        with patch.object(catalog.catalog, "_page", new=fake_page):
+            with TestClient(appmod.app) as client:
+                detail = client.get(f"/v/api/v1/mdb/{guid}").json()["data"]
+                root = client.get(f"/v/api/v1/item/{guid}").json()["data"]
+                listing = client.post("/v/api/v1/item/list", json={
+                    "ancestor_guid": guid, "page": 1,
+                    "page_size": 22}).json()["data"]
+        self.assertIn("源一", detail["name"])
+        self.assertEqual(root["type"], "MediaDB")
+        self.assertEqual(listing["total"], 8)
+        self.assertEqual(listing["list"][0]["ancestor_guid"], guid)
+        self.assertIn("源一", listing["list"][0]["ancestor_name"])
+
+    def test_mediadb_list_injects_only_mapped_libraries(self):
+        with patch("app._passthrough", AsyncMock(return_value=JSONResponse(
+                {"code": 0, "msg": "", "data": [{"guid": "local-1"}]}))):
+            with TestClient(appmod.app) as client:
+                rows = client.get("/v/api/v1/mediadb/list").json()["data"]
+        virtual = [r for r in rows if r["guid"] != "local-1"]
+        self.assertEqual(len(virtual), 2)
+        self.assertTrue(all("源一" in r["title"] for r in virtual))
+
+    def test_split_route_refresh_keys_by_source(self):
+        sources = [{"id": "s_1", "name": "源一",
+                    "api": "https://a.invalid/api"},
+                   {"id": "s_2", "name": "源二",
+                    "api": "https://b.invalid/api"}]
+
+        async def fake_classes(client, source):
+            return {"code": 1, "class": [
+                {"type_id": 1, "type_name": "动作片"},
+                {"type_id": 2, "type_name": "国产剧"},
+                {"type_id": 3, "type_name": "日本动漫"},
+                {"type_id": 4, "type_name": "大陆综艺"},
+            ]}
+
+        async def fake_probe(client, source, row):
+            return {"source_id": source["id"], "source_name": source["name"],
+                    "api": source["api"], "type_id": str(row["type_id"]),
+                    "type_name": row["type_name"], "pages": 5, "total": 100,
+                    "posters": []}
+
+        with patch("catalog.client_get_classes", new=fake_classes), \
+                patch.object(catalog.catalog, "_probe", new=fake_probe):
+            status = asyncio.run(catalog.catalog.refresh_routes(
+                None, sources, split=True))
+        self.assertIn("s_1:movie", status["routes"])
+        self.assertIn("s_2:variety", status["routes"])
+        self.assertNotIn("movie", status["routes"])
+        self.assertIn("s_1", status["by_source"])
 
 
 if __name__ == "__main__":

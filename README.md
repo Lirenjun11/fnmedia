@@ -44,7 +44,7 @@
 | 内网自建源 | 允许局域网 / 回环的订阅、海报与分片代理 | [docs/limitations.md](docs/limitations.md) |
 | 检查更新红点 | 手动 + 打开页面自动检查，只读不安装 | [docs/update-check.md](docs/update-check.md) |
 | 广告切片过滤 | 按清单文本特征跳过广告分片，默认关闭 | [docs/playback.md](docs/playback.md) |
-| 虚拟媒体库 | 媒体库首页注入榜单四库 + 海量分类四库，可开关 | [docs/virtual-library.md](docs/virtual-library.md) |
+| 虚拟媒体库 | 媒体库首页注入榜单四库 + 海量分类四库，可开关；支持按片源映射（只显示指定源、按分类拆库）并按账号授权过滤 | [docs/virtual-library.md](docs/virtual-library.md) |
 | 账号权限 | 按 fnOS 账号控制可见的虚拟库与可用片源，默认关闭 | [docs/source-acl.md](docs/source-acl.md) |
 
 ## 开发

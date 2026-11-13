@@ -469,12 +469,23 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
     vlib_charts: !!boot.config.vlib_charts,
     vlib_catalog: !!boot.config.vlib_catalog,
     vlib_refresh_hours: Number(boot.config.vlib_refresh_hours ?? 6),
+    vlib_sources: [...(boot.config.vlib_sources || [])],
+    vlib_categories: [...(boot.config.vlib_categories || [])],
+    vlib_split: boot.config.vlib_split || 'source_category',
   });
   const [status, setStatus] = useState(boot.vlib);
   const [busy, setBusy] = useState('');
 
-  const set = (key: keyof typeof form, value: number | boolean) =>
+  const set = (key: keyof typeof form, value: number | boolean | string | string[]) =>
     setForm((current) => ({ ...current, [key]: value }));
+
+  function toggleId(key: 'vlib_sources' | 'vlib_categories', id: string) {
+    setForm((current) => {
+      const cur = current[key];
+      return { ...current, [key]: cur.includes(id)
+        ? cur.filter((x) => x !== id) : [...cur, id] };
+    });
+  }
 
   async function save() {
     setBusy('save');
@@ -484,6 +495,9 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
         vlib_charts: form.vlib_charts,
         vlib_catalog: form.vlib_catalog,
         vlib_refresh_hours: Number(form.vlib_refresh_hours),
+        vlib_sources: form.vlib_sources,
+        vlib_categories: form.vlib_categories,
+        vlib_split: form.vlib_split,
       });
       await refresh();
       setStatus(await api.vlibStatus());
@@ -513,6 +527,7 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
 
   const chartCounts = status?.charts?.counts || {};
   const routes = status?.catalog?.routes || {};
+  const bySource = status?.catalog?.by_source || {};
 
   return (
     <>
@@ -553,6 +568,58 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
                    onChange={(e) => set('vlib_refresh_hours', Number(e.target.value))} />
           </div>
         </div>
+
+        <div className="divider" />
+        <div className="card-title">片源映射</div>
+        <p className="card-sub">
+          不勾选任何片源 = 沿用全部启用源（旧的「榜单四库 + 海量四库」）。勾选后
+          只有选中的源会进入虚拟库；账号只看到自己被授权的源对应的库。
+        </p>
+        <label className="field">映射到虚拟库的片源（不选 = 全部）</label>
+        <div className="grid">
+          {boot.sources.filter((s) => s.enabled).map((s) => (
+            <label key={s.id} className="row" style={{ cursor: 'pointer', gap: 6 }}>
+              <input className="check" type="checkbox"
+                     checked={form.vlib_sources.includes(s.id)}
+                     onChange={() => toggleId('vlib_sources', s.id)} />
+              <span>{s.name || s.id}</span>
+            </label>
+          ))}
+        </div>
+        {boot.sources.filter((s) => s.enabled).length === 0 && (
+          <p className="hint">当前没有启用的片源，请先在「片源配置」启用。</p>
+        )}
+        <label className="field mt">显示分类（不选 = 四类全开）</label>
+        <div className="row">
+          {VLIB_CATS.map((cat) => (
+            <label key={cat.key} className="row" style={{ cursor: 'pointer', gap: 6 }}>
+              <input className="check" type="checkbox"
+                     checked={form.vlib_categories.includes(cat.key)}
+                     onChange={() => toggleId('vlib_categories', cat.key)} />
+              <span>{cat.label}</span>
+            </label>
+          ))}
+        </div>
+        <label className="field mt">库卡片形态</label>
+        <div className="stack">
+          <label className="row" style={{ cursor: 'pointer' }}>
+            <input className="check" type="radio" name="vlib_split"
+                   checked={form.vlib_split === 'source_category'}
+                   onChange={() => set('vlib_split', 'source_category')} />
+            <span>按源 × 分类拆分：每个源生成一组分类库卡片（如「源名 · 电影」）</span>
+          </label>
+          <label className="row" style={{ cursor: 'pointer' }}>
+            <input className="check" type="radio" name="vlib_split"
+                   checked={form.vlib_split === 'category'}
+                   onChange={() => set('vlib_split', 'category')} />
+            <span>只保留 4 张分类库：内容限选中源，卡片数量不变</span>
+          </label>
+        </div>
+        <p className="hint">
+          保存后会在后台立即重建分类路由，稍等片刻重新进入飞牛影视即可看到。
+          卡片数量 = 选中源数 × 显示分类数，建议不超过 6 个源。
+        </p>
+
         <div className="row end mt">
           <button className="btn primary" disabled={!!busy} onClick={() => void save()}>
             {busy === 'save' ? '保存中…' : '保存设置'}
@@ -585,7 +652,31 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
           <p className="hint">榜单错误：{status.charts.last_error}</p>
         )}
         <div className="stack mt">
-          {VLIB_CATS.map((cat) => {
+          {Object.keys(bySource).length > 0 ? (
+            <>
+              <div className="row">
+                <span className="badge ok">榜单四库</span>
+                {VLIB_CATS.map((cat) => (
+                  <span className="badge" key={cat.key}>
+                    {cat.label} {chartCounts[cat.key] ?? 0}
+                  </span>
+                ))}
+              </div>
+              {Object.entries(bySource).map(([sid, cats]) => {
+                const name = status?.mapping?.sources.find((s) => s.id === sid)?.name || sid;
+                return (
+                  <div className="row" key={sid}>
+                    <span className="badge ok">{name}</span>
+                    {VLIB_CATS.filter((c) => cats[c.key]).map((c) => (
+                      <span className="badge" key={c.key}>
+                        {c.label} {cats[c.key].total}
+                      </span>
+                    ))}
+                  </div>
+                );
+              })}
+            </>
+          ) : VLIB_CATS.map((cat) => {
             const route = routes[cat.key];
             return (
               <div className="row" key={cat.key}>

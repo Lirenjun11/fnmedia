@@ -303,8 +303,8 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
                       </td>
                       <td data-label="名称">{s.name}</td>
                       <td className="api" data-label="KEY">{s.key || '—'}</td>
-                      <td className="api" data-label="API" title={s.api}>{s.api}</td>
-                      <td className="api" data-label="DETAIL" title={s.detail || ''}>{s.detail || '—'}</td>
+                      <td className="api" data-label="API 地址" title={s.api}>{s.api}</td>
+                      <td className="api" data-label="DETAIL 地址" title={s.detail || ''}>{s.detail || '—'}</td>
                       <td data-label="状态">
                         <span className={`badge ${s.enabled ? 'ok' : 'warn'}`}>
                           {s.enabled ? '启用中' : '已禁用'}

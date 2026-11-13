@@ -200,13 +200,21 @@ class Catalog:
         return (not self._updated_at) or (time.time() - self._updated_at) >= ROUTE_TTL
 
     def status(self) -> dict:
+        routes: dict[str, dict] = {}
+        by_source: dict[str, dict] = {}
+        for key, row in self._routes.items():
+            info = {"name": row.get("type_name", ""),
+                    "source": row.get("source_name", ""),
+                    "total": self.total(key)}
+            routes[key] = info
+            if ":" in key:
+                sid, _, cat = key.partition(":")
+                by_source.setdefault(sid, {})[cat] = info
         return {
             "updated_at": int(self._updated_at),
             "refreshing": self._refreshing,
-            "routes": {cat: {"name": (self._routes.get(cat) or {}).get("type_name", ""),
-                             "source": (self._routes.get(cat) or {}).get("source_name", ""),
-                             "total": self.total(cat)}
-                       for cat, _, _ in CATALOG_CATEGORIES},
+            "routes": routes,
+            "by_source": by_source,
         }
 
     def reset(self) -> None:
@@ -220,15 +228,20 @@ class Catalog:
 
     # ---------- 路由重建 ----------
     async def refresh_routes(self, client: httpx.AsyncClient,
-                             sources: list[dict]) -> dict:
+                             sources: list[dict], split: bool = False) -> dict:
         if self._refreshing:
             return self.status()
         self._refreshing = True
         self._last_attempt = time.time()
         try:
-            table = await self._discover(client, sources)
+            table = await self._discover(client, sources, split)
             if table:
-                self._routes = table
+                # 两种模式的 key 不能共存：切模式时清掉另一套，避免旧路由
+                # 继续给已经不存在的库供数据。
+                for key in list(self._routes):
+                    if (":" in key) != bool(split):
+                        self._routes.pop(key, None)
+                self._routes.update(table)
                 self._updated_at = time.time()
                 self._pages.clear()
                 self._persist()
@@ -239,15 +252,19 @@ class Catalog:
         return self.status()
 
     async def _discover(self, client: httpx.AsyncClient,
-                        sources: list[dict]) -> dict[str, dict]:
-        classes_by_source: list[tuple[dict, list[dict]]] = []
-        for source in sources[:8]:
+                        sources: list[dict], split: bool = False) -> dict[str, dict]:
+        async def fetch(source: dict):
             payload = await client_get_classes(client, source)
             classes = _classes(payload)
-            if classes:
-                classes_by_source.append((source, classes))
+            return (source, classes) if classes else None
+
+        results = await asyncio.gather(
+            *(fetch(s) for s in sources[:8]), return_exceptions=True)
+        classes_by_source = [row for row in results if isinstance(row, tuple)]
         if not classes_by_source:
             return {}
+        if split:
+            return await self._discover_by_source(client, classes_by_source)
 
         routes: dict[str, dict] = {}
         for cat, _, _ in CATALOG_CATEGORIES:
@@ -268,6 +285,41 @@ class Catalog:
             if best:
                 routes[cat] = best
         return routes
+
+    async def _discover_by_source(self, client,
+                                  classes_by_source) -> dict[str, dict]:
+        """按「源 × 分类」各建一条路由，key 为 ``<源id>:<分类>``。
+
+        每类只探第一个候选子类，并发受限；6 源 × 4 类最多 24 次请求，
+        6 小时一次，不会打爆资源站。
+        """
+        sem = asyncio.Semaphore(8)
+
+        async def probe_one(source, row, sid, cat):
+            async with sem:
+                return sid, cat, await self._probe(client, source, row)
+
+        tasks = []
+        for source, classes in classes_by_source[:6]:
+            sid = str(source.get("id") or "")
+            if not sid:
+                continue
+            for cat, _, _ in CATALOG_CATEGORIES:
+                candidates = [row for row in classes
+                              if bucket_of(str(row.get("type_name") or "")) == cat][:1]
+                for row in candidates:
+                    tasks.append(probe_one(source, row, sid, cat))
+        best: dict[str, dict] = {}
+        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            if not isinstance(result, tuple):
+                continue
+            sid, cat, info = result
+            if not info:
+                continue
+            key = f"{sid}:{cat}"
+            if key not in best or info["total"] > best[key]["total"]:
+                best[key] = info
+        return best
 
     async def _probe(self, client: httpx.AsyncClient, source: dict,
                      row: dict) -> dict | None:

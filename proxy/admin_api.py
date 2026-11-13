@@ -51,9 +51,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.18"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.19"
     except OSError:
-        return "0.0.1.18"
+        return "0.0.1.19"
 
 
 def _public_config() -> dict:
@@ -139,7 +139,15 @@ async def bootstrap(request: Request):
 async def patch_config(request: Request):
     guard(request)
     body = await body_json(request)
-    return ok({"config": {k: v for k, v in config.patch(body).items()
+    result = config.patch(body)
+    # 片源映射变更后立即后台重建路由，不必等 6 小时定时刷新；
+    # 失败保留旧路由，不阻塞管理页保存。
+    if any(k in body for k in ("vlib_sources", "vlib_categories", "vlib_split")):
+        asyncio.create_task(catalog.catalog.refresh_routes(
+            request.app.state.src,
+            vlib.mapped_sources() or config.enabled_sources(),
+            split=vlib.split_by_source()))
+    return ok({"config": {k: v for k, v in result.items()
                           if k != "admin_token"}})
 
 
@@ -560,6 +568,7 @@ async def acl_discover(request: Request):
 
 
 def vlib_status() -> dict:
+    cfg = config.get()
     return {
         "enabled": vlib.enabled(),
         "charts_enabled": vlib.charts_enabled(),
@@ -567,6 +576,15 @@ def vlib_status() -> dict:
         "charts": charts.chart_cache.status(),
         "catalog": catalog.catalog.status(),
         "bindings": vlib.bind_count(),
+        "mapping": {
+            "configured_sources": list(cfg.get("vlib_sources") or []),
+            "sources": [{"id": str(s.get("id") or ""),
+                         "name": str(s.get("name") or "")}
+                        for s in vlib.mapped_sources()],
+            "categories": [row[0] for row in vlib.mapped_categories()],
+            "split": "source_category" if vlib.split_by_source() else "category",
+            "configured_split": str(cfg.get("vlib_split") or "category"),
+        },
     }
 
 
@@ -586,7 +604,9 @@ async def vlib_refresh(request: Request):
     if what in ("all", "charts"):
         await charts.chart_cache.refresh(client)
     if what in ("all", "catalog"):
-        await catalog.catalog.refresh_routes(client, config.enabled_sources())
+        await catalog.catalog.refresh_routes(
+            client, vlib.mapped_sources() or config.enabled_sources(),
+            split=vlib.split_by_source())
     return ok(vlib_status())
 
 

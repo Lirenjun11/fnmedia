@@ -47,6 +47,15 @@ DEFAULTS = {
     "vlib_charts": True,
     "vlib_catalog": True,
     "vlib_refresh_hours": 6,
+    # ---- 虚拟库片源映射（空配置 = 旧行为，零回归）----
+    # vlib_sources:    选中进虚拟库的源 id；空 = 全部启用源（沿用旧 4+4 库）
+    # vlib_categories: 要显示的分类；空 = movie/tv/anime/variety 全开
+    # vlib_split:      category = 4 张分类库（内容限选中源）
+    #                  source_category = 每个「源 × 分类」一张库卡片
+    #                  仅在 vlib_sources 非空时生效，空配置仍是旧 4+4 库
+    "vlib_sources": [],
+    "vlib_categories": [],
+    "vlib_split": "source_category",
     # ---- 账号权限（默认关闭；关闭时全链路短路，行为与旧版一致）----
     # acl_subjects: [{id,name,source}] 授权主体（fnOS 账号）
     # acl_grants:   {uid: {libs: ["chart:movie"], sources: [sid], online: bool}}
@@ -214,6 +223,25 @@ def save(cfg: dict) -> dict:
     clean["sources"] = [s for s in clean["sources"] if isinstance(s, dict) and s.get("api")]
     clean["subscriptions"] = [s for s in clean["subscriptions"]
                               if isinstance(s, dict) and s.get("url")]
+    # 虚拟库映射：源 id 必须真实存在。订阅全量拉取会整体替换 sources[]，
+    # 所以这份映射只能独立存键，不能挂在源对象上。
+    known_ids = {str(s.get("id") or "") for s in clean["sources"]
+                 if s.get("id")}
+    raw_picked = clean["vlib_sources"]
+    if not isinstance(raw_picked, list):
+        raw_picked = []
+    clean["vlib_sources"] = sorted({
+        str(x).strip()[:40] for x in raw_picked[:64]
+        if str(x).strip() and str(x).strip() in known_ids})
+    raw_cats = clean["vlib_categories"]
+    if not isinstance(raw_cats, list):
+        raw_cats = []
+    wanted_cats = {str(x).strip() for x in raw_cats}
+    clean["vlib_categories"] = [
+        c for c in ("movie", "tv", "anime", "variety") if c in wanted_cats]
+    clean["vlib_split"] = ("source_category"
+                           if clean["vlib_split"] == "source_category"
+                           else "category")
     with _LOCK:
         _write(clean)
     return copy.deepcopy(clean)

@@ -48,6 +48,9 @@ export interface Config {
   vlib_charts: boolean;
   vlib_catalog: boolean;
   vlib_refresh_hours: number;
+  vlib_sources: string[];
+  vlib_categories: string[];
+  vlib_split: string;
   acl_enabled: boolean;
   acl_subjects: AclSubject[];
   acl_grants: Record<string, AclGrant>;
@@ -72,6 +75,7 @@ export interface AclLib {
   title: string;
   guid: string;
   kind: string;
+  group?: string;
 }
 
 export interface AclSource {
@@ -158,6 +162,14 @@ export interface VlibStatus {
     refreshing: boolean;
     updated_at: number;
     routes: Record<string, VlibRouteInfo>;
+    by_source?: Record<string, Record<string, VlibRouteInfo>>;
+  };
+  mapping?: {
+    configured_sources: string[];
+    sources: { id: string; name: string }[];
+    categories: string[];
+    split: string;
+    configured_split: string;
   };
 }
 

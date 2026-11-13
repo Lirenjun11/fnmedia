@@ -1,6 +1,6 @@
 {
   "name": "fnmedia-ext-admin",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "private": true,
   "type": "module",
   "description": "fnmedia 管理台静态前端",

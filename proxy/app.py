@@ -75,7 +75,9 @@ async def _vlib_worker(app: FastAPI) -> None:
                         and config.enabled_sources() \
                         and catalog_mod.catalog.stale():
                     await catalog_mod.catalog.refresh_routes(
-                        app.state.src, config.enabled_sources())
+                        app.state.src,
+                        vlib.mapped_sources() or config.enabled_sources(),
+                        split=vlib.split_by_source())
         except asyncio.CancelledError:
             raise
         except Exception as exc:  
