@@ -113,6 +113,21 @@ def _adopt_if_needed(uid: str, bucket: dict) -> None:
     _adopted.add(uid)
 
 
+def referenced_guids() -> set:
+    """所有分区里仍被引用的条目 guid（收藏 / 已看 / 历史）。
+
+    重启恢复 playcache 时据此裁剪：用户删掉的记录不再占缓存，也不会
+    因为缓存残留而“复活”。
+    """
+    load()
+    with _lock:
+        out: set = set()
+        for bucket in _users.values():
+            for name in ("favorites", "watched", "history"):
+                out.update(bucket[name])
+        return out
+
+
 def snapshot() -> dict:
     with _lock:
         return {

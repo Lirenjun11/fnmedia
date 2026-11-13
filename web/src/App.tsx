@@ -116,7 +116,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div>v{boot?.version || '0.0.1.21'} · 零内置源</div>
+          <div>v{boot?.version || '0.0.2.0'} · 零内置源</div>
         </div>
       </aside>
 
@@ -225,7 +225,7 @@ function Overview({ boot, onGo }: { boot: Bootstrap | null; onGo: () => void }) 
       <div className="card">
         <div className="card-title">运行信息</div>
         <div className="pill-row mt">
-          <span className="badge brand">v{boot?.version || '0.0.1.21'}</span>
+          <span className="badge brand">v{boot?.version || '0.0.2.0'}</span>
           <span className="badge">运行 {Math.round((boot?.uptime ?? 0) / 60)} 分钟</span>
           <span className="badge ok">上游接管正常</span>
           {boot?.acl?.enabled ? (

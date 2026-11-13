@@ -26,6 +26,7 @@ import config
 import douban
 import fake
 import hls
+import playcache
 import playstate
 import playstate_api
 import runtime
@@ -109,9 +110,12 @@ async def lifespan(app: FastAPI):
     playstate.load()
     vlib.bind_client(app.state.src)
     restored = vlib.restore(app.state.store)
+    # 内存 store 重启即空，最近播放/收藏要靠落盘缓存恢复，否则列表会全空。
+    played = playcache.restore(app.state.store)
     runtime.log(f"service started, sources={len(config.enabled_sources())} "
                 f"aes_decrypt={'on' if hls.can_decrypt() else 'off'} "
-                f"vlib_charts={charts.chart_cache.total()} restored={restored}")
+                f"vlib_charts={charts.chart_cache.total()} restored={restored} "
+                f"playcache={played}")
     worker = asyncio.create_task(_auto_update_worker())
     vlib_worker = asyncio.create_task(_vlib_worker(app))
     try:

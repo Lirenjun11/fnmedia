@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 import fake
 import hls
+import playcache
 import playstate
 import runtime
 import upstream
@@ -33,6 +34,8 @@ async def _body(request: Request) -> dict:
 
 def _canonical(request: Request, guid: str):
     store = request.app.state.store
+    # 内存条目被淘汰或服务刚重启时，从落盘缓存补回来再反查。
+    playcache.ensure(store, guid)
     ep = store.resolve_episode(guid)
     target = ep[0] if ep else guid
     return store.get(target), target
@@ -58,6 +61,7 @@ async def favorite_add(request: Request):
     if not brief:
         return await _passthrough(request)
     playstate.add_favorite(canonical, brief)
+    playcache.remember(brief)
     return _ok(guid)
 
 
@@ -87,6 +91,7 @@ async def watched_set(request: Request):
         playstate.remove_watched(canonical)
     else:
         playstate.set_watched(canonical)
+        playcache.remember(brief)
     return _ok(guid)
 
 
@@ -117,6 +122,9 @@ async def favorite_list(request: Request):
     cards = []
     for guid in playstate.favorite_guids():
         brief = request.app.state.store.get(guid)
+        if not brief:
+            playcache.ensure(request.app.state.store, guid)
+            brief = request.app.state.store.get(guid)
         if not brief:
             continue
         cards.append(playstate.apply(fake.search_card(brief), guid))
@@ -175,6 +183,7 @@ async def play_record(request: Request):
     playstate.record({**body, "item_guid": canonical,
                       "episode_guid": episode}, brief,
                      float(meta.get("duration") or 0))
+    playcache.remember(brief)
     runtime.log(f"play/record: {brief.get('title', '')[:30]} ep{index + 1} "
                 f"ts={body.get('ts')!r} dur={body.get('duration')!r} "
                 f"keys={','.join(sorted(str(k) for k in body)[:10])}")
@@ -207,11 +216,19 @@ async def play_list(request: Request):
     if not isinstance(local_items, list):
         local_items = []
     cards = []
+    missing = 0
     for guid, rec in playstate.history_records():
         brief = request.app.state.store.get(guid)
         if not brief:
+            playcache.ensure(request.app.state.store, guid)
+            brief = request.app.state.store.get(guid)
+        if not brief:
+            # 源被删除/禁用，或落盘缓存缺失：没有可播放线路，跳过这条。
+            missing += 1
             continue
         cards.append(fake.history_card(brief, rec))
+    if missing:
+        runtime.log(f"play/list: {missing} 条历史无可播放数据（缓存缺失或源已删除）")
     cards.sort(key=lambda row: row.get("_updated_at", 0), reverse=True)
     for row in cards:
         row.pop("_updated_at", None)
