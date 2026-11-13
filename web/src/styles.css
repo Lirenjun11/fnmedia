@@ -335,6 +335,10 @@ input[type=checkbox].check { width: 16px; height: 16px; accent-color: var(--bran
   .card { padding: 16px; }
   h1 { font-size: 20px; }
   .toast { right: 12px; left: 12px; bottom: 82px; max-width: none; }
+  /* iOS 上输入框字号小于 16px 时，聚焦会自动放大整页，且退出后不缩回 */
+  input[type=text], input[type=number], input[type=url], textarea, select {
+    font-size: 16px;
+  }
   /* 触控目标不小于 36~40px，避免手机上点不中 */
   .btn { min-height: 40px; }
   .btn.sm { min-height: 36px; padding: 8px 12px; }

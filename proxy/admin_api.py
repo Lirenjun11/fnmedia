@@ -51,9 +51,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.16"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.1.17"
     except OSError:
-        return "0.0.1.16"
+        return "0.0.1.17"
 
 
 def _public_config() -> dict:
@@ -532,6 +532,24 @@ async def acl_del_subject(uid: str, request: Request):
     acl.invalidate(uid)
     runtime.log(f"acl: del subject {uid} grants={'yes' if dropped else 'no'}")
     return ok(_acl_payload())
+
+
+@router.patch("/ui/theme")
+async def set_ui_theme(request: Request):
+    """记住管理页主题。
+
+    浏览器 localStorage 在飞牛 App 内嵌页/隐私模式下可能不可用，导致
+    「切了主题、下次打开又变回去」。主题存服务端后与设备无关。
+    """
+    guard(request)
+    body = await body_json(request)
+    theme = str(body.get("theme") or "").strip()
+    if theme not in ("light", "dark", "system"):
+        return fail("主题只能是 light / dark / system")
+    cfg = config.get()
+    cfg["ui_theme"] = theme
+    config.save(cfg)
+    return ok({"theme": theme})
 
 
 @router.post("/acl/discover")

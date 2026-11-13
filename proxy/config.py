@@ -20,6 +20,8 @@ DEFAULTS = {
     "update_interval_hours": 24,
     "config_text": "",
     "last_update": 0,
+    # 管理页外观主题：light / dark / system（存服务端，换浏览器/清缓存也记得住）
+    "ui_theme": "system",
     "enabled_limit": 200,
     "search_timeout": 2.5,
     "search_concurrency": 5,
@@ -200,6 +202,8 @@ def save(cfg: dict) -> dict:
     clean["acl_grants"] = _clean_grants(clean["acl_grants"])
     clean["acl_default_visible"] = bool(clean["acl_default_visible"])
     clean["acl_default_online"] = bool(clean["acl_default_online"])
+    if clean.get("ui_theme") not in ("light", "dark", "system"):
+        clean["ui_theme"] = DEFAULTS["ui_theme"]
     raw_keywords = clean["adfilter_keywords"]
     if not isinstance(raw_keywords, list):
         raw_keywords = []

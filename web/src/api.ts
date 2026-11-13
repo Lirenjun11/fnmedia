@@ -25,6 +25,7 @@ export interface Config {
   update_interval_hours: number;
   config_text: string;
   last_update: number;
+  ui_theme: 'light' | 'dark' | 'system';
   enabled_limit: number;
   search_timeout: number;
   search_concurrency: number;
@@ -258,6 +259,8 @@ export const api = {
   bootstrap: () => request<Bootstrap>('/v/api/ext/bootstrap'),
   patchConfig: (value: Partial<Config>) =>
     request<{ config: Config }>('/v/api/ext/config', json('PATCH', value)),
+  setTheme: (theme: 'light' | 'dark' | 'system') =>
+    request<{ theme: string }>('/v/api/ext/ui/theme', json('PATCH', { theme })),
   addSource: (value: { name: string; api: string; key?: string; detail?: string }) =>
     request<{ source: Source }>('/v/api/ext/sources', json('POST', value)),
   batchSources: (ids: string[], action: 'enable' | 'disable' | 'delete') =>

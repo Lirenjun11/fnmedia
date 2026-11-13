@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type Bootstrap, type UpdateInfo } from './api';
+import { syncThemeFromServer } from './theme';
 import SourcesPage from './Sources';
 import SubscriptionsPage from './Subscriptions';
 import PreferencesPage from './Preferences';
@@ -68,6 +69,13 @@ export default function App() {
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { void checkUpdate(); }, [checkUpdate]);
+  // 主题以服务端为准：localStorage 在部分内嵌环境下不可用，只靠本机会「忘」。
+  const themeSynced = useRef(false);
+  useEffect(() => {
+    if (themeSynced.current || !boot) return;
+    themeSynced.current = true;
+    syncThemeFromServer(boot.config.ui_theme);
+  }, [boot]);
   // 手机端底部导航可横向滑动：切页后把当前项滚到可见区域，
   // 否则从深层页面返回时当前标签可能停在屏幕外。
   useEffect(() => {
@@ -108,7 +116,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div>v{boot?.version || '0.0.1.16'} · 零内置源</div>
+          <div>v{boot?.version || '0.0.1.17'} · 零内置源</div>
         </div>
       </aside>
 
@@ -217,7 +225,7 @@ function Overview({ boot, onGo }: { boot: Bootstrap | null; onGo: () => void }) 
       <div className="card">
         <div className="card-title">运行信息</div>
         <div className="pill-row mt">
-          <span className="badge brand">v{boot?.version || '0.0.1.16'}</span>
+          <span className="badge brand">v{boot?.version || '0.0.1.17'}</span>
           <span className="badge">运行 {Math.round((boot?.uptime ?? 0) / 60)} 分钟</span>
           <span className="badge ok">上游接管正常</span>
           {boot?.acl?.enabled ? (

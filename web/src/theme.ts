@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 
+import { api } from './api';
+
 export type Theme = 'light' | 'dark' | 'system';
 
 export const THEME_OPTIONS: { key: Theme; label: string; icon: string }[] = [
@@ -64,5 +66,17 @@ export function useTheme(): [Theme, (theme: Theme) => void] {
     applyTheme(readTheme());
     return onThemeChange(setTheme);
   }, []);
-  return [theme, (next: Theme) => applyTheme(next)];
+  return [theme, (next: Theme) => {
+    applyTheme(next);
+    // 同步存服务端：内嵌 webview / 无痕模式里 localStorage 可能不可用，
+    // 只存本机就会出现「下次打开又变回去」。
+    void api.setTheme(next).catch(() => {});
+  }];
+}
+
+/** 启动时用服务端记住的主题覆盖本机（服务端是权威，跨浏览器一致）。 */
+export function syncThemeFromServer(theme: string | null | undefined): void {
+  if (theme === 'light' || theme === 'dark' || theme === 'system') {
+    applyTheme(theme);
+  }
 }

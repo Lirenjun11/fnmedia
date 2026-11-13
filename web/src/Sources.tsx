@@ -18,6 +18,9 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
   const [keyword, setKeyword] = useState('');
   const [busy, setBusy] = useState('');
   const [form, setForm] = useState({ name: '', key: '', api: '', detail: '' });
+  const [editing, setEditing] = useState<{
+    id: string; name: string; key: string; api: string; detail: string;
+  } | null>(null);
 
   useEffect(() => {
     const valid = new Set(boot.sources.map((s) => s.id));
@@ -118,6 +121,19 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
     });
   }
 
+  async function doSaveEdit() {
+    if (!editing) return;
+    await run('save-edit', async () => {
+      await api.updateSource(editing.id, {
+        name: editing.name.trim(), key: editing.key.trim(),
+        api: editing.api.trim(), detail: editing.detail.trim(),
+      });
+      setEditing(null);
+      notify('视频源已更新', 'ok');
+      await refresh();
+    });
+  }
+
   const field = (key: keyof typeof form, label: string, placeholder: string) => (
     <div className="grow">
       <label className="field">{label}</label>
@@ -208,6 +224,48 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
           </div>
         )}
 
+        {editing && (
+          <div className="modal-overlay" onClick={() => setEditing(null)}>
+            <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-title">编辑视频源</div>
+              <p className="card-sub">
+                改完保存即时生效。仅改名称/KEY/DETAIL 时不影响已授权关系；
+                API 地址可改，但该源的 ID 不会随之变化。
+              </p>
+              <div className="stack">
+                <div>
+                  <label className="field">名称</label>
+                  <input type="text" value={editing.name}
+                         onChange={(e) => setEditing({ ...editing, name: e.target.value })} />
+                </div>
+                <div>
+                  <label className="field">KEY</label>
+                  <input type="text" value={editing.key}
+                         onChange={(e) => setEditing({ ...editing, key: e.target.value })} />
+                </div>
+                <div>
+                  <label className="field">API 地址</label>
+                  <input type="text" value={editing.api}
+                         onChange={(e) => setEditing({ ...editing, api: e.target.value })} />
+                </div>
+                <div>
+                  <label className="field">DETAIL 地址（可选）</label>
+                  <input type="text" value={editing.detail}
+                         onChange={(e) => setEditing({ ...editing, detail: e.target.value })} />
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button className="btn ghost" onClick={() => setEditing(null)}>取消</button>
+                <button className="btn primary"
+                        disabled={busy === 'save-edit' || !editing.api.trim()}
+                        onClick={() => void doSaveEdit()}>
+                  {busy === 'save-edit' ? '保存中…' : '保存'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {boot.sources.length === 0 ? (
           <div className="empty mt">
             <div className="empty-icon">▦</div>
@@ -260,6 +318,11 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
                       </td>
                       <td data-label="操作">
                         <div className="row">
+                          <button className="btn sm ghost"
+                                  onClick={() => setEditing({
+                                    id: s.id, name: s.name, key: s.key || '',
+                                    api: s.api, detail: s.detail || '',
+                                  })}>编辑</button>
                           <button className="btn sm" disabled={busy === `toggle-${s.id}`}
                                   onClick={() => void toggleOne(s.id, !s.enabled)}>
                             {s.enabled ? '禁用' : '启用'}
