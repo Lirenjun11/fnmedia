@@ -184,6 +184,7 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
         adfilter_head_guard: Boolean(form.adfilter_head_guard),
         adfilter_breaks: Boolean(form.adfilter_breaks),
         adfilter_strong: Boolean(form.adfilter_strong),
+        adfilter_preroll: Boolean(form.adfilter_preroll),
         adfilter_keywords: keywords
           .split(/[\n,]/)
           .map((word) => word.trim())
@@ -247,9 +248,19 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
           />
           <span>强证据识别：重复分片 / 极短追踪分片 / 少数派域名</span>
         </label>
+        <label className="row mt" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.adfilter_preroll}
+            onChange={(e) => set('adfilter_preroll', e.target.checked)}
+          />
+          <span>识别片头贴片（正片开头 1–6 片、90 秒内的独立小段）</span>
+        </label>
         <p className="hint mt">
           分段识别按 DISCONTINUITY 把清单切组，仅当某组 3–15 片、3–120 秒、
           且不足最长组 5% 时才判为广告；单组或分组过密的清单不处理。
+          片头贴片单独判定：清单最前面 1–6 片、合计 90 秒内，且与正文之间有
+          DISCONTINUITY、域名/目录切换或时长突变任一条依据，才整段删除；
+          正片剩余不足 90 秒或贴片占比超过 20% 时不动。
           强证据为无条件自动推断，误判风险同源，故与分段识别分开独立开关；
           若某源会循环复用正片分片，单独关掉它即可。
           删除广告段后清理其出口处残留的 DISCONTINUITY 标签，正片内部合法切换保留。
@@ -312,10 +323,16 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
                 <div className="row mt">
                   <span className="small">
                     命中：标记 {item.by_marker} / 关键字 {item.by_keyword} / 片头 {item.by_head} /
-                    分段 {item.by_break} / 重复 {item.by_duplicate} / 极短 {item.by_tiny} /
-                    少数域名 {item.by_minority} / 清理标记 {item.disc_cleaned}
+                    分段 {item.by_break} / 贴片 {item.by_preroll} / 重复 {item.by_duplicate} /
+                    极短 {item.by_tiny} / 少数域名 {item.by_minority} / 清理标记 {item.disc_cleaned}
                   </span>
                 </div>
+                {item.preroll && (
+                  <p className="hint">
+                    片头贴片依据：{item.preroll === 'discontinuity' ? '片头分组边界'
+                      : item.preroll === 'stream' ? '域名/目录切换' : '时长突变'}
+                  </p>
+                )}
                 {(item.groups || []).length > 1 && (
                   <p className="hint">
                     分组：

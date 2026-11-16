@@ -38,6 +38,17 @@ _AD_MIN_GROUP_SEGMENTS = 3
 _AD_MAX_GROUP_SEGMENTS = 15
 _AD_MIN_GROUP_DURATION = 3.0
 _AD_MAX_GROUP_DURATION = 120.0
+# 片头贴片：清单最前面那一小段（1–6 片、<=90 秒），后面才是正文。
+# 分段规则要求至少 3 片，单条 15/30 秒的贴片永远轮不到它，所以单独判定。
+_AD_PREROLL_MAX_SEGMENTS = 6
+_AD_PREROLL_MAX_DURATION = 90.0
+_AD_PREROLL_MAX_RATIO = 0.20
+_AD_PREROLL_MIN_SEGMENTS = 12
+_AD_PREROLL_MIN_TOTAL = 180.0
+_AD_PREROLL_MIN_TAIL = 90.0
+_AD_PREROLL_SHAPE_GAP = 0.4
+_AD_PREROLL_SHAPE_STRONG = 1.0
+_AD_PREROLL_SHAPE_RESUME = 0.35
 _AD_MAX_GROUP_RELATIVE = 0.05
 _AD_PREVIEWS: deque = deque(maxlen=5)
 
@@ -70,13 +81,14 @@ def ad_rules() -> dict:
         "head_guard": bool(cfg.get("adfilter_head_guard", True)),
         "breaks": bool(cfg.get("adfilter_breaks", True)),
         "strong": bool(cfg.get("adfilter_strong", True)),
+        "preroll": bool(cfg.get("adfilter_preroll", True)),
     }
 
 
 def ad_rules_active(rules: dict) -> bool:
     return bool(rules["enabled"] and (
         rules["markers"] or rules["keywords"] or rules["head_skip"] > 0
-        or rules["breaks"] or rules["strong"]))
+        or rules["breaks"] or rules["strong"] or rules["preroll"]))
 
 
 def _same_stream(left: str, right: str) -> bool:
@@ -115,6 +127,108 @@ def _group_summary(records: list[dict]) -> dict[int, dict]:
     return groups
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    mid = len(ordered) // 2
+    return (ordered[mid] if len(ordered) % 2
+            else (ordered[mid - 1] + ordered[mid]) / 2)
+
+
+def _stream_key(url: str) -> tuple[str, str, str]:
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "", "", ""
+    return parts.scheme, parts.netloc.lower(), parts.path.rsplit("/", 1)[0]
+
+
+def _preroll_head_end(records: list[dict], total_duration: float) -> tuple[int, str]:
+    """片头贴片结束于第几段，以及依据了哪种证据（0 表示没找到）。
+
+    只有「位置边界」加「时长形态」两条独立证据同时成立才认定，避免把
+    正片自己的分段边界当成广告：贴片通常是独立文件（15/30 秒），时长
+    与正片切片（常见 6–10 秒）明显不同，正片接上时又回到统一时长。
+    没有边界时只接受更极端的时长突变（差 1 倍以上）。
+    """
+    limit = min(_AD_PREROLL_MAX_SEGMENTS, len(records) - 3)
+    if limit < 1:
+        return 0, ""
+
+    def body_median(end: int) -> float:
+        return _median([rec["duration"] for rec in records[end:]
+                        if rec["duration"] > 0])
+
+    def head_deviation(end: int) -> float:
+        durations = [rec["duration"] for rec in records[:end] if rec["duration"] > 0]
+        median = body_median(end)
+        if median <= 0 or not durations:
+            return 0.0
+        return abs(sum(durations) / len(durations) - median) / median
+
+    def resumes_at(end: int) -> bool:
+        if end >= len(records):
+            return False
+        duration, median = records[end]["duration"], body_median(end)
+        return (duration > 0 and median > 0
+                and abs(duration - median) / median <= _AD_PREROLL_SHAPE_RESUME)
+
+    def shaped(end: int) -> bool:
+        return head_deviation(end) >= _AD_PREROLL_SHAPE_GAP and resumes_at(end)
+
+    streams = [_stream_key(rec["abs"]) for rec in records]
+    for index in range(1, limit + 1):
+        if records[index]["group"] != records[0]["group"]:
+            return (index, "discontinuity") if shaped(index) else (0, "")
+    for index in range(1, limit + 1):
+        head_streams = set(streams[:index])
+        if len(head_streams) != 1:
+            break
+        only_head = head_streams.pop()
+        if all(stream != only_head for stream in streams[index:]) and shaped(index):
+            return index, "stream"
+    # 没有边界时只看时长形态：开头几段异常、随后立刻回到正文统一时长。
+    if len(records) < 24 or total_duration < _AD_PREROLL_MIN_TOTAL:
+        return 0, ""
+    median = _median([rec["duration"] for rec in records[limit:]
+                      if rec["duration"] > 0])
+    if median <= 0:
+        return 0, ""
+    run = 0
+    for rec in records[:limit]:
+        duration = rec["duration"]
+        if duration > 0 and abs(duration - median) / median >= _AD_PREROLL_SHAPE_STRONG:
+            run += 1
+        else:
+            break
+    if 1 <= run <= 3 and resumes_at(run):
+        return run, "duration"
+    return 0, ""
+
+
+def _mark_preroll(records: list[dict], total_duration: float, stats: dict) -> None:
+    """把片头贴片标成 ``preroll``；命中后其它规则不再重复计数。"""
+    if len(records) < _AD_PREROLL_MIN_SEGMENTS or total_duration < _AD_PREROLL_MIN_TOTAL:
+        return
+    end, why = _preroll_head_end(records, total_duration)
+    if not end:
+        return
+    head = records[:end]
+    if any(rec["reason"] for rec in head):
+        return  # 标记 / 关键字已经命中，交给更可靠的证据计数
+    head_duration = sum(rec["duration"] for rec in head)
+    if not (1.0 <= head_duration <= _AD_PREROLL_MAX_DURATION):
+        return
+    if head_duration / total_duration > _AD_PREROLL_MAX_RATIO:
+        return
+    if total_duration - head_duration < _AD_PREROLL_MIN_TAIL:
+        return
+    for rec in head:
+        rec["reason"] = "preroll"
+    stats["preroll"] = why
+
+
 def strip_ads(text: str, base_url: str = "",
               rules: dict | None = None) -> tuple[str, dict]:
     """Drop ad segments from a media playlist, keeping AES-128 indexes intact.
@@ -127,8 +241,9 @@ def strip_ads(text: str, base_url: str = "",
     stats = {"removed": 0, "removed_duration": 0.0, "kept_duration": 0.0,
              "total_duration": 0.0, "by_marker": 0, "by_keyword": 0,
              "by_head": 0, "by_break": 0, "by_duplicate": 0, "by_tiny": 0,
-             "by_minority": 0, "guard_kept": 0, "guard": "", "sample": "",
-             "dropped": [], "groups": [], "disc_cleaned": 0}
+             "by_minority": 0, "by_preroll": 0, "guard_kept": 0, "guard": "",
+             "preroll": "", "sample": "", "dropped": [], "groups": [],
+             "disc_cleaned": 0}
     lines = text.splitlines()
     total_duration = sum(_extinf_duration(row) for row in lines)
     stats["total_duration"] = total_duration
@@ -252,6 +367,10 @@ def strip_ads(text: str, base_url: str = "",
                     stats["guard_kept"] += 1
             if stats["guard_kept"] and not stats["guard"]:
                 stats["guard"] = "head-only suspect segments kept"
+
+    # 片头贴片兜底：单独一条 15/30 秒的贴片凑不满分段规则的最少 3 片。
+    if rules["preroll"]:
+        _mark_preroll(records, total_duration, stats)
 
     removed = [rec for rec in records if rec["reason"]]
     removed_duration = sum(rec["duration"] for rec in removed)
@@ -543,9 +662,10 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                 f"hits=m{ad_stats['by_marker']}/k{ad_stats['by_keyword']}/"
                 f"h{ad_stats['by_head']}/b{ad_stats['by_break']}/"
                 f"d{ad_stats['by_duplicate']}/t{ad_stats['by_tiny']}/"
-                f"o{ad_stats['by_minority']} "
+                f"o{ad_stats['by_minority']}/p{ad_stats['by_preroll']} "
                 f"guard={ad_stats['guard'] or '-'} "
                 f"guarded={ad_stats['guard_kept']} "
+                f"preroll={ad_stats['preroll'] or '-'} "
                 f"disc={ad_stats['disc_cleaned']} "
                 f"sample={ad_stats['sample'][:80]}")
             _AD_PREVIEWS.append({
@@ -561,6 +681,8 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                 "by_duplicate": ad_stats["by_duplicate"],
                 "by_tiny": ad_stats["by_tiny"],
                 "by_minority": ad_stats["by_minority"],
+                "by_preroll": ad_stats["by_preroll"],
+                "preroll": ad_stats["preroll"],
                 "groups": ad_stats["groups"],
                 "disc_cleaned": ad_stats["disc_cleaned"],
                 "guard": ad_stats["guard"],

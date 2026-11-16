@@ -86,7 +86,7 @@ def reset(**overrides):
     cfg.update({"adfilter_enabled": False, "adfilter_markers": True,
                 "adfilter_keywords": [], "adfilter_head_skip": 0.0,
                 "adfilter_head_guard": True, "adfilter_breaks": True,
-                "adfilter_strong": True})
+                "adfilter_strong": True, "adfilter_preroll": True})
     cfg.update(overrides)
     config.save(cfg)
 
@@ -455,6 +455,101 @@ https://cdn.example.com/vod/c3.ts
         self.assertEqual(stats["removed"], 0)
         self.assertEqual(stats["disc_cleaned"], 0)
         self.assertEqual(text.count("#EXT-X-DISCONTINUITY"), 1)
+
+
+def preroll_playlist(head, body, *, boundary=True, body_prefix="vod"):
+    """head / body 是 [(片数, 时长, 目录)] 的列表，默认中间插 DISCONTINUITY。"""
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:30",
+             "#EXT-X-MEDIA-SEQUENCE:0"]
+    idx = 0
+    for position, group in enumerate([head, body]):
+        if position and boundary:
+            lines.append("#EXT-X-DISCONTINUITY")
+        for count, duration, folder in group:
+            for _ in range(count):
+                lines.append(f"#EXTINF:{duration:.1f},")
+                lines.append(f"https://cdn.example.com/{folder}/s{idx}.ts")
+                idx += 1
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
+
+
+class PrerollTest(unittest.TestCase):
+    """片头贴片：单条 15/30 秒的贴片凑不满分段规则要求的最少 3 片。"""
+
+    def setUp(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0)
+
+    def tearDown(self):
+        reset()
+
+    def test_single_ad_before_discontinuity_is_removed(self):
+        playlist = preroll_playlist([(1, 15.0, "vod")],
+                                    [(30, 10.0, "vod")])
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 1)
+        self.assertEqual(stats["by_preroll"], 1)
+        self.assertEqual(stats["preroll"], "discontinuity")
+        self.assertNotIn("s0.ts", text)
+        self.assertIn("s1.ts", text)
+
+    def test_two_same_directory_ads_are_removed(self):
+        playlist = preroll_playlist([(2, 30.0, "vod")],
+                                    [(30, 10.0, "vod")])
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_preroll"], 2)
+        self.assertEqual(stats["removed_duration"], 60.0)
+
+    def test_ad_only_directory_switch_is_removed(self):
+        playlist = preroll_playlist([(1, 15.0, "preroll")],
+                                    [(30, 10.0, "vod")], boundary=False)
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_preroll"], 1)
+        self.assertEqual(stats["preroll"], "stream")
+
+    def test_duration_shape_without_boundary_is_removed(self):
+        playlist = preroll_playlist([(2, 30.0, "vod")],
+                                    [(45, 6.0, "vod")], boundary=False)
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_preroll"], 2)
+        self.assertEqual(stats["preroll"], "duration")
+
+    def test_content_part_boundary_is_left_alone(self):
+        """正片自己的分段边界（时长一致）不能被当成贴片。"""
+        playlist = preroll_playlist([(30, 10.0, "vod")],
+                                    [(30, 10.0, "vod")])
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 0)
+        self.assertEqual(stats["by_preroll"], 0)
+        self.assertEqual(text, playlist)
+
+    def test_oversized_head_is_left_alone(self):
+        """贴片占比过高（90 秒贴片 / 290 秒总量）时不动。"""
+        playlist = preroll_playlist([(3, 30.0, "vod")],
+                                    [(20, 10.0, "vod")])
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 0)
+
+    def test_preroll_switch_can_be_disabled(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0,
+              adfilter_preroll=False)
+        playlist = preroll_playlist([(1, 15.0, "vod")],
+                                    [(30, 10.0, "vod")])
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_preroll"], 0)
+        self.assertEqual(text, playlist)
+
+    def test_preroll_is_exposed_in_preview(self):
+        playlist = preroll_playlist([(1, 15.0, "vod")],
+                                    [(30, 10.0, "vod")])
+        hls._AD_PREVIEWS.clear()
+        hls.rewrite_playlist(playlist, BASE, SEG_PREFIX)
+        item = hls.recent_ad_previews(1)[0]
+        self.assertEqual(item["by_preroll"], 1)
+        self.assertEqual(item["preroll"], "discontinuity")
+        self.assertEqual(item["dropped"][0]["reason"], "preroll")
 
 
 if __name__ == "__main__":
