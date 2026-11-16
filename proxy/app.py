@@ -488,6 +488,11 @@ async def _item_title_detail(brief: dict, guid: str, request: Request):
         except Exception as exc:
             runtime.log(f"tmdb enrich error: {type(exc).__name__}")
     detail = fake.detail_item(brief, meta)
+    if not brief.get("lines"):
+        # 补不出线路（源站不可达 / 该部署只有 JS 源）：明确标成不可播，
+        # 免得客户端显示一个点了没反应的播放按钮。
+        detail.update({"can_play": 0, "status": "暂无片源",
+                       "play_error": "暂无在线片源"})
     borrowed = False
     if config.get().get("borrow_official", True):
         try:
@@ -1011,6 +1016,9 @@ async def media_range_route(file_hash: str, request: Request):
     if not picked:
         return Response(status_code=404)
     url = picked[0]
+    if not str(url).startswith(("http://", "https://")):
+        # 红果 JS 源占位地址：明确失败，不要当 HLS 去解析。
+        return Response(status_code=404)
     is_hls = not _is_direct_media(url)
     runtime.log(f"media/range takeover: {brief.get('title', '')[:30]} "
                 f"ep{index + 1} line{line} -> {'hls' if is_hls else 'direct'}")
@@ -1053,6 +1061,10 @@ async def play_play(request: Request):
     if not picked:
         return _err("该片暂无可用播放线路", 404)
     url, _ = picked
+    if not str(url).startswith(("http://", "https://")):
+        # 红果 JS 源的占位地址（hgplay://）：本扩展只接管内置源，
+        # 直接给明确提示，别让客户端拿到一个必然失败的地址。
+        return _err("该线路暂不支持，请在红果服务里切换内置源", 404)
     is_hls = not _is_direct_media(url)
     suffix = "preset.m3u8" if is_hls else "direct"
     link = f"{ONLINE}/{mg}/{suffix}?line={line}&index={index}"

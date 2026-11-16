@@ -38,9 +38,11 @@ CATALOG_CATEGORIES = [
     ("variety", "🎤海量综艺", "Mix"),
 ]
 
-# 脏类：命中即不参与分类归并（解说/预告/福利/短剧等）。
+# 脏类：命中即不参与分类归并（解说/预告/福利等）。
+# 注意「短剧」不是脏类：它同时是合法的剧集分类（红果之类源的主分类），
+# 列在 _TV_WORDS 里，放进来会让这类源的主库被默认过滤掉。
 _JUNK_WORDS = ("伦理", "福利", "写真", "情色", "成人", "三级", "里番",
-               "解说", "预告", "花絮", "短剧", "体育", "赛事", "直播",
+               "解说", "预告", "花絮", "体育", "赛事", "直播",
                "游戏", "记录片解说", "综艺解说", "动漫解说", "电影解说")
 
 _ANIME_WORDS = ("动漫", "动画", "番剧", "国漫", "日漫", "里番")
@@ -551,6 +553,9 @@ class Catalog:
                   "api": route["api"],
                   "kind": route.get("kind") or ""}
         if hongguo.enabled(source):
+            # 路由里只持久化了 id/名称，口令不在其中；翻页要取回完整源配置，
+            # 否则设了 TOKEN 的部署会 401，库里看起来一片空白。
+            source = hongguo.find_source(str(source["id"])) or source
             titles = await hongguo.page_titles(client, source,
                                                str(route["type_id"]), page)
         else:

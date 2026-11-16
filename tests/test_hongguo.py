@@ -1,5 +1,6 @@
 import _bootstrap
 import asyncio
+import json
 import unittest
 from unittest.mock import patch
 
@@ -259,6 +260,88 @@ class HongguoIntegrationTest(unittest.TestCase):
         self.assertEqual(out["episodes"], 2)
         url, _ = appmod._pick(out, 0, 1)
         self.assertIn("/api/stream/9002", url)
+
+    def test_pending_brief_still_reaches_detail_when_acl_on(self):
+        """ACL 开启时，没有分集的条目不能被判成失效。
+
+        否则详情请求会落回官方透传，客户端显示「该影片已被移除」——
+        这是「分类能进去、点进去就报错」的直接原因。
+        """
+        import acl
+        import app as appmod
+
+        cfg = config.get()
+        orig = {k: cfg.get(k) for k in
+                ("acl_enabled", "acl_grants", "acl_default_visible",
+                 "acl_default_online")}
+        cfg.update({"acl_enabled": True, "acl_grants": {},
+                    "acl_default_visible": True, "acl_default_online": True})
+        config.save(cfg)
+        acl.invalidate()
+        token = acl.push(acl.Identity(uid="u1", name="u1", via="session"))
+        try:
+            store = cms.TitleStore()
+            brief = {"guid": "k" * 32, "provider": "hg_test", "vod_id": "100",
+                     "title": "示例短剧", "lines": {}, "line_names": [],
+                     "episodes": 0, "is_tv": True, "poster": "", "overview": ""}
+            store.put_brief(brief)
+            self.assertIsNotNone(appmod._brief(store, "k" * 32))
+        finally:
+            acl.reset(token)
+            cfg.update(orig)
+            config.save(cfg)
+            acl.invalidate()
+
+    def test_catalog_page_reads_token_from_live_source(self):
+        """路由只存 id/名称，翻页必须取回完整源配置，否则 TOKEN 部署会 401。"""
+        cfg = config.get()
+        cfg["sources"] = [dict(SOURCE, token="t0ken")]
+        config.save(cfg)
+        seen = {}
+
+        async def fake_page(client, source, tid, page=1):
+            seen["token"] = source.get("token")
+            return []
+
+        route = {"api": "http://hg.invalid:8787/", "type_id": "1",
+                 "source_id": "hg_test", "source_name": "红果",
+                 "kind": "hongguo", "total": 0}
+        with patch.object(hongguo, "page_titles", new=fake_page):
+            asyncio.run(catalog.catalog._page(None, route, 7))
+        self.assertEqual(seen.get("token"), "t0ken")
+
+    def test_item_detail_returns_playable_lines_for_pending_card(self):
+        """分类卡片点进详情：ACL 开启也要补出分集，不能落回官方透传。"""
+        import acl
+        import app as appmod
+        from types import SimpleNamespace
+
+        cfg = config.get()
+        orig = {k: cfg.get(k) for k in
+                ("sources", "acl_enabled", "acl_grants",
+                 "acl_default_visible", "acl_default_online")}
+        cfg.update({"sources": [dict(SOURCE)], "acl_enabled": True,
+                    "acl_grants": {}, "acl_default_visible": True,
+                    "acl_default_online": True})
+        config.save(cfg)
+        acl.invalidate()
+        try:
+            store = cms.TitleStore()
+            guid = store.remember(hongguo.titles(SOURCE, HOME["items"]))[0]["guid"]
+            client = FakeClient({"/api/detail": DETAIL})
+            request = SimpleNamespace(
+                headers={}, query_params={},
+                app=SimpleNamespace(state=SimpleNamespace(
+                    src=client, store=store, poster=None)))
+            resp = asyncio.run(appmod.item_detail(guid, request))
+            data = json.loads(bytes(resp.body))["data"]
+            self.assertEqual(data["title"], "示例短剧")
+            self.assertEqual(data["can_play"], 1)
+            self.assertEqual(data["number_of_episodes"], 2)
+        finally:
+            cfg.update(orig)
+            config.save(cfg)
+            acl.invalidate()
 
     def test_merge_keeps_pending_source_as_separate_card(self):
         """红果卡没有播放地址，不能被同名 CMS 卡合并吃掉。"""

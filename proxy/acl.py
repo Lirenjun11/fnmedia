@@ -645,6 +645,16 @@ def filter_brief(brief: dict | None, enforce: bool = True) -> dict | None:
         mapping = {}
     lines = brief.get("lines") or {}
     names = [str(n) for n in (brief.get("line_names") or []) if n]
+    if not lines and not names:
+        # 「只有标题、还没有分集」的条目：红果等源要再查一次详情才有线路。
+        # 这里判成无可用线路会让详情/起播落回官方透传（客户端看到
+        # 「该影片已被移除」），所以只校验来源本身，线路留给详情补齐。
+        src = str(brief.get("provider") or "")
+        if not config.source_live(src):
+            return None
+        if allow is not None and src not in allow:
+            return None
+        return brief
     keep: list[str] = []
     for name in names:
         src = str(mapping.get(name) or brief.get("provider") or "")

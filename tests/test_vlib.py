@@ -94,7 +94,10 @@ class VlibTest(unittest.TestCase):
         self.assertEqual(catalog.bucket_of("大陆综艺"), "variety")
         self.assertIsNone(catalog.bucket_of("电影解说"))
         self.assertIsNone(catalog.bucket_of("伦理片"))
-        self.assertIsNone(catalog.bucket_of("短剧"))
+        # 「短剧」是合法剧集分类（红果这类源的主分类），不能当脏类过滤掉。
+        self.assertEqual(catalog.bucket_of("短剧"), "tv")
+        self.assertFalse(catalog.is_junk("短剧"))
+        self.assertTrue(catalog.is_junk("福利片"))
 
     # ---------------------------------------------------------- 媒体库列表
     def test_mediadb_list_injects_libraries_and_keeps_local(self):

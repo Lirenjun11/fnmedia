@@ -24,8 +24,10 @@ class FakeRequest:
 
 
 def brief_of(*, provider="s_1", lines=None, mapping=None, names=None):
-    lines = lines or {"L1": [{"url": "https://a.invalid/1.m3u8"}]}
-    names = names or list(lines)
+    if lines is None:
+        lines = {"L1": [{"url": "https://a.invalid/1.m3u8"}]}
+    if names is None:
+        names = list(lines)
     data = {
         "guid": "g1", "provider": provider, "provider_name": provider,
         "title": "测试片", "lines": lines, "line_names": names,
@@ -170,6 +172,42 @@ class AclTest(unittest.TestCase):
         try:
             # 未授权 s_1 且没有线路映射：整条不可用。
             self.assertIsNone(acl.filter_brief(brief_of(provider="s_1")))
+        finally:
+            acl.reset(token)
+
+    def test_brief_without_lines_is_not_dropped(self):
+        """还没有分集的条目（红果要再查详情）不能判成无片源。
+
+        原来 filter_brief 见不到线路就返回 None，详情请求直接落回官方透传，
+        客户端显示「该影片已被移除」。
+        """
+        self.enable(grants={})
+        token = self.as_user("u1")
+        try:
+            pending = brief_of(provider="s_1", lines={}, names=[])
+            kept = acl.filter_brief(pending)
+            self.assertIs(kept, pending)
+            self.assertIsNotNone(acl.filter_brief(brief_of(provider="s_1")))
+        finally:
+            acl.reset(token)
+
+    def test_pending_brief_respects_source_grants(self):
+        """没有线路也要按源授权裁剪：未授权源照样整条不可用。"""
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_2"]}})
+        token = self.as_user("u1")
+        try:
+            self.assertIsNone(
+                acl.filter_brief(brief_of(provider="s_1", lines={}, names=[])))
+        finally:
+            acl.reset(token)
+
+    def test_pending_brief_dies_with_disabled_source(self):
+        """源被禁用后，即使条目还没补线路也必须失效。"""
+        self.enable(grants={})
+        token = self.as_user("u1")
+        try:
+            self.assertIsNone(
+                acl.filter_brief(brief_of(provider="s_3", lines={}, names=[])))
         finally:
             acl.reset(token)
 
