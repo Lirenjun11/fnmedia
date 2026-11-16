@@ -27,6 +27,7 @@ import config
 import douban
 import fake
 import hls
+import hongguo
 import playcache
 import playstate
 import playstate_api
@@ -76,15 +77,23 @@ async def _vlib_worker(app: FastAPI) -> None:
                     await charts.chart_cache.refresh(app.state.src)
                 if cfg.get("vlib_catalog", True) \
                         and config.enabled_sources() \
-                        and (catalog_mod.catalog.stale()
+                        and (catalog_mod.catalog.stale(interval)
                              or (vlib.split_by_source()
-                                 and catalog_mod.catalog.legacy_routes())):
-                    # 从 0.0.1.19 升级时旧路由是 <sid>:movie，按源拆库后
-                    # 查 <sid>:<type_id> 会全部落空，启动时强制重建一次。
-                    await catalog_mod.catalog.refresh_routes(
+                                 and (catalog_mod.catalog.legacy_routes()
+                                      or catalog_mod.catalog
+                                      .missing_split_routes(
+                                          vlib.mapped_sources())))):
+                    # 两种「配置要求拆库但路由不是拆库形态」的现场都要重建：
+                    # 1) 旧版留下 <sid>:movie 键；2) 路由表整个还是四大类
+                    #    <cat>（升级/清缓存后常见），不重建客户端就只剩榜单
+                    #    四库，海量库全部消失。
+                    built = await catalog_mod.catalog.refresh_routes(
                         app.state.src,
                         vlib.mapped_sources() or config.enabled_sources(),
                         split=vlib.split_by_source())
+                    runtime.log("catalog rebuilt: "
+                                f"routes={len(built.get('routes') or {})} "
+                                f"split={vlib.split_by_source()}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  
@@ -298,6 +307,9 @@ _DIRECT_EXT = (".mp4", ".mkv", ".flv", ".mov", ".m4v", ".webm", ".avi")
 def _is_direct_media(url: str) -> bool:
     """只有明确是视频文件才是直链；分享页/未知地址按 HLS 处理。"""
     path = str(url or "").split("?", 1)[0].lower()
+    # 红果服务的分集流是 /api/stream/<id>，没有扩展名但确实是 MP4（支持 Range）。
+    if hongguo.STREAM_MARK in path:
+        return True
     return ".m3u8" not in path and path.endswith(_DIRECT_EXT)
 
 
@@ -466,6 +478,8 @@ async def item_detail(guid: str, request: Request):
 
 
 async def _item_title_detail(brief: dict, guid: str, request: Request):
+    # 红果类条目：详情接口才有分集，标题详情页是补线路的最佳时机。
+    brief = await _hg_brief(request, brief) or brief
     # TMDB 命中缓存立即用；未命中最多等 1 秒，超时先返回源站数据，后台继续补。
     meta = None
     if tmdb.enabled():
@@ -688,6 +702,26 @@ def _brief(store: cms.TitleStore, guid: str, enforce: bool = True) -> dict | Non
     return acl.filter_brief(store.get(guid), enforce=enforce)
 
 
+async def _hg_brief(request: Request, brief: dict | None) -> dict | None:
+    """红果类条目补播放地址。
+
+    搜索结果与分类列表本身不带分集地址（要再查一次详情），所以在详情页、
+    起播、分片这三条入口统一补一次；补完写回 store，后续请求直接命中。
+    """
+    if not brief or brief.get("lines"):
+        return brief
+    source = hongguo.find_source(str(brief.get("provider") or ""))
+    if not hongguo.enabled(source):
+        return brief
+    try:
+        updated = await hongguo.ensure_lines(
+            request.app.state.src, request.app.state.store, brief)
+    except Exception as exc:  # noqa: BLE001 - 补失败保留原条目
+        runtime.log(f"hongguo ensure error: {type(exc).__name__}")
+        return brief
+    return updated or brief
+
+
 def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
     ep = store.resolve_episode(guid)
     if ep:
@@ -876,6 +910,7 @@ async def play_info_route(request: Request):
         brief = _brief(store, guid)
         if not brief:
             return await _passthrough(request)
+        brief = await _hg_brief(request, brief) or brief
         index = ref["index"]
         info = fake.episode_play_info(brief, index, ref["episode"])
         canonical = guid
@@ -883,6 +918,7 @@ async def play_info_route(request: Request):
         brief = _brief(store, guid)
         if not brief:
             return await _passthrough(request)
+        brief = await _hg_brief(request, brief) or brief
         if brief.get("is_tv"):
             # 整部剧点播放：解析到续播集，播放器才有“下一集/选集”身份。
             index = _resume_index(store, guid)
@@ -922,6 +958,7 @@ async def stream_post(request: Request):
     brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
+    brief = await _hg_brief(request, brief) or brief
     line = _line_from_body(brief, body)
     meta = hls.get_playlist_meta((guid, line, index))
     data = fake.stream_payload(
@@ -968,6 +1005,7 @@ async def media_range_route(file_hash: str, request: Request):
     brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
+    brief = await _hg_brief(request, brief) or brief
     line, explicit = _range_selection(request, brief)
     picked = _pick(brief, line, index)
     if not picked:
@@ -1002,6 +1040,7 @@ async def play_play(request: Request):
     brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
+    brief = await _hg_brief(request, brief) or brief
     explicit = any(body.get(k) for k in
                    ("bitrate", "line", "direct_link_quality_index"))
     line = _line_from_body(brief, body)

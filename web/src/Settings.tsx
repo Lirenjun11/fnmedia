@@ -645,7 +645,7 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
         </p>
         <div className="grid mt">
           <div>
-            <label className="field">刷新间隔（小时，1 – 24）</label>
+            <label className="field">刷新间隔（小时，1 – 24，榜单与分类库共用）</label>
             <input type="number" min="1" max="24" value={form.vlib_refresh_hours}
                    onChange={(e) => set('vlib_refresh_hours', Number(e.target.value))} />
           </div>
@@ -847,6 +847,11 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
           虚拟库只在本扩展内伪造媒体库条目，不改官方数据库、不写官方影视数据。
           榜单条目本身不是片源，点开时才按片名搜索你配置的资源站；海量库条目来自
           资源站公开分类接口。停用扩展或关闭总开关后，媒体库首页立即恢复官方原样。
+        </p>
+        <p className="small">
+          资源站新增影片后，点进库里翻页会立刻看到（页数据只缓存 10 分钟）；
+          但库卡片上的「数量 / 封面」是上次扫描的快照，要等刷新间隔到点或点
+          「立即刷新榜单与分类」才会重新统计。
         </p>
       </section>
     </>

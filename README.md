@@ -33,6 +33,10 @@
 
 订阅不可达时可在「配置内容」粘贴订阅文本离线导入；完整备份用「关于」页的导出 / 导入。
 
+自托管的 [hongguo-web](https://github.com/kid941005/hongguo-web) 不走订阅：在
+「片源配置 → 添加红果服务」填部署地址（默认端口 8787，有 `TOKEN` 就一并填），
+校验 `/health` 通过后即作为普通片源参与搜索、详情、播放与虚拟库源映射。
+
 ## 功能速览
 
 | 功能 | 说明 | 详细文档 |
@@ -43,6 +47,7 @@
 | 起播竞速与换线 | 3s 并发优选最快线路，失败自动切换 | [docs/playback.md](docs/playback.md) |
 | 手机 App 播放兜底 | 修复手机端「文件权限不足」403 | [docs/playback.md](docs/playback.md) |
 | 内网自建源 | 允许局域网 / 回环的订阅、海报与分片代理 | [docs/limitations.md](docs/limitations.md) |
+| 自托管红果服务 | 录入 hongguo-web 部署地址当片源用：搜索、详情、分集播放、账号授权与虚拟库按源建库 | 见「片源配置」页 |
 | 检查更新红点 | 手动 + 打开页面自动检查，只读不安装 | [docs/update-check.md](docs/update-check.md) |
 | 广告切片过滤 | 按清单文本特征跳过广告分片，默认关闭 | [docs/playback.md](docs/playback.md) |
 | 虚拟媒体库 | 媒体库首页注入榜单四库 + 海量分类四库，可开关；支持按片源映射（只显示指定源、按分类拆库）并按账号授权过滤 | [docs/virtual-library.md](docs/virtual-library.md) |

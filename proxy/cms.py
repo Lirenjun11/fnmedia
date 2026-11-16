@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 import httpx
 
 import config
+import hongguo
 
 _MEDIA = re.compile(r"\.(m3u8|mp4|flv|mkv|ts)(\?|$)", re.I)
 _UA = "Mozilla/5.0 (compatible; fnmedia-ext/0.1)"
@@ -64,7 +65,7 @@ class OnlineTitle:
 
 _TV_WORDS = ("电视剧", "连续剧", "日剧", "韩剧", "美剧", "英剧", "泰剧", "国剧",
              "日本剧", "韩国剧", "欧美剧", "海外剧", "港台剧", "动漫", "番剧",
-             "动画剧", "综艺")
+             "动画剧", "综艺", "短剧")
 _MOVIE_WORDS = ("电影", "影片", "剧情片", "动作片", "喜剧片", "爱情片", "科幻片",
                 "恐怖片", "纪录片")
 
@@ -200,7 +201,13 @@ def _merge_bucket(bucket: list[OnlineTitle]) -> list[OnlineTitle]:
             first_by_provider[t.provider] = t
     if len(first_by_provider) <= 1:
         return bucket
-    ordered = sorted(first_by_provider.values(), key=lambda x: x.provider)
+    # 有些源（自托管红果）搜索结果不带播放地址，要再查一次详情才有。
+    # 把它们并进合并卡会丢掉唯一那条「待补全」的线路，所以让它们各自成卡。
+    ready = [t for t in first_by_provider.values() if t.lines]
+    pending = [t for t in first_by_provider.values() if not t.lines]
+    if not ready:
+        return bucket
+    ordered = sorted(ready, key=lambda x: x.provider)
     primary = ordered[0]
     lines: dict[str, list] = {}
     line_sources: dict[str, str] = {}
@@ -214,7 +221,8 @@ def _merge_bucket(bucket: list[OnlineTitle]) -> list[OnlineTitle]:
                 n += 1
             lines[key] = eps
             line_sources[key] = t.provider
-    return [replace(primary, lines=lines, line_sources=line_sources)] + extra
+    return ([replace(primary, lines=lines, line_sources=line_sources)]
+            + extra + pending)
 
 
 def merge_titles(titles: list[OnlineTitle]) -> list[OnlineTitle]:
@@ -241,6 +249,12 @@ def merge_titles(titles: list[OnlineTitle]) -> list[OnlineTitle]:
 
 async def search_source(client: httpx.AsyncClient, source: dict,
                         keyword: str, timeout: float) -> list[OnlineTitle]:
+    # 自托管红果服务走自己的 /api/search，不认苹果 CMS 的 ac=detail&wd=。
+    if hongguo.enabled(source):
+        try:
+            return await hongguo.search_titles(client, source, keyword)
+        except Exception:  # noqa: BLE001 - 单源失败不影响其它源
+            return []
     try:
         resp = await client.get(source["api"], params={"ac": "detail", "wd": keyword},
                                 headers={"User-Agent": _UA}, timeout=timeout)

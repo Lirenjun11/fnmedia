@@ -23,6 +23,7 @@ import httpx
 
 import cms
 import config
+import hongguo
 
 STATE = config.STATE_DIR / "catalog.json"
 PER_PAGE = 20
@@ -272,8 +273,13 @@ class Catalog:
     def total(self, cat: str) -> int:
         return int((self.route(cat) or {}).get("total") or 0)
 
-    def stale(self) -> bool:
-        return (not self._updated_at) or (time.time() - self._updated_at) >= ROUTE_TTL
+    def stale(self, ttl: float = ROUTE_TTL) -> bool:
+        """路由是否该重扫。``ttl`` 传「刷新间隔」小时数转成的秒数。
+
+        以前写死 6 小时，管理页的「刷新间隔」只作用于榜单、对分类库无效，
+        用户设 1 小时也还是等 6 小时，容易误以为有新片没更新。
+        """
+        return (not self._updated_at) or (time.time() - self._updated_at) >= ttl
 
     def status(self) -> dict:
         routes: dict[str, dict] = {}
@@ -299,6 +305,28 @@ class Catalog:
         cats = {row[0] for row in CATALOG_CATEGORIES}
         return any(":" in key and key.partition(":")[2] in cats
                    for key in self._routes)
+
+    def missing_split_routes(self, sources: list[dict]) -> bool:
+        """拆分模式下，映射源一个真正的 ``<sid>:<type_id>`` 路由都没有。
+
+        典型现场：升级前路由表是四大类（``<cat>`` 或 ``<sid>:movie``），切到
+        按源拆库后没有任何东西触发重建，``libraries()`` 在拆分分支里找不到
+        路由就全部跳过，客户端只剩榜单四库、海量库凭空消失。``legacy_routes``
+        只认 ``<sid>:movie`` 那种旧键，纯 ``<cat>`` 路由会永远卡住。
+        """
+        if not sources:
+            return False
+        cats = {row[0] for row in CATALOG_CATEGORIES}
+        for source in sources:
+            sid = str(source.get("id") or "")
+            if not sid:
+                continue
+            if any(key.startswith(f"{sid}:")
+                   and key.partition(":")[2] not in cats
+                   for key in self._routes):
+                continue
+            return True
+        return False
 
     def reset(self) -> None:
         """清内容缓存（路由 / 分页），**保留源站分类表**。
@@ -344,6 +372,12 @@ class Catalog:
                 self._updated_at = time.time()
                 self._pages.clear()
                 self._persist()
+            elif table is not None and split \
+                    and not self.missing_split_routes(sources):
+                # 本轮没有新分类可补（映射源的库都齐了）：记为「已检查」。
+                # 不记的话 stale 永远为真，每 10 分钟白拉一遍所有源的分类表。
+                self._updated_at = time.time()
+                self._persist()
         except Exception:  # noqa: BLE001 - 刷新失败保留旧路由
             pass
         finally:
@@ -352,7 +386,13 @@ class Catalog:
 
     async def _discover(self, client: httpx.AsyncClient,
                         sources: list[dict], split: bool = False,
-                        force: bool = False) -> dict[str, dict]:
+                        force: bool = False) -> dict[str, dict] | None:
+        """探测分类表并建路由。返回 ``None`` 表示一个源的分类表都没拿到。
+
+        区分 ``{}`` 与 ``None`` 很重要：``{}`` 是「拿到了分类表，但本轮没有
+        需要新建的路由」，调用方应记为已检查；``None`` 是彻底失败，必须保留
+        旧路由并等下一次重试。
+        """
         async def fetch(source: dict):
             payload = await client_get_classes(client, source)
             rows = class_rows(payload)
@@ -364,7 +404,7 @@ class Catalog:
             *(fetch(s) for s in sources[:16]), return_exceptions=True)
         classes_by_source = [row for row in results if isinstance(row, tuple)]
         if not classes_by_source:
-            return {}
+            return None
         # 顺手缓存每个源的全部分类，管理页直接列出，不必再打一次源站。
         for source, rows in classes_by_source:
             sid = str(source.get("id") or "")
@@ -399,14 +439,18 @@ class Catalog:
         """按「源 × 该源原始分类」逐类建路由，key 为 ``<sid>:<type_id>``。
 
         默认取该源全部非脏分类；配置了 ``vlib_class_ids`` 时只取选中的
-        type_id（用户显式勾选脏类也能出）。每源最多 40 类、总并发 4。
+        type_id（用户显式勾选脏类也能出）。每源最多 60 类、总并发 6。
 
         ``force=False`` 时**已有可用路由的分类不再重复探测**：重建只补缺，
         否则每次刷新都要打上百个 ``ac=detail&t=`` 请求，源站一限流就整库
         建不出来（表现为「清缓存重建后一直打不开」）。
+
+        探测结果**边完成边写回** ``self._routes`` 并落盘（每 2 秒一次）：
+        源站慢时一百多个分类要跑一两分钟，等全部探测完才写盘的话，客户端
+        在这段时间里刷新只会看到榜单四库，容易被当成「库没了」。
         """
         picked_all = config.get().get("vlib_class_ids") or {}
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(6)
 
         async def probe_one(source, row, sid, tid):
             async with sem:
@@ -423,43 +467,69 @@ class Catalog:
                 chosen = [r for r in rows if str(r["id"]) in wanted]
             else:
                 chosen = [r for r in rows if not r.get("junk")]
-            for row in chosen[:40]:
+            for row in chosen[:60]:
                 tid = str(row["id"])
                 if not force and (self._routes.get(f"{sid}:{tid}")
                                   or {}).get("total"):
                     continue
-                tasks.append(probe_one(source, row, sid, tid))
+                tasks.append(asyncio.create_task(
+                    probe_one(source, row, sid, tid)))
         routes: dict[str, dict] = {}
-        for result in await asyncio.gather(*tasks[:120],
-                                           return_exceptions=True):
-            if not isinstance(result, tuple):
-                continue
-            sid, tid, info = result
-            if info:
-                routes[f"{sid}:{tid}"] = info
+        pending = set(tasks[:120])
+        last_flush = 0.0
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, timeout=2.0,
+                    return_when=asyncio.FIRST_COMPLETED)
+                added = False
+                for task in done:
+                    try:
+                        sid, tid, info = task.result()
+                    except Exception:  # noqa: BLE001 - 单类探测失败跳过
+                        continue
+                    if info:
+                        routes[f"{sid}:{tid}"] = info
+                        added = True
+                if added and time.time() - last_flush >= 2.0:
+                    last_flush = time.time()
+                    self._routes.update(routes)
+                    self._updated_at = time.time()
+                    self._persist()
+        finally:
+            for task in pending:
+                task.cancel()
         return routes
 
     async def _probe(self, client: httpx.AsyncClient, source: dict,
                      row: dict) -> dict | None:
         type_id = str(row.get("id") or row.get("type_id") or "")
-        payload = await _get_json(client, source["api"],
-                                  {"ac": "detail", "t": type_id, "pg": 1},
-                                  _PROBE_TIMEOUT)
-        titles = _page_rows(payload, source)
+        pagecount = 0
+        if hongguo.enabled(source):
+            # 红果没有 pagecount / total，只能按首屏条数估一个量级，
+            # 真实边界靠翻到空页时在 window() 里收敛。
+            titles = await hongguo.page_titles(client, source, type_id, 1)
+            total = len(titles) * 20
+        else:
+            payload = await _get_json(client, source["api"],
+                                      {"ac": "detail", "t": type_id, "pg": 1},
+                                      _PROBE_TIMEOUT)
+            titles = _page_rows(payload, source)
+            pagecount = _to_int((payload or {}).get("pagecount"))
+            total = _to_int((payload or {}).get("total"))
+            if pagecount:
+                total = pagecount * PER_PAGE
+            elif total <= 0:
+                total = len(titles) * 20
         if not titles:
             return None
         # 探测页顺手入缓存，首次浏览第一页不必再打一次源站。
         self._pages[(source["api"], type_id, 1)] = (time.monotonic(), titles)
-        pagecount = _to_int((payload or {}).get("pagecount"))
-        total = _to_int((payload or {}).get("total"))
-        if pagecount:
-            total = pagecount * PER_PAGE
-        elif total <= 0:
-            total = len(titles) * 20
         return {
             "source_id": source.get("id") or "",
             "source_name": source.get("name") or source.get("id") or "",
             "api": source["api"],
+            "kind": str(source.get("kind") or ""),
             "type_id": type_id,
             "type_name": str(row.get("name") or row.get("type_name") or ""),
             "mdb": str(row.get("mdb") or "Mix"),
@@ -476,13 +546,18 @@ class Catalog:
         hit = self._pages.get(key)
         if hit and time.monotonic() - hit[0] < PAGE_TTL:
             return hit[1]
-        payload = await _get_json(
-            client, route["api"],
-            {"ac": "detail", "t": route["type_id"], "pg": page}, 8.0)
         source = {"id": route.get("source_id") or "catalog",
                   "name": route.get("source_name") or "",
-                  "api": route["api"]}
-        titles = _page_rows(payload, source)
+                  "api": route["api"],
+                  "kind": route.get("kind") or ""}
+        if hongguo.enabled(source):
+            titles = await hongguo.page_titles(client, source,
+                                               str(route["type_id"]), page)
+        else:
+            payload = await _get_json(
+                client, route["api"],
+                {"ac": "detail", "t": route["type_id"], "pg": page}, 8.0)
+            titles = _page_rows(payload, source)
         if len(self._pages) > 240:
             self._pages.clear()
         self._pages[key] = (time.monotonic(), titles)
@@ -516,6 +591,11 @@ class Catalog:
 
 
 async def client_get_classes(client: httpx.AsyncClient, source: dict):
+    # 红果服务没有苹果 CMS 的 ac=list，分类走 /api/home 的 classes。
+    if hongguo.enabled(source):
+        rows = await hongguo.classes(client, source)
+        return {"code": 1, "class": [{"type_id": r["id"], "type_name": r["name"]}
+                                     for r in rows]}
     return await _get_json(client, source["api"], _params(source["api"]),
                            _PROBE_TIMEOUT)
 

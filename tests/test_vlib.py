@@ -524,6 +524,93 @@ class VlibSourceMappingTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in catalog.catalog.classes("s_1")],
                          ["1", "2", "3", "4"])
 
+    def test_stale_honours_refresh_interval(self):
+        """stale 要能用管理页设的刷新间隔，而不是写死 6 小时。"""
+        catalog.catalog._updated_at = time.time() - 3600
+        self.assertTrue(catalog.catalog.stale(1800))
+        self.assertFalse(catalog.catalog.stale(7200))
+
+    def test_refresh_without_new_classes_marks_checked(self):
+        """路由齐全、本轮无新分类时不再重复探源，但 updated_at 要刷新。
+
+        否则 stale 永远为真，后台每 10 分钟白拉一遍所有源的分类表。
+        """
+        sources = [{"id": "s_1", "name": "源一", "api": "https://a.invalid/api"}]
+
+        async def fake_classes(client, source):
+            return {"code": 1, "class": [
+                {"type_id": 1, "type_name": "动作片"},
+                {"type_id": 2, "type_name": "国产剧"},
+            ]}
+
+        calls: list[str] = []
+
+        async def fake_probe(client, source, row):
+            calls.append(str(row.get("id")))
+            return {"source_id": source["id"], "source_name": source["name"],
+                    "api": source["api"], "type_id": str(row.get("id")),
+                    "type_name": str(row.get("name")), "pages": 2, "total": 40,
+                    "posters": []}
+
+        with patch("catalog.client_get_classes", new=fake_classes), \
+                patch.object(catalog.catalog, "_probe", new=fake_probe):
+            asyncio.run(catalog.catalog.refresh_routes(
+                None, sources, split=True, force=True))
+            self.assertEqual(sorted(calls), ["1", "2"])
+            catalog.catalog._updated_at = 0.0
+            asyncio.run(catalog.catalog.refresh_routes(None, sources, split=True))
+        self.assertEqual(len(calls), 2)  # 第二轮没再探
+        self.assertGreater(catalog.catalog._updated_at, 0)
+        self.assertIn("s_1:1", catalog.catalog._routes)
+
+    def test_missing_split_routes_detects_pure_category_routes(self):
+        """纯 <cat> 路由在拆库模式下必须判为「缺路由」并触发重建。
+
+        以前判断只看 ``legacy_routes()``（<sid>:movie 键），升级后路由表整个
+        是 movie/tv/anime/variety 时两者都不成立，客户端就永久只剩榜单四库。
+        """
+        sources = [{"id": "s_1", "name": "源一", "api": "https://a.invalid/api"}]
+        catalog.catalog._routes = {
+            "movie": {"type_id": "1", "source_id": "s_1", "total": 9},
+            "tv": {"type_id": "2", "source_id": "s_1", "total": 9},
+        }
+        self.assertFalse(catalog.catalog.legacy_routes())
+        self.assertTrue(catalog.catalog.missing_split_routes(sources))
+        catalog.catalog._routes["s_1:5"] = {
+            "type_id": "5", "source_id": "s_1", "total": 9}
+        self.assertFalse(catalog.catalog.missing_split_routes(sources))
+        # <sid>:四大类 这种旧键不能算「已建路由」
+        catalog.catalog._routes = {
+            "s_1:movie": {"type_id": "movie", "source_id": "s_1", "total": 9}}
+        self.assertTrue(catalog.catalog.missing_split_routes(sources))
+        self.assertFalse(catalog.catalog.missing_split_routes([]))
+
+    def test_split_rebuild_writes_routes_before_all_probes_done(self):
+        """探测中途就要有路由落盘，否则源站慢时客户端只看到空库。"""
+        sources = [{"id": "s_1", "name": "源一", "api": "https://a.invalid/api"}]
+
+        async def fake_classes(client, source):
+            return {"code": 1, "class": [
+                {"type_id": i, "type_name": f"类{i}"} for i in range(1, 13)]}
+
+        seen: list[int] = []
+
+        async def fake_probe(client, source, row):
+            await asyncio.sleep(0.01)
+            seen.append(len(catalog.catalog._routes))
+            return {"source_id": source["id"], "source_name": source["name"],
+                    "api": source["api"], "type_id": str(row.get("id")),
+                    "type_name": str(row.get("name")), "pages": 3, "total": 60,
+                    "posters": []}
+
+        with patch("catalog.client_get_classes", new=fake_classes), \
+                patch.object(catalog.catalog, "_probe", new=fake_probe):
+            status = asyncio.run(catalog.catalog.refresh_routes(
+                None, sources, split=True, force=True))
+        self.assertEqual(len(status["routes"]), 12)
+        # 12 个探测里有若干个是在「已有部分路由」之后才跑的
+        self.assertTrue(any(n > 0 for n in seen))
+
     def test_class_rows_keeps_every_source_category(self):
         rows = catalog.class_rows({"class": [
             {"type_id": 1, "type_name": "动作片"},

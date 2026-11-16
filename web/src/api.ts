@@ -7,6 +7,10 @@ export interface Source {
   adult?: boolean;
   enabled: boolean;
   from: string;
+  /** maccms（缺省）= 苹果 CMS 采集接口；hongguo = 自托管红果服务 */
+  kind?: string;
+  token?: string;
+  version?: string;
 }
 
 export interface ProbeResult {
@@ -306,6 +310,11 @@ export const api = {
     request<{ theme: string }>('/v/api/ext/ui/theme', json('PATCH', { theme })),
   addSource: (value: { name: string; api: string; key?: string; detail?: string }) =>
     request<{ source: Source }>('/v/api/ext/sources', json('POST', value)),
+  addHongguoSource: (value: { name?: string; api: string; token?: string }) =>
+    request<{
+      source: Source;
+      probe: { ok: boolean; version: string; active: string; message: string };
+    }>('/v/api/ext/sources/hongguo', json('POST', value)),
   batchSources: (ids: string[], action: 'enable' | 'disable' | 'delete') =>
     request<{ changed: number; action: string; total: number }>(
       '/v/api/ext/sources/batch', json('POST', { ids, action })),

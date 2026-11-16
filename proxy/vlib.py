@@ -26,6 +26,7 @@ import charts
 import cms
 import config
 import fake
+import hongguo
 import playstate
 import runtime
 import tmdb
@@ -80,7 +81,7 @@ def selected_classes(sid: str) -> list[dict]:
         rows = [r for r in rows if str(r.get("id")) in wanted]
     else:
         rows = [r for r in rows if not r.get("junk")]
-    return rows[:40]
+    return rows[:60]
 
 
 def source_lib_guid(sid: str, cls_id: str) -> str:
@@ -819,6 +820,12 @@ async def detail(store: cms.TitleStore, client, guid: str) -> dict | None:
     # 绑定是全局共享的（A 可能先用较宽的授权绑定），展示前必须按当前账号裁剪，
     # 否则详情页会把别的账号才有的线路/源名暴露出来。
     brief = acl.filter_brief(await ensure_bound(store, client, guid))
+    if brief and not brief.get("lines"):
+        # 红果类绑定只有标题没有分集，详情前补一次 /api/detail。
+        try:
+            brief = await hongguo.ensure_lines(client, store, brief) or brief
+        except Exception:  # noqa: BLE001 - 补失败仍走「暂无片源」分支
+            pass
     if not brief:
         poster = fake.poster_path(meta.get("cover") or "")
         row = _blank_card(guid, meta.get("title") or "")

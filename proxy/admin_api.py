@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import urllib.parse
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -15,6 +16,7 @@ import catalog
 import charts
 import config
 import hls
+import hongguo
 import runtime
 import subscription
 import tmdb
@@ -52,9 +54,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.2"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.3"
     except OSError:
-        return "0.0.2.2"
+        return "0.0.2.3"
 
 
 def _public_config() -> dict:
@@ -151,6 +153,47 @@ async def patch_config(request: Request):
             split=vlib.split_by_source()))
     return ok({"config": {k: v for k, v in result.items()
                           if k != "admin_token"}})
+
+
+@router.post("/sources/hongguo")
+async def add_hongguo_source(request: Request):
+    """录入一个自托管的红果服务（hongguo-web）作为片源。
+
+    只认 `/health` 自报 `service=hongguo-web` 的地址，避免把任意网址当成源；
+    录入后它和普通片源一样参与搜索、详情、播放、账号授权与虚拟库源映射。
+    """
+    guard(request)
+    body = await body_json(request)
+    url = str(body.get("api") or body.get("url") or "").strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        return fail("地址必须以 http(s) 开头")
+    token = str(body.get("token") or "").strip()[:200]
+    candidate = {
+        "id": hongguo.new_id(url),
+        "name": str(body.get("name") or "").strip()[:60],
+        "api": url,
+        "kind": hongguo.KIND,
+        "token": token,
+        "detail": url,
+        "from": "manual",
+        "enabled": bool(body.get("enabled", True)),
+    }
+    cfg = config.get()
+    if any(s.get("id") == candidate["id"] for s in cfg["sources"]):
+        return fail("该地址已录入")
+    probe = await hongguo.probe(request.app.state.src, candidate)
+    if not probe.get("ok"):
+        return fail(probe.get("message") or "连不上该红果服务")
+    if not candidate["name"]:
+        host = urllib.parse.urlparse(url).netloc or "hongguo"
+        candidate["name"] = f"红果（{host}）"
+    if probe.get("version"):
+        candidate["version"] = probe["version"]
+    cfg["sources"].append(candidate)
+    config.save(cfg)
+    runtime.log(f"hongguo source added: {candidate['name']} "
+                f"v{probe.get('version') or '?'} active={probe.get('active') or '?'}")
+    return ok({"source": candidate, "probe": probe})
 
 
 @router.post("/sources")
@@ -302,6 +345,12 @@ async def test_source(sid: str, request: Request):
     if not source:
         return fail("源不存在", 404)
     started = time.monotonic()
+    if hongguo.enabled(source):
+        # 红果源用 /health 判活；拿关键词去搜反而会把「服务正常但没这片」误判成不可用。
+        probe = await hongguo.probe(request.app.state.src, source)
+        return ok({"ok": bool(probe.get("ok")), "count": 0,
+                   "elapsed_ms": int((time.monotonic() - started) * 1000),
+                   "error": None if probe.get("ok") else probe.get("message")})
     try:
         found = await cms.search_source(request.app.state.src, source, "测试", timeout=3.0)
         return ok({"ok": bool(found), "count": len(found),

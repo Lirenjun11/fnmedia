@@ -14,10 +14,12 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [probe, setProbe] = useState<Record<string, ProbeResult>>({});
   const [showAdd, setShowAdd] = useState(false);
+  const [showHg, setShowHg] = useState(false);
   const [showProbe, setShowProbe] = useState(false);
   const [keyword, setKeyword] = useState('');
   const [busy, setBusy] = useState('');
   const [form, setForm] = useState({ name: '', key: '', api: '', detail: '' });
+  const [hgForm, setHgForm] = useState({ name: '', api: '', token: '' });
   const [editing, setEditing] = useState<{
     id: string; name: string; key: string; api: string; detail: string;
   } | null>(null);
@@ -121,6 +123,20 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
     });
   }
 
+  async function doAddHg() {
+    await run('add-hg', async () => {
+      const endpoint = hgForm.api.trim();
+      if (!endpoint) throw new Error('请填写红果服务地址');
+      const result = await api.addHongguoSource({
+        name: hgForm.name.trim(), api: endpoint, token: hgForm.token.trim(),
+      });
+      setHgForm({ name: '', api: '', token: '' });
+      setShowHg(false);
+      notify(`红果服务已录入（v${result.probe.version || '?'}，当前源 ${result.probe.active || '默认'}），已启用`, 'ok');
+      await refresh();
+    });
+  }
+
   async function doSaveEdit() {
     if (!editing) return;
     await run('save-edit', async () => {
@@ -176,6 +192,9 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
           <button className="btn sm primary" onClick={() => setShowAdd(!showAdd)}>
             添加视频源
           </button>
+          <button className="btn sm info" onClick={() => setShowHg(!showHg)}>
+            添加红果服务
+          </button>
           {selected.size === 0 && (
             <span className="small">勾选视频源后可进行批量操作</span>
           )}
@@ -220,6 +239,44 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
             <div className="row end">
               <button className="btn primary sm" disabled={busy === 'add'}
                       onClick={() => void doAdd()}>添加</button>
+            </div>
+          </div>
+        )}
+
+        {showHg && (
+          <div className="stack probe-box mt">
+            <p className="card-sub">
+              填入自托管 hongguo-web 的地址（容器默认端口 8787）。
+              录入后会先校验 <code>/health</code>，确认是红果服务才保存；
+              保存后与普通片源一样参与搜索、详情、播放、账号授权，
+              也能在「虚拟媒体库 → 片源映射」里按源 × 分类建库。
+            </p>
+            <div className="row">
+              <div className="grow">
+                <label className="field">服务地址</label>
+                <input type="text" value={hgForm.api}
+                       placeholder="http://192.168.1.10:8787"
+                       onChange={(e) => setHgForm((f) => ({ ...f, api: e.target.value }))} />
+              </div>
+              <div className="grow">
+                <label className="field">访问口令（TOKEN，可选）</label>
+                <input type="text" value={hgForm.token}
+                       placeholder="容器环境变量 TOKEN 的值"
+                       onChange={(e) => setHgForm((f) => ({ ...f, token: e.target.value }))} />
+              </div>
+            </div>
+            <div className="row">
+              <div className="grow">
+                <label className="field">名称（可选）</label>
+                <input type="text" value={hgForm.name} placeholder="例如：红果短剧"
+                       onChange={(e) => setHgForm((f) => ({ ...f, name: e.target.value }))} />
+              </div>
+              <div className="row end">
+                <button className="btn primary sm" disabled={busy === 'add-hg'}
+                        onClick={() => void doAddHg()}>
+                  {busy === 'add-hg' ? '校验中…' : '录入'}
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -301,7 +358,15 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
                                checked={selected.has(s.id)}
                                onChange={() => toggleSelect(s.id)} />
                       </td>
-                      <td data-label="名称">{s.name}</td>
+                      <td data-label="名称">
+                        {s.name}
+                        {s.kind === 'hongguo' && (
+                          <span className="badge" style={{ marginLeft: 6 }}
+                                title={s.version ? `hongguo-web v${s.version}` : '自托管红果服务'}>
+                            红果
+                          </span>
+                        )}
+                      </td>
                       <td className="api" data-label="KEY">{s.key || '—'}</td>
                       <td className="api" data-label="API 地址" title={s.api}>{s.api}</td>
                       <td className="api" data-label="DETAIL 地址" title={s.detail || ''}>{s.detail || '—'}</td>
