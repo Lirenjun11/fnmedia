@@ -54,9 +54,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.6"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.7"
     except OSError:
-        return "0.0.2.6"
+        return "0.0.2.7"
 
 
 def _public_config() -> dict:
@@ -727,7 +727,7 @@ async def logs(request: Request):
 @router.get("/adfilter/preview")
 async def adfilter_preview(request: Request):
     guard(request)
-    return ok({"previews": hls.recent_ad_previews(3)})
+    return ok({"previews": hls.recent_ad_previews(5)})
 
 
 @router.get("/export")

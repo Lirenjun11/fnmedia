@@ -474,9 +474,33 @@ def preroll_playlist(head, body, *, boundary=True, body_prefix="vod"):
     return "\n".join(lines) + "\n"
 
 
+def sliced_playlist(head, groups):
+    """2 秒切片、每个 DISCONTINUITY 一组的清单（bf4 那类推流源）。
+
+    head 是片头各片时长；groups 的每一项要么是片数（整 2 秒），要么直接给
+    一串时长（用于构造补齐片）。
+    """
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:2",
+             "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD",
+             "#EXT-X-DISCONTINUITY"]
+    idx = 0
+    for duration in head:
+        lines.append(f"#EXTINF:{duration:.2f},")
+        lines.append(f"https://sm4.example.com/vod/hls/s{idx}.ts")
+        idx += 1
+    for group in groups:
+        durations = [2.0] * group if isinstance(group, int) else group
+        lines.append("#EXT-X-DISCONTINUITY")
+        for duration in durations:
+            lines.append(f"#EXTINF:{duration:.2f},")
+            lines.append(f"https://sm4.example.com/vod/hls/s{idx}.ts")
+            idx += 1
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
+
+
 class PrerollTest(unittest.TestCase):
     """片头贴片：单条 15/30 秒的贴片凑不满分段规则要求的最少 3 片。"""
-
     def setUp(self):
         reset(adfilter_enabled=True, adfilter_markers=False,
               adfilter_keywords=[], adfilter_head_skip=0.0)
@@ -514,6 +538,114 @@ class PrerollTest(unittest.TestCase):
         _, stats = hls.strip_ads(playlist, BASE)
         self.assertEqual(stats["by_preroll"], 2)
         self.assertEqual(stats["preroll"], "duration")
+
+    def test_same_duration_splice_is_removed(self):
+        """广告与正片同目录同时长：只剩「片头/正文」拼接边界可用。"""
+        playlist = preroll_playlist([(2, 6.0, "vod")],
+                                    [(30, 6.0, "vod")])
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_preroll"], 2)
+        self.assertEqual(stats["preroll"], "splice")
+        self.assertEqual(stats["head"][0]["d"], 6.0)
+        self.assertNotIn("s0.ts", text)
+        self.assertIn("s2.ts", text)
+
+    def test_directory_switch_with_same_duration_is_removed(self):
+        playlist = preroll_playlist([(3, 6.0, "preroll")],
+                                    [(30, 6.0, "vod")], boundary=False)
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_preroll"], 3)
+        self.assertEqual(stats["preroll"], "stream")
+
+    def test_extra_break_elsewhere_blocks_splice(self):
+        """片头之外还有别的分组切换时，不把片头当拼接广告。"""
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:6",
+                 "#EXT-X-MEDIA-SEQUENCE:0"]
+        idx = 0
+
+        def block(count, folder):
+            nonlocal idx
+            for _ in range(count):
+                lines.append("#EXTINF:6.0,")
+                lines.append(f"https://cdn.example.com/{folder}/s{idx}.ts")
+                idx += 1
+
+        block(2, "vod")
+        lines.append("#EXT-X-DISCONTINUITY")
+        block(20, "vod")
+        lines.append("#EXT-X-DISCONTINUITY")
+        block(10, "vod")
+        lines.append("#EXT-X-ENDLIST")
+        _, stats = hls.strip_ads("\n".join(lines) + "\n", BASE)
+        self.assertEqual(stats["by_preroll"], 0)
+        self.assertEqual(stats["preroll_miss"], "shape")
+
+    def test_kept_playlist_is_logged_with_probe_and_miss(self):
+        """没删掉也要留记录：片头探针 + 未命中原因。"""
+        playlist = preroll_playlist([(6, 6.0, "vod")],
+                                    [(22, 10.0, "vod")], boundary=False)
+        hls._AD_PREVIEWS.clear()
+        hls.rewrite_playlist(playlist, BASE, SEG_PREFIX)
+        item = hls.recent_ad_previews(1)[0]
+        self.assertEqual(item["removed"], 0)
+        self.assertEqual(len(item["head"]), 6)
+        self.assertEqual(item["head"][0]["d"], 6.0)
+        self.assertEqual(item["body_median"], 10.0)
+        self.assertEqual(item["preroll_miss"], "duration")
+
+    def test_tail_padded_head_splice_is_removed(self):
+        """真实 bf4 清单形状：2 秒切片、密集分组、片头最后一刀切不满。"""
+        playlist = sliced_playlist([2.0, 2.0, 2.0, 2.0, 2.0, 0.48], [6] * 15)
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["preroll"], "tail")
+        self.assertEqual(stats["by_preroll"], 6)
+        self.assertAlmostEqual(stats["removed_duration"], 10.48, places=2)
+        self.assertNotIn("s0.ts", text)
+        self.assertIn("s6.ts", text)
+
+    def test_body_chunk_padding_does_not_block_head_ad(self):
+        """正文别处也有补齐片（源站分块余量）时，片头贴片照样要删。"""
+        playlist = sliced_playlist([2.0, 2.0, 2.0, 2.0, 2.0, 0.48],
+                                   [6] * 20 + [[2.0, 2.0, 0.5], 6] + [6] * 20)
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["preroll"], "tail")
+        self.assertEqual(stats["by_preroll"], 6)
+        self.assertNotIn("s0.ts", text)
+
+    def test_mid_splice_block_is_removed(self):
+        """贴片不在片头也一样：整组以补齐片收尾就是拼接块。"""
+        playlist = sliced_playlist([2.0] * 6,
+                                   [6] * 20 + [[2.0, 2.0, 2.0, 2.0, 2.0, 0.48]] + [6] * 20)
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_pad"], 6)
+        self.assertEqual(len(stats["pad_blocks"]), 1)
+        self.assertAlmostEqual(stats["pad_blocks"][0]["duration"], 10.48, places=2)
+        self.assertIn("#EXT-X-ENDLIST", text)
+
+    def test_last_group_padding_is_not_ad(self):
+        """片尾最后一组本身就是收片补齐片，不能当贴片。"""
+        playlist = sliced_playlist([2.0] * 6, [6] * 20 + [[2.0, 2.0, 0.96]])
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_pad"], 0)
+
+    def test_splices_switch_can_be_disabled(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0,
+              adfilter_splices=False)
+        playlist = sliced_playlist([2.0] * 6,
+                                   [6] * 20 + [[2.0, 2.0, 2.0, 2.0, 2.0, 0.48]] + [6] * 20)
+        _, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_pad"], 0)
+
+    def test_dense_playlist_honors_manual_head_skip(self):
+        """分组过密时自动规则失效，手动片头秒数不能被保护逻辑抵消。"""
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=12.0)
+        playlist = sliced_playlist([2.0] * 6, [6] * 15)
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["by_head"], 6)
+        self.assertEqual(stats["guard_kept"], 0)
+        self.assertNotIn("s0.ts", text)
 
     def test_content_part_boundary_is_left_alone(self):
         """正片自己的分段边界（时长一致）不能被当成贴片。"""

@@ -54,6 +54,7 @@ export interface Config {
   adfilter_breaks: boolean;
   adfilter_strong: boolean;
   adfilter_preroll: boolean;
+  adfilter_splices: boolean;
   vlib_enabled: boolean;
   vlib_charts: boolean;
   vlib_catalog: boolean;
@@ -262,7 +263,12 @@ export interface AdPreview {
   by_tiny: number;
   by_minority: number;
   by_preroll: number;
+  by_pad: number;
+  pad_blocks: { group: number; count: number; duration: number }[];
   preroll: string;
+  preroll_miss: string;
+  head: { d: number; g: number; s: string }[];
+  body_median: number;
   groups: { group: number; count: number; duration: number }[];
   disc_cleaned: number;
   guard: string;

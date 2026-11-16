@@ -55,6 +55,7 @@ DEFAULTS = {
     "adfilter_breaks": True,
     "adfilter_strong": True,
     "adfilter_preroll": True,
+    "adfilter_splices": True,
     "vlib_enabled": True,
     "vlib_charts": True,
     "vlib_catalog": True,
@@ -231,6 +232,7 @@ def save(cfg: dict) -> dict:
     clean["adfilter_breaks"] = bool(clean["adfilter_breaks"])
     clean["adfilter_strong"] = bool(clean["adfilter_strong"])
     clean["adfilter_preroll"] = bool(clean["adfilter_preroll"])
+    clean["adfilter_splices"] = bool(clean["adfilter_splices"])
     clean["vlib_enabled"] = bool(clean["vlib_enabled"])
     clean["vlib_charts"] = bool(clean["vlib_charts"])
     clean["vlib_catalog"] = bool(clean["vlib_catalog"])

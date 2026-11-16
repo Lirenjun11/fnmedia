@@ -185,6 +185,7 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
         adfilter_breaks: Boolean(form.adfilter_breaks),
         adfilter_strong: Boolean(form.adfilter_strong),
         adfilter_preroll: Boolean(form.adfilter_preroll),
+        adfilter_splices: Boolean(form.adfilter_splices),
         adfilter_keywords: keywords
           .split(/[\n,]/)
           .map((word) => word.trim())
@@ -253,14 +254,25 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
             className="check" type="checkbox" checked={!!form.adfilter_preroll}
             onChange={(e) => set('adfilter_preroll', e.target.checked)}
           />
-          <span>识别片头贴片（正片开头 1–6 片、90 秒内的独立小段）</span>
+          <span>识别片头贴片（正片开头 1–6 片、90 秒内的拼接小段）</span>
+        </label>
+        <label className="row mt" style={{ cursor: 'pointer' }}>
+          <input
+            className="check" type="checkbox" checked={!!form.adfilter_splices}
+            onChange={(e) => set('adfilter_splices', e.target.checked)}
+          />
+          <span>识别中插拼接贴片（任意位置「补齐片」收尾的整组）</span>
         </label>
         <p className="hint mt">
           分段识别按 DISCONTINUITY 把清单切组，仅当某组 3–15 片、3–120 秒、
           且不足最长组 5% 时才判为广告；单组或分组过密的清单不处理。
-          片头贴片单独判定：清单最前面 1–6 片、合计 90 秒内，且与正文之间有
-          DISCONTINUITY、域名/目录切换或时长突变任一条依据，才整段删除；
-          正片剩余不足 90 秒或贴片占比超过 20% 时不动。
+          片头贴片单独判定：清单最前面 1–6 片、合计 90 秒内，满足任一依据即整段删除——
+          片头有 DISCONTINUITY 且时长形态突变；整条清单只有「片头/正文」两个分组且正文
+          切片长度统一（广告与正片同名同时长时只有这条能识别）；或片头来自正文没出现过的
+          域名/目录。正片剩余不足 90 秒或贴片占比超过 20% 时不动。
+          中插拼接贴片按同一思路但不限位置：源站把正片切成整 2 秒一片时，只有拼接进来
+          的贴片最后一刀切不满（如整组末尾出现 0.48 秒），命中即删整组；块长上限 90 秒、
+          占比上限 5%，片尾收片补齐不算。
           强证据为无条件自动推断，误判风险同源，故与分段识别分开独立开关；
           若某源会循环复用正片分片，单独关掉它即可。
           删除广告段后清理其出口处残留的 DISCONTINUITY 标签，正片内部合法切换保留。
@@ -293,17 +305,21 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
       <section className="card">
         <div className="card-title">最近清单诊断</div>
         <p className="card-sub">
-          进程内保留最近 5 次清单改写记录，不落盘。这里能看到每个被删分片的地址、时长与命中原因。
+          进程内保留最近 5 次经过过滤的 HLS 清单，不落盘。不管有没有删掉分片都会记录，
+          这里能看到片头每片的时长、分组与目录，以及没删掉时卡在哪一步。
         </p>
         <div className="row mb">
           <button className="btn sm" disabled={loadingPreview}
                   onClick={() => void loadPreview()}>
             {loadingPreview ? '读取中…' : '刷新记录'}
           </button>
-          <span className="small">仅在启用过滤后出现记录</span>
+          <span className="small">播放一个订阅源条目后刷新</span>
         </div>
         {previews.length === 0 ? (
-          <p className="hint">暂无记录。启用过滤并播放一个订阅源条目后再刷新。</p>
+          <p className="hint">
+            暂无记录：说明播放请求没有经过 HLS 清单改写。常见原因是该条目走了直链 MP4
+            （不经代理）、是官方库/本地文件，或广告过滤总开关没打开。
+          </p>
         ) : (
           <div className="stack">
             {previews.slice().reverse().map((item, i) => (
@@ -323,14 +339,36 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
                 <div className="row mt">
                   <span className="small">
                     命中：标记 {item.by_marker} / 关键字 {item.by_keyword} / 片头 {item.by_head} /
-                    分段 {item.by_break} / 贴片 {item.by_preroll} / 重复 {item.by_duplicate} /
+                    分段 {item.by_break} / 贴片 {item.by_preroll} / 拼接 {item.by_pad} /
+                    重复 {item.by_duplicate} /
                     极短 {item.by_tiny} / 少数域名 {item.by_minority} / 清理标记 {item.disc_cleaned}
                   </span>
                 </div>
+                {(item.head || []).length > 0 && (
+                  <p className="hint">
+                    片头探针：{item.head.map((h) => `${h.d}s`).join(' / ')}
+                    {' '}（分组 {item.head.map((h) => `#${h.g}`).join('/')}，
+                    目录 {item.head.map((h) => (h.s === 'same' ? '同' : '异')).join('/')}，
+                    正文中位 {item.body_median}s）
+                  </p>
+                )}
                 {item.preroll && (
                   <p className="hint">
-                    片头贴片依据：{item.preroll === 'discontinuity' ? '片头分组边界'
-                      : item.preroll === 'stream' ? '域名/目录切换' : '时长突变'}
+                    片头贴片依据：{item.preroll === 'discontinuity' ? '片头分组边界 + 时长突变'
+                      : item.preroll === 'splice' ? '片头/正文拼接边界（正文切片长度统一）'
+                      : item.preroll === 'tail' ? '片头拼接块尾部补齐片'
+                      : item.preroll === 'stream' ? '域名/目录整体切换' : '时长突变'}
+                  </p>
+                )}
+                {!item.preroll && item.removed === 0 && item.preroll_miss && (
+                  <p className="hint">
+                    片头未处理：{PREROLL_MISS[item.preroll_miss] || item.preroll_miss}
+                  </p>
+                )}
+                {(item.pad_blocks || []).length > 0 && (
+                  <p className="hint">
+                    中插拼接块：{item.pad_blocks
+                      .map((b) => `#${b.group} ${b.duration}s/${b.count}片`).join('，')}
                   </p>
                 )}
                 {(item.groups || []).length > 1 && (
@@ -494,6 +532,15 @@ export function LogsPage({ notify }: { notify: Notify }) {
     </>
   );
 }
+
+const PREROLL_MISS: Record<string, string> = {
+  short: '清单太短，未做贴片判定',
+  shape: '片头有分组边界，但时长形态不像贴片',
+  duration: '没有分组边界，开头时长也不够极端',
+  'duration-gate': '片头时长超出 1–90 秒闸门',
+  ratio: '片头占比超过 20%',
+  tail: '删掉片头后正片不足 90 秒',
+};
 
 const VLIB_CATS = [
   { key: 'movie', label: '电影' },
