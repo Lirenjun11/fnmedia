@@ -17,7 +17,8 @@ class ConfigTest(unittest.TestCase):
 
     def test_patch_and_limit(self):
         config.patch({"search_timeout": 99, "enabled_limit": 2})
-        self.assertLessEqual(config.get()["search_timeout"], 10)
+        # 上界 30 秒（总预算可设到 30s），超出的按上界截断
+        self.assertEqual(config.get()["search_timeout"], 30)
         sources = [{"id": f"s{i}", "name": str(i),
                     "api": "https://example.invalid/api.php/provide/vod",
                     "enabled": True} for i in range(6)]

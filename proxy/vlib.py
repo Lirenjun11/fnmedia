@@ -98,11 +98,33 @@ def source_lib_pairs() -> list[tuple]:
 
 
 def source_lib_of(guid: str):
-    """库 guid 反查 (sid, type_id)；由配置 + 分类缓存确定性重建。"""
-    for source, cls in source_lib_pairs():
+    """库 guid 反查 ``(sid, type_id)``。
+
+    候选分类取三处并集：源站分类表（缓存）∪ 已建路由（持久化）∪
+    ``vlib_class_ids``（用户显式勾选）。以前只看分类表，清缓存或分类拉取
+    失败时表是空的，所有「源 × 分类」库都反查不到自己，客户端表现为库里
+    什么都打不开——路由与配置都是稳的，不该被一张缓存表拖垮。
+    """
+    sources = mapped_sources()
+    if not sources:
+        return None
+    picked_all = config.get().get("vlib_class_ids") or {}
+    for source in sources:
         sid = str(source.get("id") or "")
-        if source_lib_guid(sid, str(cls["id"])) == guid:
-            return sid, str(cls["id"])
+        if not sid:
+            continue
+        ids = [str(row.get("id")) for row in catalog.catalog.classes(sid)]
+        ids += catalog.catalog.route_ids(sid)
+        picked = picked_all.get(sid)
+        if isinstance(picked, list):
+            ids += [str(value) for value in picked]
+        seen: set[str] = set()
+        for cid in ids:
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            if source_lib_guid(sid, cid) == guid:
+                return sid, cid
     return None
 
 

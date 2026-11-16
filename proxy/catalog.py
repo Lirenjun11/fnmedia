@@ -259,6 +259,12 @@ class Catalog:
             return self.stale()
         return (time.time() - self._last_attempt) > 30.0
 
+    def route_ids(self, sid: str) -> list[str]:
+        """该源已建路由的 type_id 列表（虚拟库 guid 反查的兜底来源）。"""
+        prefix = f"{str(sid or '')}:"
+        return [key[len(prefix):] for key in self._routes
+                if key.startswith(prefix) and key[len(prefix):]]
+
     def available(self, cat: str) -> bool:
         route = self.route(cat)
         return bool(route and route.get("total"))
@@ -295,29 +301,44 @@ class Catalog:
                    for key in self._routes)
 
     def reset(self) -> None:
+        """清内容缓存（路由 / 分页），**保留源站分类表**。
+
+        分类表是源站元数据（type_id ↔ type_name），虚拟库 guid 要靠它反查。
+        以前连它一起清掉，清缓存后到重建完成前所有「源 × 分类」库都认不出
+        自己是谁，客户端表现为库点进去直接报错、重建也救不回来。重建本来
+        就会重新拉一次 ``ac=list`` 覆盖它，保留不会留下旧内容。
+        """
         self._routes = {}
-        self._classes.clear()
         self._updated_at = 0.0
         self._pages.clear()
-        try:
-            STATE.unlink()
-        except OSError:
-            pass
+        self._persist()
 
     # ---------- 路由重建 ----------
     async def refresh_routes(self, client: httpx.AsyncClient,
-                             sources: list[dict], split: bool = False) -> dict:
+                             sources: list[dict], split: bool = False,
+                             force: bool = False) -> dict:
         if self._refreshing:
             return self.status()
         self._refreshing = True
         self._last_attempt = time.time()
         try:
-            table = await self._discover(client, sources, split)
+            table = await self._discover(client, sources, split, force)
             if table:
-                # 重建时清掉本模式下的全部旧路由，避免分类维度变化后
-                # 旧的 <sid>:<四大类> 路由残留成幽灵库。
-                for key in list(self._routes):
-                    if (":" in key) == bool(split):
+                live = {str(s.get("id") or "") for s in sources}
+                cats = {row[0] for row in CATALOG_CATEGORIES}
+                for key, row in list(self._routes.items()):
+                    if ":" in key:
+                        if not split:
+                            continue  # 分类模式的 <sid>:… 路由不归这次管
+                        sid, _, tid = key.partition(":")
+                        # 拆分模式只清「旧四大类残留」和「源已移出映射」的路由。
+                        # 本次没探测到的分类**保留旧路由**：源站偶发限流/超时
+                        # 时整库不会突然消失，等下次重建再覆盖。
+                        if tid in cats or sid not in live:
+                            self._routes.pop(key, None)
+                    else:
+                        if split:
+                            continue  # 拆分模式不动四大类路由
                         self._routes.pop(key, None)
                 self._routes.update(table)
                 self._updated_at = time.time()
@@ -330,14 +351,17 @@ class Catalog:
         return self.status()
 
     async def _discover(self, client: httpx.AsyncClient,
-                        sources: list[dict], split: bool = False) -> dict[str, dict]:
+                        sources: list[dict], split: bool = False,
+                        force: bool = False) -> dict[str, dict]:
         async def fetch(source: dict):
             payload = await client_get_classes(client, source)
             rows = class_rows(payload)
             return (source, rows) if rows else None
 
+        # 上限 16：映射源超过 8 个时，后面的源原本永远拿不到分类表，
+        # 它们的「源×分类」库就会认不出来（清缓存后尤其明显）。
         results = await asyncio.gather(
-            *(fetch(s) for s in sources[:8]), return_exceptions=True)
+            *(fetch(s) for s in sources[:16]), return_exceptions=True)
         classes_by_source = [row for row in results if isinstance(row, tuple)]
         if not classes_by_source:
             return {}
@@ -347,7 +371,8 @@ class Catalog:
             if sid and rows:
                 self._classes[sid] = rows
         if split:
-            return await self._discover_by_source(client, classes_by_source)
+            return await self._discover_by_source(client, classes_by_source,
+                                                 force)
 
         routes: dict[str, dict] = {}
         for cat, _, _ in CATALOG_CATEGORIES:
@@ -369,22 +394,26 @@ class Catalog:
                 routes[cat] = best
         return routes
 
-    async def _discover_by_source(self, client,
-                                  classes_by_source) -> dict[str, dict]:
+    async def _discover_by_source(self, client, classes_by_source,
+                                  force: bool = False) -> dict[str, dict]:
         """按「源 × 该源原始分类」逐类建路由，key 为 ``<sid>:<type_id>``。
 
         默认取该源全部非脏分类；配置了 ``vlib_class_ids`` 时只取选中的
-        type_id（用户显式勾选脏类也能出）。每源最多 40 类、总并发 8。
+        type_id（用户显式勾选脏类也能出）。每源最多 40 类、总并发 4。
+
+        ``force=False`` 时**已有可用路由的分类不再重复探测**：重建只补缺，
+        否则每次刷新都要打上百个 ``ac=detail&t=`` 请求，源站一限流就整库
+        建不出来（表现为「清缓存重建后一直打不开」）。
         """
         picked_all = config.get().get("vlib_class_ids") or {}
-        sem = asyncio.Semaphore(8)
+        sem = asyncio.Semaphore(4)
 
         async def probe_one(source, row, sid, tid):
             async with sem:
                 return sid, tid, await self._probe(client, source, row)
 
         tasks = []
-        for source, rows in classes_by_source[:6]:
+        for source, rows in classes_by_source[:12]:
             sid = str(source.get("id") or "")
             if not sid:
                 continue
@@ -395,7 +424,11 @@ class Catalog:
             else:
                 chosen = [r for r in rows if not r.get("junk")]
             for row in chosen[:40]:
-                tasks.append(probe_one(source, row, sid, str(row["id"])))
+                tid = str(row["id"])
+                if not force and (self._routes.get(f"{sid}:{tid}")
+                                  or {}).get("total"):
+                    continue
+                tasks.append(probe_one(source, row, sid, tid))
         routes: dict[str, dict] = {}
         for result in await asyncio.gather(*tasks[:120],
                                            return_exceptions=True):

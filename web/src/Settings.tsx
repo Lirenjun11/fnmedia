@@ -60,8 +60,8 @@ export function PlaybackPage({ boot, refresh, notify }: Props) {
         </p>
         <div className="grid">
           <div>
-            <label className="field">总预算（秒，0.5 – 10）</label>
-            <input type="number" step="0.1" min="0.5" max="10" value={form.search_timeout}
+            <label className="field">总预算（秒，0.5 – 30）</label>
+            <input type="number" step="0.1" min="0.5" max="30" value={form.search_timeout}
                    onChange={(e) => set('search_timeout', Number(e.target.value))} />
           </div>
           <div>

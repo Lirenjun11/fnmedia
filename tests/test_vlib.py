@@ -563,6 +563,78 @@ class VlibSourceMappingTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in rows["s_1"]], ["11", "12"])
         self.assertTrue(rows["s_1"][1]["junk"])
 
+    # ---- 清缓存 / 重建：库身份与路由不能互相拖死 ----
+    def test_clear_cache_keeps_class_table_and_library_identity(self):
+        """清缓存只清路由与分页，分类表保留 → 库 guid 仍能反查。"""
+        guid = vlib.source_lib_guid("s_1", "1")
+        catalog.catalog.reset()
+        self.assertEqual(catalog.catalog._routes, {})
+        self.assertEqual([r["id"] for r in catalog.catalog.classes("s_1")],
+                         ["1", "2", "9"])
+        self.assertEqual(vlib.source_lib_of(guid), ("s_1", "1"))
+        self.assertTrue(vlib.is_virtual_lib(guid))
+
+    def test_identity_survives_without_class_table(self):
+        """分类表丢了（拉取失败）时，靠已建路由仍能反查库身份。"""
+        guid = vlib.source_lib_guid("s_1", "2")
+        catalog.catalog._classes = {}
+        self.assertEqual(vlib.source_lib_of(guid), ("s_1", "2"))
+
+    def test_rebuild_skips_classes_that_already_have_routes(self):
+        """重建只补缺：已有路由的分类不再探测源站，避免限流把库打没。"""
+        probed: list[str] = []
+
+        async def fake_probe(client, source, row):
+            probed.append(str(row["id"]))
+            return {"source_id": source["id"], "source_name": source["name"],
+                    "api": source["api"], "type_id": str(row["id"]),
+                    "type_name": row["name"], "pages": 1, "total": 9,
+                    "posters": []}
+
+        async def fake_classes(client, source):
+            return {"code": 1, "class": [
+                {"type_id": 1, "type_name": "动作片"},
+                {"type_id": 2, "type_name": "国产剧"},
+            ]}
+
+        sources = [{"id": "s_1", "name": "源一",
+                    "api": "https://a.invalid/api"}]
+        with patch("catalog.client_get_classes", new=fake_classes), \
+                patch.object(catalog.catalog, "_probe", new=fake_probe):
+            asyncio.run(catalog.catalog.refresh_routes(None, sources,
+                                                       split=True))
+        self.assertEqual(probed, [])
+        self.assertEqual(catalog.catalog._routes["s_1:1"]["total"], 8)
+
+    def test_partial_rebuild_keeps_untouched_routes(self):
+        """部分分类探测失败时，旧路由保留，不会整库消失。"""
+
+        async def fake_probe(client, source, row):
+            if str(row["id"]) != "1":
+                return None
+            return {"source_id": source["id"], "source_name": source["name"],
+                    "api": source["api"], "type_id": "1",
+                    "type_name": row["name"], "pages": 1, "total": 100,
+                    "posters": []}
+
+        async def fake_classes(client, source):
+            return {"code": 1, "class": [
+                {"type_id": 1, "type_name": "动作片"},
+                {"type_id": 2, "type_name": "国产剧"},
+            ]}
+
+        sources = [{"id": "s_1", "name": "源一",
+                    "api": "https://a.invalid/api"},
+                   {"id": "s_2", "name": "源二",
+                    "api": "https://b.invalid/api"}]
+        with patch("catalog.client_get_classes", new=fake_classes), \
+                patch.object(catalog.catalog, "_probe", new=fake_probe):
+            asyncio.run(catalog.catalog.refresh_routes(None, sources,
+                                                       split=True, force=True))
+        self.assertEqual(catalog.catalog._routes["s_1:1"]["total"], 100)
+        self.assertEqual(catalog.catalog._routes["s_1:2"]["total"], 8)
+        self.assertEqual(catalog.catalog._routes["s_2:3"]["total"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()

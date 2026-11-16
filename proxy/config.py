@@ -85,7 +85,7 @@ DEFAULTS = {
     "acl_default_online": True,
 }
 
-_NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 10.0),
+_NUMERIC = {"enabled_limit": (1, 200), "search_timeout": (0.5, 30.0),
             "search_concurrency": (1, 16), "play_timeout": (2.0, 30.0),
             "update_interval_hours": (1, 168), "adfilter_head_skip": (0.0, 120.0),
             "search_debounce_ms": (0, 1000), "vlib_refresh_hours": (1, 24)}

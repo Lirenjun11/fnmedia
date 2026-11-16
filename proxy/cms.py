@@ -399,6 +399,14 @@ class TitleStore:
         if len(self._items) > self._max:
             for key in list(self._items)[: max(1, self._max // 4)]:
                 self._drop(key)
+        if out:
+            # 搜索/虚拟库浏览到的条目顺手落盘：内存 store 重启即空，
+            # 客户端缓存的卡片再点开时会反查不到 brief（详情直接报错）。
+            try:
+                import briefcache
+                briefcache.remember(out)
+            except Exception:  # noqa: BLE001 - 缓存失败不影响本次结果
+                pass
         return out
 
     def get(self, guid: str) -> dict | None:

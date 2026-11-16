@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 import admin_api
 import acl
 import borrow
+import briefcache
 import catalog as catalog_mod
 import charts
 import cms
@@ -113,10 +114,13 @@ async def lifespan(app: FastAPI):
     restored = vlib.restore(app.state.store)
     # 内存 store 重启即空，最近播放/收藏要靠落盘缓存恢复，否则列表会全空。
     played = playcache.restore(app.state.store)
+    # 虚拟库/搜索结果同理：客户端缓存着库里的卡片，重启后没有 brief
+    # 就点不开详情（透传官方直接 -6「此媒体库不存在」）。
+    browsed = briefcache.restore(app.state.store)
     runtime.log(f"service started, sources={len(config.enabled_sources())} "
                 f"aes_decrypt={'on' if hls.can_decrypt() else 'off'} "
                 f"vlib_charts={charts.chart_cache.total()} restored={restored} "
-                f"playcache={played}")
+                f"playcache={played} browse={browsed}")
     worker = asyncio.create_task(_auto_update_worker())
     vlib_worker = asyncio.create_task(_vlib_worker(app))
     try:

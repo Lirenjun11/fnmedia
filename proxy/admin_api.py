@@ -52,9 +52,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.1"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.2"
     except OSError:
-        return "0.0.2.1"
+        return "0.0.2.2"
 
 
 def _public_config() -> dict:
@@ -635,17 +635,22 @@ async def vlib_classes(request: Request):
 
 @router.post("/vlib/refresh")
 async def vlib_refresh(request: Request):
-    """立即刷新榜单与分类路由；失败保留旧缓存，结果如实返回。"""
+    """立即刷新榜单与分类路由；失败保留旧缓存，结果如实返回。
+
+    真正干活的是后台任务：全量重建要逐个分类探测源站，动辄几十秒，
+    同步等会把管理页请求拖到反向代理超时、客户端断开还会把协程取消，
+    结果一条路由都没写进去——这就是「点了刷新/重建但一直不生效」的来源。
+    """
     guard(request)
     body = await body_json(request)
     what = str(body.get("what") or "all")
     client = request.app.state.src
     if what in ("all", "charts"):
-        await charts.chart_cache.refresh(client)
+        asyncio.create_task(charts.chart_cache.refresh(client))
     if what in ("all", "catalog"):
-        await catalog.catalog.refresh_routes(
+        asyncio.create_task(catalog.catalog.refresh_routes(
             client, vlib.mapped_sources() or config.enabled_sources(),
-            split=vlib.split_by_source())
+            split=vlib.split_by_source(), force=what == "all"))
     return ok(vlib_status())
 
 
@@ -653,7 +658,15 @@ async def vlib_refresh(request: Request):
 async def vlib_clear(request: Request):
     guard(request)
     charts.chart_cache.reset()
+    # reset 只清路由/分页，保留源站分类表（虚拟库 guid 靠它反查）
     catalog.catalog.reset()
+    # 清完立刻后台重建，否则路由空着的这段时间所有「源 × 分类」库都进不去，
+    # 只能等用户再点一次刷新。
+    if vlib.catalog_enabled():
+        asyncio.create_task(catalog.catalog.refresh_routes(
+            request.app.state.src,
+            vlib.mapped_sources() or config.enabled_sources(),
+            split=vlib.split_by_source()))
     return ok(vlib_status())
 
 
