@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import secrets
 import threading
 from pathlib import Path
@@ -37,6 +38,12 @@ DEFAULTS = {
     "seg_redirect": True,
     "seg_redirect_block_hosts": [],
     "douban_enabled": False,
+    # TMDB 元数据富化：中文简介 / 类型 / 评分 / 时长 / 横版背景 / 演员表。
+    # API Key 只存本机 state，不入包、不上传；未填 Key 时整条链路短路。
+    # tmdb_proxy 是 TMDB 专用出口代理（留空则回退 source_proxy，再直连）。
+    "tmdb_enabled": True,
+    "tmdb_api_key": "",
+    "tmdb_proxy": "",
     "playstate": {},
     "update_repo": "Lirenjun11/fnmedia",
     "admin_token": "",
@@ -214,6 +221,11 @@ def save(cfg: dict) -> dict:
         if str(host).strip()})[:32]
     clean["adfilter_enabled"] = bool(clean["adfilter_enabled"])
     clean["adfilter_markers"] = bool(clean["adfilter_markers"])
+    clean["tmdb_enabled"] = bool(clean["tmdb_enabled"])
+    # v3 API Key（32 位十六进制）；顺带容忍 v4 Bearer 里的 - _ . 字符
+    clean["tmdb_api_key"] = re.sub(
+        r"[^0-9A-Za-z._\-]", "", str(clean.get("tmdb_api_key") or ""))[:128]
+    clean["tmdb_proxy"] = str(clean.get("tmdb_proxy") or "").strip()[:200]
     clean["adfilter_head_guard"] = bool(clean["adfilter_head_guard"])
     clean["adfilter_breaks"] = bool(clean["adfilter_breaks"])
     clean["adfilter_strong"] = bool(clean["adfilter_strong"])

@@ -39,6 +39,9 @@ export interface Config {
   seg_redirect: boolean;
   seg_redirect_block_hosts: string[];
   douban_enabled: boolean;
+  tmdb_enabled: boolean;
+  tmdb_api_key: string;
+  tmdb_proxy: string;
   adfilter_enabled: boolean;
   adfilter_markers: boolean;
   adfilter_keywords: string[];
@@ -154,6 +157,21 @@ export interface VlibClass {
   name: string;
   junk: boolean;
   mdb: string;
+}
+
+export interface TmdbStatus {
+  enabled: boolean;
+  has_key: boolean;
+  cached: number;
+  channel: string;
+  inflight: number;
+}
+
+export interface TmdbProbe {
+  ok: boolean;
+  channel?: string;
+  latency_ms?: number;
+  error?: string;
 }
 
 export interface VlibStatus {
@@ -332,6 +350,8 @@ export const api = {
   vlibRefresh: (what: 'all' | 'charts' | 'catalog' = 'all') =>
     request<VlibStatus>('/v/api/ext/vlib/refresh', json('POST', { what })),
   vlibClear: () => request<VlibStatus>('/v/api/ext/vlib/cache', { method: 'DELETE' }),
+  tmdbStatus: () => request<TmdbStatus>('/v/api/ext/tmdb/status'),
+  tmdbTest: () => request<TmdbProbe>('/v/api/ext/tmdb/test', json('POST', {})),
   aclStatus: () => request<AclStatus>('/v/api/ext/acl/status'),
   aclProbe: () => request<AclProbe>('/v/api/ext/acl/probe'),
   // 后端 PATCH /acl/config 的开关字段叫 enabled（配置键是 acl_enabled）。

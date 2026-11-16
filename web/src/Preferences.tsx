@@ -13,11 +13,18 @@ export default function PreferencesPage({ boot, refresh, notify }: Props) {
   const [importFile, setImportFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [douban, setDouban] = useState(!!boot.config.douban_enabled);
+  const [tmdb, setTmdb] = useState(!!boot.config.tmdb_enabled);
+  const [tmdbKey, setTmdbKey] = useState(boot.config.tmdb_api_key || '');
+  const [tmdbProxy, setTmdbProxy] = useState(boot.config.tmdb_proxy || '');
+  const [tmdbMsg, setTmdbMsg] = useState('');
   const [borrow, setBorrow] = useState(!!boot.config.borrow_official);
   const [intranet, setIntranet] = useState(!!boot.config.allow_intranet);
 
   useEffect(() => {
     setDouban(!!boot.config.douban_enabled);
+    setTmdb(!!boot.config.tmdb_enabled);
+    setTmdbKey(boot.config.tmdb_api_key || '');
+    setTmdbProxy(boot.config.tmdb_proxy || '');
     setBorrow(!!boot.config.borrow_official);
     setIntranet(!!boot.config.allow_intranet);
   }, [boot]);
@@ -56,6 +63,47 @@ export default function PreferencesPage({ boot, refresh, notify }: Props) {
       notify(douban ? '豆瓣增强已开启' : '豆瓣增强已关闭', 'ok');
     } catch (err) {
       notify(err instanceof Error ? err.message : '保存失败', 'err');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveTmdb() {
+    setBusy(true);
+    try {
+      await api.patchConfig({
+        tmdb_enabled: tmdb,
+        tmdb_api_key: tmdbKey.trim(),
+        tmdb_proxy: tmdbProxy.trim(),
+      });
+      await refresh();
+      notify(tmdb ? 'TMDB 元数据已保存' : 'TMDB 已关闭', 'ok');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '保存失败', 'err');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function testTmdb() {
+    setBusy(true);
+    setTmdbMsg('测试中…');
+    try {
+      // 先落库再测，保证测的是输入框里的 Key 与代理
+      await api.patchConfig({
+        tmdb_enabled: tmdb,
+        tmdb_api_key: tmdbKey.trim(),
+        tmdb_proxy: tmdbProxy.trim(),
+      });
+      const result = await api.tmdbTest();
+      if (result.ok) {
+        setTmdbMsg(`连接正常 · ${result.channel} · ${result.latency_ms} ms`);
+      } else {
+        setTmdbMsg(`失败：${result.error || '未知错误'}`);
+      }
+      await refresh();
+    } catch (err) {
+      setTmdbMsg(err instanceof Error ? err.message : '测试失败');
     } finally {
       setBusy(false);
     }
@@ -172,6 +220,46 @@ export default function PreferencesPage({ boot, refresh, notify }: Props) {
           </button>
           <span className="small">{douban ? '已开启' : '已关闭，零外连'}</span>
         </div>
+      </section>
+
+      <section className="card">
+        <div className="card-title">TMDB 元数据</div>
+        <p className="card-sub">
+          按「片名 + 年份」匹配 TMDB，为在线条目补中文简介、类型、评分、时长、
+          横版背景与演员表；官方媒体库已刮削的条目仍优先用官方数据。
+          API Key 只存本机配置，不入包、不上传；未填 Key 时完全不外连。
+        </p>
+        <div className="grid">
+          <div>
+            <label className="field">API Key（v3）</label>
+            <input type="password" value={tmdbKey} autoComplete="off"
+                   placeholder="32 位十六进制 Key"
+                   onChange={(e) => setTmdbKey(e.target.value)} />
+          </div>
+          <div>
+            <label className="field">出口代理（可选）</label>
+            <input type="text" value={tmdbProxy} autoComplete="off"
+                   placeholder="http://127.0.0.1:7890，留空则先试资源站代理再直连"
+                   onChange={(e) => setTmdbProxy(e.target.value)} />
+          </div>
+        </div>
+        <div className="row mt">
+          <label className="switch">
+            <input
+              type="checkbox" checked={tmdb}
+              onChange={(e) => setTmdb(e.target.checked)}
+            />
+            <span className="slider" />
+          </label>
+          <button className="btn sm" disabled={busy} onClick={() => void saveTmdb()}>
+            {busy ? '保存中…' : '保存'}
+          </button>
+          <button className="btn sm" disabled={busy} onClick={() => void testTmdb()}>
+            测试连接
+          </button>
+          <span className="small">{tmdb ? '已开启' : '已关闭，零外连'}</span>
+        </div>
+        {tmdbMsg && <p className="small mt">{tmdbMsg}</p>}
       </section>
 
       <section className="card">

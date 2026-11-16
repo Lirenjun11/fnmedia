@@ -11,6 +11,7 @@ import hls
 import playcache
 import playstate
 import runtime
+import tmdb
 import upstream
 
 router = APIRouter()
@@ -226,7 +227,12 @@ async def play_list(request: Request):
             # 源被删除/禁用，或落盘缓存缺失：没有可播放线路，跳过这条。
             missing += 1
             continue
-        cards.append(fake.history_card(brief, rec))
+        # 历史列表只读 TMDB 缓存（零网络），未命中的丢后台预热，
+        # 下次进「继续观看」就能拿到横版背景，列表本身不被拖慢。
+        meta = tmdb.cached(brief)
+        if meta is None:
+            tmdb.prefetch_brief(brief)
+        cards.append(fake.history_card(brief, rec, meta))
     if missing:
         runtime.log(f"play/list: {missing} 条历史无可播放数据（缓存缺失或源已删除）")
     cards.sort(key=lambda row: row.get("_updated_at", 0), reverse=True)

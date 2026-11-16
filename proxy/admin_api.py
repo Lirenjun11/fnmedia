@@ -17,6 +17,7 @@ import config
 import hls
 import runtime
 import subscription
+import tmdb
 import upcheck
 import vlib
 
@@ -51,9 +52,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.0"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.1"
     except OSError:
-        return "0.0.2.0"
+        return "0.0.2.1"
 
 
 def _public_config() -> dict:
@@ -596,6 +597,19 @@ def vlib_status() -> dict:
 async def vlib_status_route(request: Request):
     guard(request)
     return ok(vlib_status())
+
+
+@router.get("/tmdb/status")
+async def tmdb_status_route(request: Request):
+    guard(request)
+    return ok(tmdb.status())
+
+
+@router.post("/tmdb/test")
+async def tmdb_test_route(request: Request):
+    """用当前配置的 Key 与出口通道实际请求一次 TMDB，返回耗时与通道。"""
+    guard(request)
+    return ok(await tmdb.probe())
 
 
 @router.get("/vlib/classes")

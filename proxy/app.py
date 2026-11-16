@@ -30,6 +30,7 @@ import playcache
 import playstate
 import playstate_api
 import runtime
+import tmdb
 import upstream
 import vlib
 import vlib_api
@@ -461,7 +462,14 @@ async def item_detail(guid: str, request: Request):
 
 
 async def _item_title_detail(brief: dict, guid: str, request: Request):
-    detail = fake.detail_item(brief)
+    # TMDB 命中缓存立即用；未命中最多等 1 秒，超时先返回源站数据，后台继续补。
+    meta = None
+    if tmdb.enabled():
+        try:
+            meta = await tmdb.enrich(brief)
+        except Exception as exc:
+            runtime.log(f"tmdb enrich error: {type(exc).__name__}")
+    detail = fake.detail_item(brief, meta)
     borrowed = False
     if config.get().get("borrow_official", True):
         try:
@@ -471,10 +479,15 @@ async def _item_title_detail(brief: dict, guid: str, request: Request):
         except Exception as exc:
             runtime.log(f"borrow error: {type(exc).__name__}")
     if config.get().get("douban_enabled") and not borrowed:
+        # 豆瓣只有竖版大图；它会把 backdrops 一起覆盖成竖图。已有 TMDB
+        # 横版背景时保留横图，否则详情页顶部会变成被裁切的竖版海报。
+        tmdb_backdrop = detail.get("backdrops") if meta and meta.get("backdrop") else ""
         try:
             detail = await douban.enrich_poster(
                 request.app.state.poster, detail,
                 brief.get("title"), brief.get("year"))
+            if tmdb_backdrop:
+                detail["backdrops"] = tmdb_backdrop
         except Exception as exc:
             runtime.log(f"douban enrich error: {type(exc).__name__}")
     # 豆瓣补图与官方库借用的海报都是外链，必须转成本站代理，否则客户端
@@ -873,7 +886,8 @@ async def play_info_route(request: Request):
             info = fake.episode_play_info(brief, index, eg)
         else:
             index = 0
-            info = fake.play_info(brief, mg, vg, guid)
+            # 起播不等待富化：只读已缓存结果（纯内存，零网络）。
+            info = fake.play_info(brief, mg, vg, guid, tmdb.cached(brief))
         canonical = guid
     pos = playstate.ts_for(canonical)
     info["ts"] = pos

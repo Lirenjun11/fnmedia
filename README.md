@@ -38,6 +38,7 @@
 | 功能 | 说明 | 详细文档 |
 |---|---|---|
 | 元数据清洗 + 官方刮削借用 | 简介分类清洗、背景图 / 评分 / IMDb，只读官方库 | [docs/metadata.md](docs/metadata.md) |
+| TMDB 元数据富化 | 按片名+年份补中文简介 / 类型 / 评分 / 时长 / 横版背景 / 演员表，可选、未填 Key 零外连 | [docs/metadata.md](docs/metadata.md) |
 | 播放状态 | 收藏 / 已看 / 续播，按飞牛账号隔离，不写官方数据库 | [docs/playback.md](docs/playback.md) |
 | 起播竞速与换线 | 3s 并发优选最快线路，失败自动切换 | [docs/playback.md](docs/playback.md) |
 | 手机 App 播放兜底 | 修复手机端「文件权限不足」403 | [docs/playback.md](docs/playback.md) |

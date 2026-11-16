@@ -28,6 +28,7 @@ import config
 import fake
 import playstate
 import runtime
+import tmdb
 
 CHART_LIB_GUIDS = {
     cat: hashlib.md5(f"fnmedia-vlib:chart:{cat}".encode()).hexdigest()
@@ -814,12 +815,18 @@ async def detail(store: cms.TitleStore, client, guid: str) -> dict | None:
         playstate.apply(row, guid)
         return row
 
-    data = fake.detail_item(brief)
+    # 虚拟库条目详情：只读 TMDB 缓存（零网络），未命中就丢后台预热。
+    meta = tmdb.cached(brief)
+    if meta is None:
+        tmdb.prefetch_brief(brief)
+    data = fake.detail_item(brief, meta)
     poster = _poster_of(brief)
     if poster:
         data["poster"] = poster
-        data["backdrops"] = poster
         data["posters"] = poster
+        # 榜单海报是竖图；已有 TMDB 横版背景时不要被竖图顶掉。
+        if not (meta and meta.get("backdrop")):
+            data["backdrops"] = poster
     chart_meta = brief.get("chart") or {}
     if chart_meta.get("desc"):
         data["overview"] = chart_meta["desc"]

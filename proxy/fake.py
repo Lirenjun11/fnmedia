@@ -222,31 +222,56 @@ def search_card(b: dict) -> dict:
     }
 
 
-def detail_item(b: dict) -> dict:
+def detail_item(b: dict, meta: dict | None = None) -> dict:
+    """在线条目详情。
+
+    ``meta`` 是 TMDB 缓存命中的元数据（可为 None）：简介过短时替换为 TMDB
+    简介，分类/主演/导演优先用 TMDB，海报与横版背景用官方图床（更清晰）。
+    字段契约不变 —— ``genres`` 仍是整型数组（客户端要求），类型名并入简介。
+    """
+    meta = meta if isinstance(meta, dict) else {}
     ov = cms.clean_text(b.get("overview") or "")
+    tm_ov = cms.clean_text(meta.get("overview") or "")
+    # 源站简介常常只有一行；TMDB 中文简介更完整时才替换。
+    if tm_ov and len(ov) < 60:
+        ov = tm_ov
+    genres = [g.strip() for g in (meta.get("genres") or [])
+              if isinstance(g, str) and g.strip()]
+    cast = [c.get("name") for c in (meta.get("cast") or [])
+            if isinstance(c, dict) and c.get("name")][:8]
     extra = []
-    if b.get("type_name"):
-        extra.append(f"分类：{b['type_name']}")
-    if b.get("actor"):
-        extra.append(f"主演：{b['actor']}")
-    if b.get("director"):
-        extra.append(f"导演：{b['director']}")
+    category = " / ".join(genres[:6]) or b.get("type_name")
+    if category:
+        extra.append(f"分类：{category}")
+    actor = " / ".join(cast) or b.get("actor")
+    if actor:
+        extra.append(f"主演：{actor}")
+    director = meta.get("director") or b.get("director")
+    if director:
+        extra.append(f"导演：{director}")
     if b.get("updated"):
         extra.append(f"更新：{b['updated']}")
     if extra:
         ov = (ov + "\n\n" if ov else "") + "\n".join(extra)
-    poster = poster_path(b.get("poster", ""))
+    poster = poster_path(meta.get("poster") or b.get("poster") or "")
+    backdrop = poster_path(meta.get("backdrop") or "") or poster
+    vote = meta.get("vote_average") or b.get("score") or "0"
     return {
         "guid": b["guid"], "imdb_id": "", "trim_id": "", "tv_title": "",
         "parent_title": "", "title": b["title"], "logos": "",
         "poster": poster,
-        "original_title": "", "backdrops": poster, "posters": poster,
+        "original_title": meta.get("original_title") or "",
+        "backdrops": backdrop, "posters": poster,
         "poster_width": 0, "poster_height": 0,
-        "vote_average": str(b.get("score") or "0"), "genres": [],
-        "content_ratings": "", "release_date": b.get("year") or "",
-        "runtime": 0, "production_countries": [b["area"]] if b.get("area") else [],
+        "vote_average": str(vote), "genres": [],
+        "content_ratings": "",
+        "release_date": meta.get("release_date") or b.get("year") or "",
+        "runtime": int(meta.get("runtime") or 0),
+        "production_countries": [b["area"]] if b.get("area") else [],
         "overview": ov, "is_favorite": 0, "is_watched": 0, "watched_ts": 0,
         "air_date": b.get("year") or "", "season_number": 0,
+        # 季/集数必须与 season/list、episode/list 伪造出的结构一致，
+        # 不能直接采用 TMDB 的season 数，否则客户端会去找不存在的季。
         "number_of_seasons": 1 if b.get("is_tv") else 0,
         "number_of_episodes": b.get("episodes", 0),
         "local_number_of_episodes": b.get("episodes", 0) if b.get("is_tv") else 0,
@@ -521,13 +546,14 @@ def person_list(b: dict) -> dict:
     return {"total": len(out), "list": out[:30]}
 
 
-def play_info(b: dict, mg: str, vg: str, guid: str) -> dict:
+def play_info(b: dict, mg: str, vg: str, guid: str,
+              meta: dict | None = None) -> dict:
     return {
         "grand_guid": "", "guid": guid, "parent_guid": "",
         "play_config": None, "ts": 0,
         "type": "TV" if b.get("is_tv") else "Movie",
         "video_guid": vg, "audio_guid": "", "subtitle_guid": "",
-        "media_guid": mg, "item": detail_item(b),
+        "media_guid": mg, "item": detail_item(b, meta),
         "direct_link_audio_index": -1,
     }
 
@@ -543,8 +569,14 @@ def episode_play_info(b: dict, index: int, guid: str) -> dict:
     }
 
 
-def history_card(b: dict, rec: dict) -> dict:
+def history_card(b: dict, rec: dict, meta: dict | None = None) -> dict:
     row = search_card(b)
+    # 继续观看/播放历史按横幅排版：有 TMDB 横图就用横图，避免竖版海报被裁。
+    backdrop = poster_path((meta or {}).get("backdrop") or "")
+    if backdrop:
+        row["poster"] = backdrop
+        row["backdrops"] = backdrop
+        row["posters"] = backdrop
     pos = int(rec.get("ts") or 0)
     row["ts"] = pos
     # 继续观看卡片的进度条读 watched_ts（与 play/info 的续播字段同一语义）。
