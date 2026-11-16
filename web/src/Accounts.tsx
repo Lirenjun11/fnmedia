@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  api, type AclProbe, type AclStatus, type Bootstrap,
+  api, type AclLib, type AclProbe, type AclStatus, type Bootstrap,
 } from './api';
 import type { Notify } from './App';
 
@@ -171,6 +171,45 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
   const subject = status?.subjects.find((s) => s.id === active);
   const grant = status?.grants[active];
   const configured = !!grant;
+
+  // 授权列表按「榜单 / 四大类」与「每个映射源」分组，各带一个全选：
+  // 某个源有几十个分类时，不必逐个点。
+  const libGroups = (() => {
+    const all: AclLib[] = status?.libs || [];
+    const plain = all.filter((l) => l.kind !== 'source');
+    const order: string[] = [];
+    const buckets = new Map<string, AclLib[]>();
+    for (const lib of all) {
+      if (lib.kind !== 'source') continue;
+      const name = lib.group || '其他源';
+      if (!buckets.has(name)) { buckets.set(name, []); order.push(name); }
+      buckets.get(name)!.push(lib);
+    }
+    return {
+      plain,
+      sources: order.map((name) => ({ name, items: buckets.get(name) || [] })),
+    };
+  })();
+
+  const allChecked = (items: AclLib[]) =>
+    items.length > 0 && items.every((l) => libs.includes(l.key));
+  const toggleKeys = (items: AclLib[]) => setLibs((cur) => allChecked(items)
+    ? cur.filter((k) => !items.some((l) => l.key === k))
+    : [...new Set([...cur, ...items.map((l) => l.key)])]);
+
+  const libBox = (lib: AclLib) => (
+    <label key={lib.key} className="row" style={{ cursor: 'pointer', gap: 6 }}>
+      <input
+        className="check" type="checkbox"
+        checked={libs.includes(lib.key)}
+        onChange={(e) => setLibs((cur) => e.target.checked
+          ? [...new Set([...cur, lib.key])]
+          : cur.filter((k) => k !== lib.key))}
+      />
+      <span>{lib.title}</span>
+      <span className="small">{lib.key}</span>
+    </label>
+  );
 
   return (
     <>
@@ -415,24 +454,39 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                   <button className="btn sm ghost" onClick={() => setLibs(
                     libs.length === (status?.libs.length || 0) ? []
                       : (status?.libs.map((l) => l.key) || []))}>
-                    {libs.length === (status?.libs.length || 0) ? '全不选' : '全选'}
+                    {libs.length === (status?.libs.length || 0) ? '全不选' : '全部全选'}
                   </button>
                 </div>
-                <div className="grid">
-                  {status?.libs.map((lib) => (
-                    <label key={lib.key} className="row" style={{ cursor: 'pointer', gap: 6 }}>
-                      <input
-                        className="check" type="checkbox"
-                        checked={libs.includes(lib.key)}
-                        onChange={(e) => setLibs((cur) => e.target.checked
-                          ? [...new Set([...cur, lib.key])]
-                          : cur.filter((k) => k !== lib.key))}
-                      />
-                      <span>{lib.title}</span>
-                      <span className="small">{lib.key}</span>
-                    </label>
-                  ))}
-                </div>
+
+                {libGroups.plain.length > 0 && (
+                  <div className="stack">
+                    <div className="row" style={{ justifyContent: 'space-between' }}>
+                      <span className="small">
+                        榜单与四大类 · {libGroups.plain.length} 个
+                      </span>
+                      <button className="btn sm ghost"
+                              onClick={() => toggleKeys(libGroups.plain)}>
+                        {allChecked(libGroups.plain) ? '全不选' : '全选'}
+                      </button>
+                    </div>
+                    <div className="grid">{libGroups.plain.map(libBox)}</div>
+                  </div>
+                )}
+
+                {libGroups.sources.map((group) => (
+                  <div key={group.name} className="stack">
+                    <div className="row" style={{ justifyContent: 'space-between' }}>
+                      <span className="small">
+                        {group.name} · {group.items.length} 个分类库
+                      </span>
+                      <button className="btn sm ghost"
+                              onClick={() => toggleKeys(group.items)}>
+                        {allChecked(group.items) ? '全不选' : '全选'}
+                      </button>
+                    </div>
+                    <div className="grid">{group.items.map(libBox)}</div>
+                  </div>
+                ))}
 
                 <div className="divider" />
                 <label className="row" style={{ cursor: 'pointer' }}>

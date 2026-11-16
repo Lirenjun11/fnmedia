@@ -559,6 +559,26 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
     });
   }
 
+  /** 「全选」的作用范围：优先只取未过滤的分类；整源都是脏类时才退回全部。 */
+  function allClassIds(sid: string): string[] {
+    const opts = classOptions[sid] || [];
+    const clean = opts.filter((c) => !c.junk).map((c) => c.id);
+    return clean.length ? clean : opts.map((c) => c.id);
+  }
+
+  function toggleAllClasses(sid: string) {
+    setForm((current) => {
+      const all = allClassIds(sid);
+      const saved = current.vlib_class_ids[sid];
+      const cur = saved !== undefined ? saved
+        : (classOptions[sid] || []).filter((c) => !c.junk).map((c) => c.id);
+      // 只作用于当前这一个源：其它源的勾选保持原样。
+      const next = all.length && all.every((id) => cur.includes(id)) ? [] : all;
+      return { ...current,
+        vlib_class_ids: { ...current.vlib_class_ids, [sid]: next } };
+    });
+  }
+
   async function save() {
     if (form.vlib_split === 'source_category') {
       const empty = form.vlib_sources.find((sid) =>
@@ -690,15 +710,24 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
                 const source = boot.sources.find((x) => x.id === sid);
                 const opts = classOptions[sid] || [];
                 const picked = selectedClasses(sid);
+                const bulk = allClassIds(sid);
+                const allPicked = bulk.length > 0
+                  && bulk.every((id) => picked.includes(id));
                 return (
                   <div key={sid} className="stack">
-                    <div className="row">
-                      <span className="badge ok">{source?.name || sid}</span>
-                      <span className="small">
-                        {opts.length
-                          ? `${opts.length} 个分类，已选 ${picked.length} 个`
-                          : '分类读取中或该源不支持分类表…'}
-                      </span>
+                    <div className="row" style={{ justifyContent: 'space-between' }}>
+                      <div className="row" style={{ gap: 6 }}>
+                        <span className="badge ok">{source?.name || sid}</span>
+                        <span className="small">
+                          {opts.length
+                            ? `${opts.length} 个分类，已选 ${picked.length} 个`
+                            : '分类读取中或该源不支持分类表…'}
+                        </span>
+                      </div>
+                      <button className="btn sm ghost" disabled={!opts.length}
+                              onClick={() => toggleAllClasses(sid)}>
+                        {allPicked ? '全不选' : '全选'}
+                      </button>
                     </div>
                     <div className="grid">
                       {opts.map((c) => (
@@ -716,8 +745,8 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
               })}
             </div>
             <p className="hint">
-              解说 / 预告 / 福利等脏类也会列出但默认不勾，需要时可手动勾选。
-              卡片数量 = 各片源已选分类数之和，一个片源最多取 40 个分类。
+              「全选」只勾选未过滤的分类，解说 / 预告 / 福利等脏类需要时再单独勾。
+              卡片数量 = 各片源已选分类数之和，一个片源最多取 60 个分类。
             </p>
           </>
         ) : (
@@ -753,7 +782,7 @@ export function VirtualLibPage({ boot, refresh, notify }: Props) {
         </div>
         <p className="hint">
           保存后会在后台立即重建分类路由，稍等片刻重新进入飞牛影视即可看到。
-          卡片数量 = 各片源已选分类数之和，建议不超过 6 个源、每源 40 个分类。
+          卡片数量 = 各片源已选分类数之和，建议不超过 6 个源、每源 60 个分类。
         </p>
 
         <div className="row end mt">
