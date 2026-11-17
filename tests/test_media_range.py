@@ -117,6 +117,29 @@ class MediaRangeTest(unittest.TestCase):
         self.assertIn("#EXTM3U", resp.text)
         self.assertIn("/v/media/online/seg?u=", resp.text)
 
+    def test_ios_slow_playlist_returns_placeholder(self):
+        import asyncio
+
+        async def handler(request):
+            await asyncio.sleep(3.0)
+            return httpx.Response(
+                200, headers={"content-type": "application/vnd.apple.mpegurl"},
+                content=b"#EXTM3U\n#EXTINF:6.0,\ns.ts\n#EXT-X-ENDLIST\n")
+
+        def action(client, brief):
+            self._install(handler)
+            mg = fake.media_guid(brief["guid"])
+            return client.get(
+                f"/v/api/v1/media/range/{mg}",
+                headers={"User-Agent": "1.13.0 (com.trim.media.ios; "
+                                       "build:1130000; iOS 27.2) Flutter/3.11.5"},
+                follow_redirects=False)
+        resp = self._run(_title("m3u8", "https://example.com/slow.m3u8"),
+                         action)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("x-fnmedia-placeholder"), "1")
+        self.assertIn("_placeholder/placeholder.ts", resp.text)
+
     def test_ios_play_link_is_absolute(self):
         ua = ("1.13.0 (com.trim.media.ios; build:1130000; "
               "iOS 27.2) Flutter/3.11.5")

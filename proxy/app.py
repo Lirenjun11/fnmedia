@@ -1062,11 +1062,16 @@ async def media_range_route(file_hash: str, request: Request):
             main_scope = dict(request.scope)
             main_scope["path"] = f"{ONLINE}/{mg}/main.m3u8"
             main_scope["query_string"] = (
-                f"line={line}&index={index}{auto}").encode()
+                f"line={line}&index={index}{auto}&ph=1").encode()
             started = time.monotonic()
             resp = await main_m3u8(mg, Request(main_scope))
+            body = resp.body if isinstance(resp.body, (bytes, bytearray)) else b""
+            segs = sum(1 for ln in body.splitlines()
+                       if ln.strip() and not ln.startswith(b"#"))
+            ph = " ph=1" if resp.headers.get(
+                "X-fnmedia-Placeholder") == "1" else ""
             runtime.log(f"ios hls: {brief.get('title', '')[:30]} ep{index + 1} "
-                        f"line{line} -> {resp.status_code} "
+                        f"line{line} -> {resp.status_code}{ph} segs={segs} "
                         f"{int((time.monotonic() - started) * 1000)}ms")
             return resp
         # 其它端保持原逻辑：302 到媒体清单，避免多包一层 master 等待。
@@ -1207,6 +1212,82 @@ async def preset_m3u8(mg: str, request: Request):
                              "Cache-Control": "no-store"})
 
 
+_PLACEHOLDER_DIR = Path(__file__).resolve().parent / "assets" / "placeholder"
+_PH_SEG_DUR = 2.0
+_PH_WINDOW = 3
+_IOS_READY_BUDGET = 2.2
+_IOS_WARM_TIMEOUT = 20.0
+_IOS_WARM: dict[tuple, asyncio.Task] = {}
+
+
+def _placeholder_playlist(mg: str) -> Response:
+    """线路清单还没就绪时先回直播式占位清单（200），让播放器保持轮询而不是报错。
+
+    占位分片用真实 TS（assets/placeholder/placeholder.ts）；播放器每 2s 重拉
+    media/range，后台清单就绪后下一次轮询即切回正片。
+    """
+    seq = int(time.time() // int(_PH_SEG_DUR))
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+             f"#EXT-X-TARGETDURATION:{int(_PH_SEG_DUR)}",
+             f"#EXT-X-MEDIA-SEQUENCE:{seq}",
+             "#EXT-X-DISCONTINUITY-SEQUENCE:0"]
+    for i in range(_PH_WINDOW):
+        lines.append(f"#EXTINF:{_PH_SEG_DUR:.3f},")
+        lines.append(f"{ONLINE}/{mg}/_placeholder/placeholder.ts?n={seq + i}")
+    return Response("\n".join(lines) + "\n",
+                    media_type="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-store",
+                             "Access-Control-Allow-Origin": "*",
+                             "X-fnmedia-Placeholder": "1"})
+
+
+@app.get(f"{ONLINE}/{{mg}}/_placeholder/placeholder.ts")
+async def placeholder_ts(mg: str, request: Request):
+    path = _PLACEHOLDER_DIR / "placeholder.ts"
+    if not path.exists():
+        return Response(status_code=404)
+    return Response(path.read_bytes(), media_type="video/mp2t",
+                    headers={"Cache-Control": "public, max-age=86400",
+                             "Access-Control-Allow-Origin": "*"})
+
+
+def _warm_playlist_task(request: Request, brief: dict, guid: str,
+                        index: int, line: int) -> asyncio.Task | None:
+    """单飞预热清单：首个 media/range 只等 2.2s，剩余时间在后台继续抓。"""
+    key = (guid, line, index)
+    task = _IOS_WARM.get(key)
+    if task is not None and not task.done():
+        return task
+    picked = _pick(brief, line, index)
+    if not picked:
+        return None
+    try:
+        url = hls.ensure_public_target(picked[0])
+    except ValueError:
+        return None
+    client = request.app.state.src
+
+    async def run():
+        text, base, meta = await asyncio.wait_for(
+            hls.fetch_playlist(client, url, timeout=_IOS_WARM_TIMEOUT),
+            timeout=_IOS_WARM_TIMEOUT)
+        hls.remember_playlist_text(key, text, base, meta)
+        hls.remember_playlist_meta(key, meta)
+        return text, base, meta
+
+    task = asyncio.create_task(run())
+    _IOS_WARM[key] = task
+
+    def _clean(done):
+        if _IOS_WARM.get(key) is done:
+            _IOS_WARM.pop(key, None)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(_clean)
+    return task
+
+
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")
 async def main_m3u8(mg: str, request: Request):
     target = await _media_target(request, mg, enforce=False)
@@ -1252,6 +1333,28 @@ async def main_m3u8(mg: str, request: Request):
                                          hls.is_master(text),
                                          hls.can_decrypt(),
                                          start_offset=start_offset)
+    if request.query_params.get("ph") == "1":
+        # iOS media/range 专用：只等 2.2s，慢源先回占位清单，后台继续抓。
+        task = _warm_playlist_task(request, brief, guid, index, line)
+        if task is not None:
+            try:
+                text, base, meta = await asyncio.wait_for(
+                    asyncio.shield(task), _IOS_READY_BUDGET)
+            except asyncio.TimeoutError:
+                runtime.log(f"ios slow playlist: {brief.get('title', '')[:40]} "
+                            f"line{line} -> placeholder")
+                return _placeholder_playlist(mg)
+            except Exception as exc:
+                _mark_bad_line(guid, line)
+                runtime.log(f"ios playlist error: {brief.get('title', '')[:40]} "
+                            f"line{line} ({type(exc).__name__})")
+            else:
+                return hls.playlist_response(text, base, SEG_PREFIX,
+                                             f"{ONLINE}/variant",
+                                             hls.is_master(text),
+                                             hls.can_decrypt(),
+                                             start_offset=start_offset)
+
     last_error = ""
     tried = set()
     while len(tried) < 2:
