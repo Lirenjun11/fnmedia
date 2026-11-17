@@ -140,7 +140,7 @@ class MediaRangeTest(unittest.TestCase):
         self.assertEqual(resp.headers.get("x-fnmedia-placeholder"), "1")
         self.assertIn("_placeholder/placeholder.ts", resp.text)
 
-    def test_ios_play_link_is_absolute(self):
+    def test_play_link_stays_relative(self):
         ua = ("1.13.0 (com.trim.media.ios; build:1130000; "
               "iOS 27.2) Flutter/3.11.5")
 
@@ -148,17 +148,13 @@ class MediaRangeTest(unittest.TestCase):
             mg = fake.media_guid(brief["guid"])
             ios = client.post("/v/api/v1/play/play", json={"media_guid": mg},
                               headers={"User-Agent": ua}).json()["data"]
-            ported = client.post(
-                "/v/api/v1/play/play", json={"media_guid": mg},
-                headers={"User-Agent": ua, "Host": "192.168.0.77:5666",
-                         "X-Forwarded-Host": "192.168.0.77"}).json()["data"]
             web = client.post("/v/api/v1/play/play",
                               json={"media_guid": mg}).json()["data"]
-            return ios, ported, web
-        ios, ported, web = self._run(_title("m3u8"), action)
-        self.assertTrue(ios["play_link"].startswith("http://testserver/"))
-        self.assertTrue(ported["play_link"].startswith(
-            "http://192.168.0.77:5666/"))
+            return ios, web
+        ios, web = self._run(_title("m3u8"), action)
+        # 两端都用相对地址：App 按自己配置的服务器地址（含端口）解析，
+        # 绝对地址会因反代 Host 不带端口而丢掉 5666。
+        self.assertTrue(ios["play_link"].startswith("/v/media/online/"))
         self.assertTrue(web["play_link"].startswith("/v/media/online/"))
 
     def test_official_hash_passthrough(self):

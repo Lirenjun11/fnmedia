@@ -189,28 +189,6 @@ def _ua(request: Request) -> str:
     return request.headers.get("user-agent", "")
 
 
-def _public_base(request: Request) -> str:
-    """按客户端实际访问的 scheme/host 拼绝对地址（原生播放器不会做相对解析）。
-
-    x-forwarded-host 常被反代写成不带端口的 $host（例如 192.168.0.77），
-    直接拿来拼地址会丢掉 5666 端口，App 请求到 80 端口报「视频文件不存在」。
-    因此优先使用客户端原始 Host（自带端口），缺失时才退回转发头/端口。
-    """
-    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    if scheme not in ("http", "https"):
-        scheme = request.url.scheme
-    host = request.headers.get("host", "").strip()
-    if not host:
-        host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
-    if host and ":" not in host:
-        port = request.headers.get("x-forwarded-port", "").split(",")[0].strip()
-        if port and not ((scheme == "http" and port == "80")
-                         or (scheme == "https" and port == "443")):
-            host = f"{host}:{port}"
-    host = host or request.url.netloc
-    return f"{scheme}://{host}"
-
-
 def _is_ios(request: Request) -> bool:
     """识别 iOS 端（含 Flutter / Alamofire 两种网络栈）。
 
@@ -1130,13 +1108,12 @@ async def play_play(request: Request):
         return _err("该线路暂不支持，请在红果服务里切换内置源", 404)
     is_hls = not _is_direct_media(url)
     suffix = "preset.m3u8" if is_hls else "direct"
+    # 保持相对地址：App 会按自己配置的服务器地址（含 5666 端口）解析。
+    # 不能按 Host 拼绝对地址——反代会把 Host 写成不带端口的 $host，
+    # 拼出来会丢端口，App 请求到 80 端口报「视频文件不存在」。
     link = f"{ONLINE}/{mg}/{suffix}?line={line}&index={index}"
     if not explicit:
         link += "&auto=1"
-    if _is_ios(request):
-        # 新版 iOS 的 fncache 直接拿 play_link 构造原生播放项，不再按接口域名
-        # 补全相对路径；相对地址会得到空 source，表现就是一直转圈且没有任何媒体请求。
-        link = _public_base(request) + link
     try:
         start = int(float(body.get("startTimestamp")
                           or body.get("start_ts") or 0))
