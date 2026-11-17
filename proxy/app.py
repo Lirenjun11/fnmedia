@@ -1053,7 +1053,12 @@ async def media_range_route(file_hash: str, request: Request):
             main_scope["path"] = f"{ONLINE}/{mg}/main.m3u8"
             main_scope["query_string"] = (
                 f"line={line}&index={index}{auto}").encode()
-            return await main_m3u8(mg, Request(main_scope))
+            started = time.monotonic()
+            resp = await main_m3u8(mg, Request(main_scope))
+            runtime.log(f"ios hls: {brief.get('title', '')[:30]} ep{index + 1} "
+                        f"line{line} -> {resp.status_code} "
+                        f"{int((time.monotonic() - started) * 1000)}ms")
+            return resp
         # 其它端保持原逻辑：302 到媒体清单，避免多包一层 master 等待。
         return Response(status_code=302, headers={
             "Location": f"{ONLINE}/{mg}/main.m3u8?line={line}"
@@ -1203,7 +1208,11 @@ async def main_m3u8(mg: str, request: Request):
         start_offset = float(request.query_params.get("start") or 0)
     except ValueError:
         start_offset = 0.0
-    auto_start = request.query_params.get("auto") == "1"
+    # 带显式 line 的 auto=1 来自 media/range（App 起播）：直接用该线路，
+    # 不再竞速所有候选。竞速会给慢源叠加最多 3s，也可能选中“清单快但分片死”
+    # 的线路，表现就是部分影片一直加载。
+    auto_start = (request.query_params.get("auto") == "1"
+                  and not request.query_params.get("line"))
     if not auto_start:
         cached = hls.get_playlist_text((guid, line, index))
         if cached:
