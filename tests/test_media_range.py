@@ -90,6 +90,33 @@ class MediaRangeTest(unittest.TestCase):
         self.assertIn("line=1", resp.headers["location"])
         self.assertNotIn("auto=1", resp.headers["location"])
 
+    def test_new_ios_gets_playlist_without_redirect(self):
+        playlist = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n"
+                    "#EXT-X-MEDIA-SEQUENCE:0\n"
+                    "#EXTINF:6.000,\nseg1.ts\n#EXTINF:6.000,\nseg2.ts\n"
+                    "#EXT-X-ENDLIST\n")
+
+        def handler(request):
+            if "movie.m3u8" in str(request.url):
+                return httpx.Response(
+                    200, headers={"content-type": "application/vnd.apple.mpegurl"},
+                    content=playlist.encode())
+            return httpx.Response(200, content=b"\x00")
+
+        def action(client, brief):
+            self._install(handler)
+            mg = fake.media_guid(brief["guid"])
+            return client.get(
+                f"/v/api/v1/media/range/{mg}",
+                headers={"User-Agent": "1.13.0 (com.trim.media.ios; "
+                                       "build:1130000; iOS 27.2) Flutter/3.11.5"},
+                follow_redirects=False)
+        resp = self._run(_title("m3u8"), action)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("mpegurl", resp.headers["content-type"])
+        self.assertIn("#EXTM3U", resp.text)
+        self.assertIn("/v/media/online/seg?u=", resp.text)
+
     def test_official_hash_passthrough(self):
         async def fake_forward(req, client_):
             return JSONResponse({"data": "official"}, status_code=200)

@@ -189,6 +189,19 @@ def _ua(request: Request) -> str:
     return request.headers.get("user-agent", "")
 
 
+def _is_ios(request: Request) -> bool:
+    """识别 iOS 端（含 Flutter / Alamofire 两种网络栈）。
+
+    新 iOS（1.13.0 起带 fncache）对 media/range 的 302 只取清单、不再继续请求
+    分片，必须与官方一样在同一请求内直接返回 200 播放内容。
+    """
+    ua = _ua(request).lower()
+    if "tvos" in ua:
+        return False
+    return ("com.trim.media.ios" in ua or "iphone" in ua
+            or "ipad" in ua or "alamofire" in ua)
+
+
 async def _passthrough(request: Request):
     try:
         return await upstream.forward(request, request.app.state.up)
@@ -1031,8 +1044,17 @@ async def media_range_route(file_hash: str, request: Request):
     runtime.log(f"media/range takeover: {brief.get('title', '')[:30]} "
                 f"ep{index + 1} line{line} -> {'hls' if is_hls else 'direct'}")
     if is_hls:
-        # 原生播放器走 Range：直接给媒体清单，避免多包一层 master 等待。
         auto = "&auto=1" if not explicit else ""
+        if _is_ios(request):
+            # 新版 iOS（1.13.0+ fncache）对 media/range 的 302 只会把 main 清单
+            # 当普通内容取下来，原生播放器不再继续请求分片，界面一直「视频加载中」。
+            # 这里同一请求内直接构造并返回单线路 main 清单（200），复刻官方行为。
+            main_scope = dict(request.scope)
+            main_scope["path"] = f"{ONLINE}/{mg}/main.m3u8"
+            main_scope["query_string"] = (
+                f"line={line}&index={index}{auto}").encode()
+            return await main_m3u8(mg, Request(main_scope))
+        # 其它端保持原逻辑：302 到媒体清单，避免多包一层 master 等待。
         return Response(status_code=302, headers={
             "Location": f"{ONLINE}/{mg}/main.m3u8?line={line}"
                         f"&index={index}{auto}"})
