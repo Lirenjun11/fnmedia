@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -185,8 +186,17 @@ async def play_record(request: Request):
                       "episode_guid": episode}, brief,
                      float(meta.get("duration") or 0))
     playcache.remember(brief)
+    link = str(body.get("play_link") or "")
+    where = ""
+    if link:
+        try:
+            parts = urllib.parse.urlsplit(link)
+            where = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        except ValueError:
+            where = ""
     runtime.log(f"play/record: {brief.get('title', '')[:30]} ep{index + 1} "
                 f"ts={body.get('ts')!r} dur={body.get('duration')!r} "
+                f"link={where[:140]!r} "
                 f"keys={','.join(sorted(str(k) for k in body)[:10])}")
     return JSONResponse({"code": 0, "msg": "", "data": True})
 

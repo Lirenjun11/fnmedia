@@ -189,6 +189,16 @@ def _ua(request: Request) -> str:
     return request.headers.get("user-agent", "")
 
 
+def _public_base(request: Request) -> str:
+    """按客户端实际访问的 scheme/host 拼绝对地址（原生播放器不会做相对解析）。"""
+    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if scheme not in ("http", "https"):
+        scheme = request.url.scheme
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    host = host or request.headers.get("host", "") or request.url.netloc
+    return f"{scheme}://{host}"
+
+
 def _is_ios(request: Request) -> bool:
     """识别 iOS 端（含 Flutter / Alamofire 两种网络栈）。
 
@@ -1106,6 +1116,10 @@ async def play_play(request: Request):
     link = f"{ONLINE}/{mg}/{suffix}?line={line}&index={index}"
     if not explicit:
         link += "&auto=1"
+    if _is_ios(request):
+        # 新版 iOS 的 fncache 直接拿 play_link 构造原生播放项，不再按接口域名
+        # 补全相对路径；相对地址会得到空 source，表现就是一直转圈且没有任何媒体请求。
+        link = _public_base(request) + link
     try:
         start = int(float(body.get("startTimestamp")
                           or body.get("start_ts") or 0))

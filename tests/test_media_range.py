@@ -117,6 +117,21 @@ class MediaRangeTest(unittest.TestCase):
         self.assertIn("#EXTM3U", resp.text)
         self.assertIn("/v/media/online/seg?u=", resp.text)
 
+    def test_ios_play_link_is_absolute(self):
+        ua = ("1.13.0 (com.trim.media.ios; build:1130000; "
+              "iOS 27.2) Flutter/3.11.5")
+
+        def action(client, brief):
+            mg = fake.media_guid(brief["guid"])
+            ios = client.post("/v/api/v1/play/play", json={"media_guid": mg},
+                              headers={"User-Agent": ua}).json()["data"]
+            web = client.post("/v/api/v1/play/play",
+                              json={"media_guid": mg}).json()["data"]
+            return ios, web
+        ios, web = self._run(_title("m3u8"), action)
+        self.assertTrue(ios["play_link"].startswith("http://testserver/"))
+        self.assertTrue(web["play_link"].startswith("/v/media/online/"))
+
     def test_official_hash_passthrough(self):
         async def fake_forward(req, client_):
             return JSONResponse({"data": "official"}, status_code=200)
