@@ -148,11 +148,17 @@ class MediaRangeTest(unittest.TestCase):
             mg = fake.media_guid(brief["guid"])
             ios = client.post("/v/api/v1/play/play", json={"media_guid": mg},
                               headers={"User-Agent": ua}).json()["data"]
+            ported = client.post(
+                "/v/api/v1/play/play", json={"media_guid": mg},
+                headers={"User-Agent": ua, "Host": "192.168.0.77:5666",
+                         "X-Forwarded-Host": "192.168.0.77"}).json()["data"]
             web = client.post("/v/api/v1/play/play",
                               json={"media_guid": mg}).json()["data"]
-            return ios, web
-        ios, web = self._run(_title("m3u8"), action)
+            return ios, ported, web
+        ios, ported, web = self._run(_title("m3u8"), action)
         self.assertTrue(ios["play_link"].startswith("http://testserver/"))
+        self.assertTrue(ported["play_link"].startswith(
+            "http://192.168.0.77:5666/"))
         self.assertTrue(web["play_link"].startswith("/v/media/online/"))
 
     def test_official_hash_passthrough(self):

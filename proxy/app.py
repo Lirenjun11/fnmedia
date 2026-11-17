@@ -190,12 +190,24 @@ def _ua(request: Request) -> str:
 
 
 def _public_base(request: Request) -> str:
-    """按客户端实际访问的 scheme/host 拼绝对地址（原生播放器不会做相对解析）。"""
+    """按客户端实际访问的 scheme/host 拼绝对地址（原生播放器不会做相对解析）。
+
+    x-forwarded-host 常被反代写成不带端口的 $host（例如 192.168.0.77），
+    直接拿来拼地址会丢掉 5666 端口，App 请求到 80 端口报「视频文件不存在」。
+    因此优先使用客户端原始 Host（自带端口），缺失时才退回转发头/端口。
+    """
     scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
     if scheme not in ("http", "https"):
         scheme = request.url.scheme
-    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
-    host = host or request.headers.get("host", "") or request.url.netloc
+    host = request.headers.get("host", "").strip()
+    if not host:
+        host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    if host and ":" not in host:
+        port = request.headers.get("x-forwarded-port", "").split(",")[0].strip()
+        if port and not ((scheme == "http" and port == "80")
+                         or (scheme == "https" and port == "443")):
+            host = f"{host}:{port}"
+    host = host or request.url.netloc
     return f"{scheme}://{host}"
 
 
