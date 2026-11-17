@@ -365,6 +365,15 @@ def episode_list(b: dict) -> list[dict]:
 _TIERS = ((2160, "4k"), (1440, "2k"), (1080, "1080p"), (720, "720p"),
           (480, "480p"), (360, "360p"), (240, "240p"))
 
+# 适配层只给档位标签（如红果的 x-stream-quality: 1080p / 360p）时换算成像素。
+_RES_SIZES = {
+    "4k": (3840, 2160), "2160p": (3840, 2160),
+    "2k": (2560, 1440), "1440p": (2560, 1440),
+    "1080p": (1920, 1080), "720p": (1280, 720),
+    "540p": (960, 540), "480p": (854, 480),
+    "360p": (640, 360), "240p": (426, 240),
+}
+
 
 def resolution_type(height: int) -> str:
     for value, label in _TIERS:
@@ -376,17 +385,29 @@ def resolution_type(height: int) -> str:
 def stream_list(b: dict, mg: str, vg: str, meta: dict | None = None) -> dict:
     ext = b.get("primary_ext") or "m3u8"
     wrapper = "MP4" if ext == "mp4" else "HLS"
+    meta = meta if isinstance(meta, dict) else {}
     width, height, bps = 1920, 1080, 0
     resolution = "1080p"
-    if meta:
-        meta_width = int(meta.get("width") or 0)
-        meta_height = int(meta.get("height") or 0)
-        if meta_height > 0:
-            width, height = meta_width, meta_height
-            resolution = resolution_type(min(meta_width, meta_height))
-        meta_bps = int(meta.get("bandwidth") or 0)
-        if meta_bps > 0:
-            bps = meta_bps
+    meta_width = int(meta.get("width") or 0)
+    meta_height = int(meta.get("height") or 0)
+    if (meta_width <= 0 or meta_height <= 0) and meta.get("resolution"):
+        size = _RES_SIZES.get(str(meta["resolution"]).strip().lower())
+        if size:
+            meta_width, meta_height = size
+    if meta_height > 0:
+        width = meta_width or width
+        height = meta_height
+        resolution = resolution_type(min(width, height))
+    meta_bps = int(meta.get("bandwidth") or 0)
+    if meta_bps > 0:
+        bps = meta_bps
+    codec = str(meta.get("codec") or "").strip().lower()
+    if codec in ("hevc", "h265"):
+        codec_name, profile = "hevc", "Main"
+    elif codec == "av1":
+        codec_name, profile = "av1", "Main"
+    else:
+        codec_name, profile = "h264", "High"
     return {
         "files": [{
             "guid": mg, "path": f"在线/{b['title']}.{ext}",
@@ -398,12 +419,12 @@ def stream_list(b: dict, mg: str, vg: str, meta: dict | None = None) -> dict:
         "video_streams": [{
             "media_guid": mg, "title": "", "guid": vg,
             "resolution_type": resolution, "color_range_type": "SDR",
-            "codec_name": "h264", "codec_type": "video", "color_range": "tv",
-            "profile": "High", "index": 0, "width": width, "height": height,
+            "codec_name": codec_name, "codec_type": "video", "color_range": "tv",
+            "profile": profile, "index": 0, "width": width, "height": height,
             "coded_width": 0, "coded_height": 0, "display_aspect_ratio": "16:9",
             "pix_fmt": "yuv420p", "level": "40", "color_space": "",
             "color_transfer": "", "color_primaries": "",
-            "duration": int((meta or {}).get("duration") or 0) if isinstance(meta, dict) else 0,
+            "duration": int(meta.get("duration") or 0),
             "dv_profile": 0, "refs": 1, "r_frame_rate": "25 fps",
             "avg_frame_rate": "25 fps", "bits_per_raw_sample": "8", "bps": bps,
             "progressive": 1, "bit_depth": 8, "wrapper": wrapper,

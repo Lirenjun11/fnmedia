@@ -266,6 +266,21 @@ class FakeTest(unittest.TestCase):
         self.assertEqual(video3["bps"], 0)
         self.assertEqual(video3["wrapper"], "HLS")
 
+    def test_stream_list_accepts_adapter_resolution_and_codec(self):
+        hevc = fake.stream_list(dict(self.brief, primary_ext="mp4"), "mg", "vg",
+                                {"resolution": "1080p", "codec": "hevc"})
+        video = hevc["video_streams"][0]
+        self.assertEqual((video["width"], video["height"]), (1920, 1080))
+        self.assertEqual(video["resolution_type"], "1080p")
+        self.assertEqual(video["codec_name"], "hevc")
+        self.assertEqual(video["profile"], "Main")
+        low = fake.stream_list(dict(self.brief, primary_ext="mp4"), "mg", "vg",
+                               {"width": 640, "height": 360, "codec": "h264"})
+        video2 = low["video_streams"][0]
+        self.assertEqual(video2["resolution_type"], "360p")
+        self.assertEqual(video2["codec_name"], "h264")
+        self.assertEqual(video2["wrapper"], "MP4")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -652,6 +652,14 @@ async def _stream_list_impl(guid: str, request: Request):
     else:
         mg, vg = fake.media_guid(guid), fake.video_guid(guid)
     meta = hls.get_playlist_meta((tv_guid, 0, ep_index))
+    if not (meta or {}).get("height"):
+        # 红果的真实档位藏在播放响应头里。这次起播前还没解析到 HLS 元数据时，
+        # 用上次播放记住的档位回填，避免固定显示 1080P。
+        hg_meta = (hongguo.cached_quality_for_episode(brief, ep_index)
+                   or hongguo.cached_quality_for_source(
+                       hongguo.find_source(str(brief.get("provider") or ""))))
+        if hg_meta:
+            meta = dict(meta or {}, **hg_meta)
     runtime.log(f"stream/list: {brief.get('title', '')[:30]} ep{ep_index + 1} "
                 f"lines={len(brief.get('line_names') or [])} "
                 f"ua={_ua(request)[:40]!r}")
@@ -1033,7 +1041,8 @@ async def media_range_route(file_hash: str, request: Request):
     except ValueError:
         _mark_bad_line(guid, line)
         return Response(status_code=404)
-    return await hls.proxy_media(request, url, request.app.state.src)
+    return await hls.proxy_media(request, url, request.app.state.src,
+                                 on_headers=hongguo.quality_hook(url))
 
 
 @app.post("/v/api/v1/play/play")
@@ -1283,7 +1292,8 @@ async def direct_media(mg: str, request: Request):
         url = hls.ensure_public_target(picked[0])
     except ValueError:
         return Response(status_code=400)
-    return await hls.proxy_media(request, url, request.app.state.src)
+    return await hls.proxy_media(request, url, request.app.state.src,
+                                 on_headers=hongguo.quality_hook(url))
 
 
 @app.get(f"{ONLINE}/seg")

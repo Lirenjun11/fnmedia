@@ -20,6 +20,7 @@ JS 源（flag 不是 hg）要先调 ``/api/play`` 换地址，本适配层暂不
 from __future__ import annotations
 
 import hashlib
+import time
 import urllib.parse
 
 import httpx
@@ -182,6 +183,183 @@ def play_placeholder(source: dict, flag: str, ep_id: str) -> str:
     """非内置线路的占位标记；播放前会被识别并给出明确提示。"""
     return f"hgplay://{urllib.parse.quote(str(flag) or 'flag', safe='')}/" \
            f"{urllib.parse.quote(str(ep_id), safe='')}"
+
+
+# --------------------------------------------------------------- 画质缓存
+# 飞牛在起播前就会调 stream/list，而红果的真实档位只有播放响应头
+# （x-stream-quality / x-stream-codec）里才有。这里记住每次实际播放命中的
+# 档位，下一次 stream/list 直接回填，不额外探测、不增加起播延迟。
+_QUALITY_TTL = 3600.0
+_QUALITY_MAX = 500
+_QUALITY: dict[tuple[str, str, str], tuple[float, str, str]] = {}
+_QUALITY_DEPLOY: dict[tuple[str, str], tuple[float, str, str]] = {}
+_QUALITY_SIZES = {
+    "4k": (3840, 2160), "2160p": (3840, 2160),
+    "2k": (2560, 1440), "1440p": (2560, 1440),
+    "1080p": (1920, 1080), "720p": (1280, 720),
+    "540p": (960, 540), "480p": (854, 480),
+    "360p": (640, 360), "240p": (426, 240),
+}
+# 官网直连失败时服务端降级到 compat（360P H.264），头里就是 compat。
+_QUALITY_ALIAS = {"compat": "360p"}
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _deploy_parts(url: str) -> tuple[str, str, str] | None:
+    """``/api/stream/<ep>`` → (部署域名, 路径前缀, 分集 id)。
+
+    query 里的 token / 画质参数不参与，换 token 后同一集仍命中同一条缓存。
+    """
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+    except ValueError:
+        return None
+    path = parsed.path or ""
+    mark = path.rfind(STREAM_MARK)
+    if mark < 0 or not parsed.netloc:
+        return None
+    ep = path[mark + len(STREAM_MARK):].strip("/")
+    if not ep or "/" in ep:
+        return None
+    return (parsed.netloc.lower(), path[:mark].rstrip("/"), ep)
+
+
+def episode_key(url: str) -> tuple[str, str, str] | None:
+    return _deploy_parts(url)
+
+
+def _quality_meta(quality: str, codec: str) -> dict | None:
+    """响应头档位 → stream/list 可直接使用的分辨率 / 编码。"""
+    label = str(quality or "").strip().lower()
+    label = _QUALITY_ALIAS.get(label, label)
+    if not label:
+        return None
+    size = _QUALITY_SIZES.get(label)
+    if not size and label.endswith("p") and label[:-1].isdigit():
+        height = int(label[:-1])
+        size = (int(round(height * 16 / 9 / 2)) * 2, height)
+    if not size:
+        return None
+    name = str(codec or "").strip().lower()
+    if name in ("h265", "hevc"):
+        name = "hevc"
+    elif name not in ("h264", "av1"):
+        name = "h264"
+    return {"resolution": label, "width": size[0], "height": size[1],
+            "codec": name}
+
+
+def reset_quality_cache() -> None:
+    """测试 / 手动排障用：清空已记住的画质。"""
+    _QUALITY.clear()
+    _QUALITY_DEPLOY.clear()
+
+
+def _prune(now: float) -> None:
+    for store in (_QUALITY, _QUALITY_DEPLOY):
+        stale = [k for k, v in store.items() if now - v[0] > _QUALITY_TTL]
+        for key in stale:
+            store.pop(key, None)
+    extra = len(_QUALITY) - _QUALITY_MAX
+    if extra > 0:
+        for key, _ in sorted(_QUALITY.items(), key=lambda kv: kv[1][0])[:extra]:
+            _QUALITY.pop(key, None)
+
+
+def remember_quality(url: str, quality: str, codec: str) -> None:
+    """记录一次播放实际命中的档位；空头 / 非红果流直接忽略。"""
+    parts = _deploy_parts(url)
+    if not parts:
+        return
+    meta = _quality_meta(quality, codec)
+    if not meta:
+        return
+    now = _now()
+    entry = (now, meta["resolution"], meta["codec"])
+    _QUALITY[parts] = entry
+    _QUALITY_DEPLOY[parts[:2]] = entry
+    _prune(now)
+
+
+def _cached_meta(entry) -> dict | None:
+    if not entry:
+        return None
+    ts, quality, codec = entry
+    if _now() - ts > _QUALITY_TTL:
+        return None
+    return _quality_meta(quality, codec)
+
+
+def cached_quality(url: str) -> dict | None:
+    parts = _deploy_parts(url)
+    if not parts:
+        return None
+    entry = _QUALITY.get(parts)
+    if not entry:
+        return None
+    meta = _cached_meta(entry)
+    if not meta:
+        _QUALITY.pop(parts, None)
+    return meta
+
+
+def cached_quality_for_episode(brief: dict, index: int) -> dict | None:
+    """按分集取已记住的画质；没有就退到同一部署最后一次已知档位。"""
+    urls: list[str] = []
+    for name in (brief or {}).get("line_names") or []:
+        eps = ((brief or {}).get("lines") or {}).get(name) or []
+        if not isinstance(eps, list) or not 0 <= index < len(eps):
+            continue
+        row = eps[index]
+        url = row.get("url") if isinstance(row, dict) else ""
+        if url:
+            urls.append(str(url))
+    for url in urls:
+        meta = cached_quality(url)
+        if meta:
+            return meta
+    # 这一集还没播放过（或分集缓存已过期）：同部署的其他分集档位相同，
+    # 用它兜底，至少比写死 1080p 更接近真实画质。
+    for url in urls:
+        parts = _deploy_parts(url)
+        if not parts:
+            continue
+        meta = _cached_meta(_QUALITY_DEPLOY.get(parts[:2]))
+        if meta:
+            return meta
+    return None
+
+
+def cached_quality_for_source(source: dict | None) -> dict | None:
+    """stream/list 阶段 brief 可能还没有分集地址，用源地址找同部署缓存。"""
+    try:
+        parsed = urllib.parse.urlparse(base_url(source))
+    except ValueError:
+        return None
+    if not parsed.netloc:
+        return None
+    key = (parsed.netloc.lower(), parsed.path.rstrip("/"))
+    return _cached_meta(_QUALITY_DEPLOY.get(key))
+
+
+def quality_hook(url: str):
+    """给 ``hls.proxy_media`` 的响应头回调；非红果流返回 None。"""
+    if not _deploy_parts(url):
+        return None
+
+    def hook(headers) -> None:
+        try:
+            lower = {str(k).lower(): v for k, v in dict(headers or {}).items()}
+        except (TypeError, ValueError):
+            return
+        remember_quality(url, str(lower.get("x-stream-quality") or ""),
+                         str(lower.get("x-stream-codec") or ""))
+
+    return hook
+
 
 
 def lines_of(source: dict, detail: dict) -> tuple[dict, bool]:

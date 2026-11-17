@@ -499,6 +499,34 @@ def sliced_playlist(head, groups):
     return "\n".join(lines) + "\n"
 
 
+def repeated_ad_playlist(blocks=7, content_segments=150, *, unique=False,
+                         ad_tail=0.64):
+    """同一条外部流目录的 6 片贴片，重复插在每段正文之前，最后再收一次。
+
+    真实样本：正文 2.5 秒一片、广告来自另一个源目录，片头/中插/片尾共 7 次。
+    unique=True 时每次贴片用不同文件名，只留「外部目录反复出现」这一条证据；
+    ad_tail=0 时不带补齐片尾巴，排除「整组以短片收尾」的判据。
+    """
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:3",
+             "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD"]
+    idx = 0
+    for block in range(blocks):
+        lines.append("#EXT-X-DISCONTINUITY")
+        for j in range(6):
+            duration = ad_tail if (j == 5 and ad_tail) else 2.5
+            name = f"a{block}_{j}" if unique else f"a{j}"
+            lines.append(f"#EXTINF:{duration:.2f},")
+            lines.append(f"https://cdn.example.com/ads/hls/{name}.ts")
+        if block < blocks - 1:
+            lines.append("#EXT-X-DISCONTINUITY")
+            for _ in range(content_segments):
+                lines.append("#EXTINF:2.50,")
+                lines.append(f"https://cdn.example.com/vod/hls/s{idx}.ts")
+                idx += 1
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
+
+
 class PrerollTest(unittest.TestCase):
     """片头贴片：单条 15/30 秒的贴片凑不满分段规则要求的最少 3 片。"""
     def setUp(self):
@@ -682,6 +710,56 @@ class PrerollTest(unittest.TestCase):
         self.assertEqual(item["by_preroll"], 1)
         self.assertEqual(item["preroll"], "discontinuity")
         self.assertEqual(item["dropped"][0]["reason"], "preroll")
+
+
+class ForeignBlockTest(unittest.TestCase):
+    """同一段外部目录贴片重复 7 次：固定 40 片上限不能把整次过滤回退。"""
+
+    def setUp(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0)
+
+    def tearDown(self):
+        reset()
+
+    def test_repeated_ad_blocks_exceed_old_fixed_cap(self):
+        playlist = repeated_ad_playlist()
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 42)
+        self.assertEqual(stats["by_preroll"], 6)
+        self.assertEqual(stats["by_duplicate"], 36)
+        self.assertEqual(stats["guard"], "")
+        self.assertNotIn("/ads/hls/", text)
+
+    def test_unique_ad_urls_in_repeated_foreign_directory_are_removed(self):
+        playlist = repeated_ad_playlist(unique=True, ad_tail=0.0)
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 42)
+        self.assertEqual(stats["by_foreign"], 42)
+        self.assertEqual(stats["guard"], "")
+        self.assertNotIn("/ads/hls/", text)
+
+    def test_one_off_foreign_directory_is_left_alone(self):
+        reset(adfilter_enabled=True, adfilter_markers=False,
+              adfilter_keywords=[], adfilter_head_skip=0.0,
+              adfilter_breaks=False)
+        playlist = build_playlist([
+            (30, 10.0, "vod", "cdn.example.com"),
+            (3, 5.0, "other", "cdn.example.com"),
+        ])
+        text, stats = hls.strip_ads(playlist, BASE)
+        self.assertEqual(stats["removed"], 0)
+        self.assertEqual(stats["by_foreign"], 0)
+        self.assertEqual(text, playlist)
+
+    def test_foreign_block_is_exposed_in_preview(self):
+        playlist = repeated_ad_playlist(unique=True, ad_tail=0.0)
+        hls._AD_PREVIEWS.clear()
+        hls.rewrite_playlist(playlist, BASE, SEG_PREFIX)
+        item = hls.recent_ad_previews(1)[0]
+        self.assertEqual(item["by_foreign"], 42)
+        self.assertEqual(len(item["foreign_blocks"]), 7)
+        self.assertEqual(item["foreign_blocks"][0]["count"], 6)
 
 
 if __name__ == "__main__":

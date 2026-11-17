@@ -213,6 +213,77 @@ class HongguoAdapterTest(unittest.TestCase):
         self.assertEqual(client.calls, [])
 
 
+class HongguoQualityCacheTest(unittest.TestCase):
+    """画质回填：只记住实际播放响应头，不额外探测。"""
+
+    def setUp(self):
+        hongguo.reset_quality_cache()
+
+    def tearDown(self):
+        hongguo.reset_quality_cache()
+
+    def test_episode_key_ignores_query_and_token(self):
+        a = hongguo.episode_key("http://hg.invalid:8787/api/stream/9001?q=auto")
+        b = hongguo.episode_key(
+            "http://hg.invalid:8787/api/stream/9001?q=1080p&at=t")
+        self.assertEqual(a, b)
+        self.assertEqual(a, ("hg.invalid:8787", "", "9001"))
+        self.assertIsNone(hongguo.episode_key(
+            "http://hg.invalid:8787/api/home"))
+
+    def test_remember_and_lookup_quality(self):
+        url = hongguo.stream_url(SOURCE, "9001")
+        hongguo.remember_quality(url, "1080p", "hevc")
+        meta = hongguo.cached_quality(url)
+        self.assertEqual(meta["resolution"], "1080p")
+        self.assertEqual((meta["width"], meta["height"]), (1920, 1080))
+        self.assertEqual(meta["codec"], "hevc")
+
+    def test_compat_header_maps_to_360p_h264(self):
+        url = hongguo.stream_url(SOURCE, "9002")
+        hongguo.remember_quality(url, "compat", "h264")
+        meta = hongguo.cached_quality(url)
+        self.assertEqual(meta["resolution"], "360p")
+        self.assertEqual((meta["width"], meta["height"]), (640, 360))
+        self.assertEqual(meta["codec"], "h264")
+
+    def test_quality_hook_reads_headers_case_insensitively(self):
+        url = hongguo.stream_url(SOURCE, "9001")
+        hongguo.quality_hook(url)({"X-Stream-Quality": "720p",
+                                   "X-Stream-Codec": "h264"})
+        meta = hongguo.cached_quality(url)
+        self.assertEqual(meta["resolution"], "720p")
+        self.assertEqual(meta["codec"], "h264")
+
+    def test_quality_hook_none_for_non_stream_url(self):
+        self.assertIsNone(hongguo.quality_hook("https://a.invalid/1.m3u8"))
+
+    def test_empty_headers_do_not_clear_cache(self):
+        url = hongguo.stream_url(SOURCE, "9001")
+        hongguo.remember_quality(url, "1080p", "hevc")
+        hongguo.quality_hook(url)({})
+        self.assertEqual(hongguo.cached_quality(url)["resolution"], "1080p")
+
+    def test_episode_lookup_falls_back_to_deployment(self):
+        first = hongguo.stream_url(SOURCE, "9001")
+        second = hongguo.stream_url(SOURCE, "9002")
+        hongguo.remember_quality(first, "720p", "h264")
+        brief = {"provider": "hg_test", "line_names": ["红果"],
+                 "lines": {"红果": [{"url": first}, {"url": second}]}}
+        # 第 2 集没播过，退到同部署最后一次已知档位。
+        self.assertEqual(
+            hongguo.cached_quality_for_episode(brief, 1)["resolution"], "720p")
+        self.assertEqual(
+            hongguo.cached_quality_for_source(SOURCE)["resolution"], "720p")
+
+    def test_expired_entry_is_ignored(self):
+        url = hongguo.stream_url(SOURCE, "9001")
+        hongguo.remember_quality(url, "1080p", "hevc")
+        now = hongguo._now()
+        with patch.object(hongguo, "_now", return_value=now + 4000):
+            self.assertIsNone(hongguo.cached_quality(url))
+
+
 class HongguoIntegrationTest(unittest.TestCase):
     """接入点：搜索、分类表、直链判定。"""
 
@@ -360,6 +431,37 @@ class HongguoIntegrationTest(unittest.TestCase):
         self.assertTrue(appmod._is_direct_media(url))
         self.assertFalse(appmod._is_direct_media("http://x/a.m3u8"))
         self.assertFalse(appmod._is_direct_media("http://x/watch/1"))
+
+    def test_stream_list_fills_cached_hongguo_quality(self):
+        """起播前 stream/list 用上次播放记住的真实档位，不再固定 1080P。"""
+        import app as appmod
+        import fake
+        from types import SimpleNamespace
+
+        hongguo.reset_quality_cache()
+        lines, _ = hongguo.lines_of(SOURCE, DETAIL)
+        guid = "l" * 32
+        brief = {"guid": guid, "provider": "hg_test", "vod_id": "100",
+                 "title": "示例短剧", "episodes": 2, "is_tv": True,
+                 "primary_ext": "mp4", "line_names": list(lines),
+                 "lines": {name: [{"title": e.title, "url": e.url,
+                                   "direct": e.direct, "headers": e.headers}
+                                  for e in eps]
+                           for name, eps in lines.items()}}
+        store = cms.TitleStore()
+        store.put_brief(brief)
+        first = lines[list(lines)[0]][0]
+        hongguo.remember_quality(first.url, "720p", "hevc")
+        request = SimpleNamespace(
+            headers={"user-agent": "test"},
+            app=SimpleNamespace(state=SimpleNamespace(store=store)))
+        resp = asyncio.run(appmod._stream_list_impl(
+            fake.episode_guid(guid, 1), request))
+        video = json.loads(bytes(resp.body))["data"]["video_streams"][0]
+        self.assertEqual(video["resolution_type"], "720p")
+        self.assertEqual((video["width"], video["height"]), (1280, 720))
+        self.assertEqual(video["codec_name"], "hevc")
+        hongguo.reset_quality_cache()
 
 
 if __name__ == "__main__":

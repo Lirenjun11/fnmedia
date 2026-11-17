@@ -32,6 +32,9 @@ _AD_KEEP_TAGS = (
 )
 _AD_MAX_REMOVE_RATIO = 0.5
 _AD_MAX_REMOVED = 40
+# 固定 40 片在 2–3 秒切片的长清单里太紧：同一段 6 片贴片插几次就超了，
+# 一旦触发整次回退，连片头广告也一起保留。按总片数给一个下限 + 比例上限。
+_AD_MAX_REMOVED_SEG_RATIO = 0.20
 _AD_MAX_BREAK_RATIO = 0.20
 _AD_MAX_GROUPS = 10
 _AD_MIN_GROUP_SEGMENTS = 3
@@ -52,6 +55,11 @@ _AD_PREROLL_TAIL_SHORT = 0.6
 # 否则宁可不动。
 _AD_PAD_MAX_DURATION = 90.0
 _AD_PAD_MAX_RATIO = 0.05
+# 外部目录拼接块：整组来自正文没出现过的流目录，且同一条流在清单里反复
+# 出现（同一段贴片插很多次）。只出现一次的外部目录不够可靠，交给片头
+# 探针和补齐片规则。
+_AD_FOREIGN_MAX_RATIO = 0.05
+_AD_FOREIGN_MAIN_SHARE = 0.50
 _AD_PREROLL_MAX_DURATION = 90.0
 _AD_PREROLL_MAX_RATIO = 0.20
 _AD_PREROLL_MIN_SEGMENTS = 12
@@ -352,6 +360,61 @@ def _mark_padded_blocks(records: list[dict], total_duration: float,
             })
 
 
+def _mark_foreign_blocks(records: list[dict], total_duration: float,
+                         stats: dict) -> None:
+    """整组来自正文之外的目录、且同一条流反复出现的短分组。
+
+    与「补齐片」互补：源站把贴片切成整段（没有 0.48s 尾巴）时，只要广告
+    分片来自另一个流目录、同一目录在片头/中插/片尾反复出现，仍可整组删除。
+    要求重复出现是为了排除「正片中途换 CDN 目录」这类一次性切换；正文
+    自身必须占绝对多数，外部流总占比也不超过 5%。
+    """
+    if len(records) < _AD_PREROLL_MIN_SEGMENTS or total_duration < _AD_PREROLL_MIN_TOTAL:
+        return
+    stream_durations: dict = {}
+    for rec in records:
+        key = _stream_key(rec["abs"])
+        stream_durations[key] = (stream_durations.get(key, 0.0)
+                                 + max(0.0, rec["duration"]))
+    if len(stream_durations) < 2:
+        return
+    main_key, main_duration = max(stream_durations.items(), key=lambda item: item[1])
+    if total_duration <= 0 or main_duration / total_duration < _AD_FOREIGN_MAIN_SHARE:
+        return
+
+    grouped: dict[int, list[dict]] = {}
+    for rec in records:
+        grouped.setdefault(rec["group"], []).append(rec)
+    stream_groups: dict = {}
+    for block in grouped.values():
+        for key in {_stream_key(rec["abs"]) for rec in block}:
+            stream_groups[key] = stream_groups.get(key, 0) + 1
+
+    for group, block in grouped.items():
+        if len(block) < 2 or any(rec["reason"] for rec in block):
+            continue
+        keys = {_stream_key(rec["abs"]) for rec in block}
+        if not keys or main_key in keys:
+            continue
+        if any(stream_durations.get(key, 0.0) / total_duration > _AD_FOREIGN_MAX_RATIO
+               for key in keys):
+            continue
+        if not all(stream_groups.get(key, 0) >= 2 for key in keys):
+            continue
+        duration = sum(rec["duration"] for rec in block)
+        if not (_AD_MIN_GROUP_DURATION <= duration <= _AD_PAD_MAX_DURATION):
+            continue
+        if duration / total_duration > _AD_PAD_MAX_RATIO:
+            continue
+        for rec in block:
+            rec["reason"] = "foreign"
+        if len(stats["foreign_blocks"]) < 12:
+            stats["foreign_blocks"].append({
+                "group": group, "count": len(block),
+                "duration": round(duration, 2),
+            })
+
+
 def strip_ads(text: str, base_url: str = "",
               rules: dict | None = None) -> tuple[str, dict]:
     """Drop ad segments from a media playlist, keeping AES-128 indexes intact.
@@ -364,9 +427,10 @@ def strip_ads(text: str, base_url: str = "",
     stats = {"removed": 0, "removed_duration": 0.0, "kept_duration": 0.0,
              "total_duration": 0.0, "by_marker": 0, "by_keyword": 0,
              "by_head": 0, "by_break": 0, "by_duplicate": 0, "by_tiny": 0,
-             "by_minority": 0, "by_preroll": 0, "by_pad": 0, "guard_kept": 0,
+             "by_minority": 0, "by_preroll": 0, "by_pad": 0,
+             "by_foreign": 0, "guard_kept": 0,
              "guard": "", "preroll": "", "preroll_miss": "", "head": [],
-             "body_median": 0.0, "pad_blocks": [],
+             "body_median": 0.0, "pad_blocks": [], "foreign_blocks": [],
              "sample": "", "dropped": [], "groups": [],
              "disc_cleaned": 0}
     lines = text.splitlines()
@@ -513,10 +577,14 @@ def strip_ads(text: str, base_url: str = "",
     # 中插拼接贴片：同一特征（整组以补齐片收尾）出现在清单任意位置。
     if rules["splices"]:
         _mark_padded_blocks(records, total_duration, stats)
+        # 没有补齐片尾巴、但整组来自反复出现的外部流目录的贴片。
+        _mark_foreign_blocks(records, total_duration, stats)
 
     removed = [rec for rec in records if rec["reason"]]
     removed_duration = sum(rec["duration"] for rec in removed)
-    if removed and (len(removed) > _AD_MAX_REMOVED or
+    max_removed = max(_AD_MAX_REMOVED,
+                      int(len(records) * _AD_MAX_REMOVED_SEG_RATIO))
+    if removed and (len(removed) > max_removed or
                     (total_duration > 0 and
                      removed_duration / total_duration > _AD_MAX_REMOVE_RATIO)
                     or len(removed) == len(records)):
@@ -805,7 +873,7 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                 f"h{ad_stats['by_head']}/b{ad_stats['by_break']}/"
                 f"d{ad_stats['by_duplicate']}/t{ad_stats['by_tiny']}/"
                 f"o{ad_stats['by_minority']}/p{ad_stats['by_preroll']}/"
-                f"s{ad_stats['by_pad']} "
+                f"s{ad_stats['by_pad']}/x{ad_stats['by_foreign']} "
                 f"guard={ad_stats['guard'] or '-'} "
                 f"guarded={ad_stats['guard_kept']} "
                 f"preroll={ad_stats['preroll'] or '-'} "
@@ -827,7 +895,9 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
             "by_minority": ad_stats["by_minority"],
             "by_preroll": ad_stats["by_preroll"],
             "by_pad": ad_stats["by_pad"],
+            "by_foreign": ad_stats["by_foreign"],
             "pad_blocks": ad_stats["pad_blocks"],
+            "foreign_blocks": ad_stats["foreign_blocks"],
             "preroll": ad_stats["preroll"],
             "preroll_miss": ad_stats["preroll_miss"],
             "head": ad_stats["head"],
@@ -957,7 +1027,8 @@ def playlist_response(text: str, base: str, seg_prefix: str,
 
 
 async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
-                      timeout: float = 8.0) -> StreamingResponse | Response:
+                      timeout: float = 8.0,
+                      on_headers=None) -> StreamingResponse | Response:
     headers = {"User-Agent": _UA}
     for key in ("range", "if-range", "if-none-match"):
         if key in request.headers:
@@ -977,6 +1048,13 @@ async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
     if status >= 400:
         await resp.aclose()
         return Response(status_code=status, headers=out_headers)
+    # 上游自报的媒体属性（红果的 x-stream-quality / x-stream-codec）交给
+    # 适配层缓存；回调失败绝不能影响播放。
+    if on_headers:
+        try:
+            on_headers(dict(resp.headers))
+        except Exception:  # noqa: BLE001 - 观测信息失败不算播放失败
+            pass
 
     async def chunks():
         try:

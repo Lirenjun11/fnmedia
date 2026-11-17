@@ -264,7 +264,9 @@ export interface AdPreview {
   by_minority: number;
   by_preroll: number;
   by_pad: number;
+  by_foreign: number;
   pad_blocks: { group: number; count: number; duration: number }[];
+  foreign_blocks: { group: number; count: number; duration: number }[];
   preroll: string;
   preroll_miss: string;
   head: { d: number; g: number; s: string }[];

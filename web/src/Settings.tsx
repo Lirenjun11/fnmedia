@@ -261,7 +261,7 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
             className="check" type="checkbox" checked={!!form.adfilter_splices}
             onChange={(e) => set('adfilter_splices', e.target.checked)}
           />
-          <span>识别中插拼接贴片（任意位置「补齐片」收尾的整组）</span>
+          <span>识别中插拼接贴片（补齐片收尾 / 反复出现的外部流目录）</span>
         </label>
         <p className="hint mt">
           分段识别按 DISCONTINUITY 把清单切组，仅当某组 3–15 片、3–120 秒、
@@ -272,11 +272,15 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
           域名/目录。正片剩余不足 90 秒或贴片占比超过 20% 时不动。
           中插拼接贴片按同一思路但不限位置：源站把正片切成整 2 秒一片时，只有拼接进来
           的贴片最后一刀切不满（如整组末尾出现 0.48 秒），命中即删整组；块长上限 90 秒、
-          占比上限 5%，片尾收片补齐不算。
+          占比上限 5%，片尾收片补齐不算。若贴片切得整齐没有补齐片，只要整组来自正文
+          没出现过的外部流目录、且同一目录在清单里反复出现，也会整组删除（片尾同样
+          适用）；只切换一次的外部目录不动。
           强证据为无条件自动推断，误判风险同源，故与分段识别分开独立开关；
           若某源会循环复用正片分片，单独关掉它即可。
           删除广告段后清理其出口处残留的 DISCONTINUITY 标签，正片内部合法切换保留。
-          一次删除超过 20%（分段规则）或半数时长、或会删空清单时，整次过滤自动回退。
+          一次删除超过 20%（分段规则）或半数时长、或会删空清单时，整次过滤自动回退；
+          片数上限随清单长度放宽（至少 40 片、最多 20%），长清单里重复多次的贴片不会
+          再因为片数超限把片头广告一起还原。
         </p>
         <div className="grid mt">
           <div>
@@ -340,6 +344,7 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
                   <span className="small">
                     命中：标记 {item.by_marker} / 关键字 {item.by_keyword} / 片头 {item.by_head} /
                     分段 {item.by_break} / 贴片 {item.by_preroll} / 拼接 {item.by_pad} /
+                    外部流 {item.by_foreign} /
                     重复 {item.by_duplicate} /
                     极短 {item.by_tiny} / 少数域名 {item.by_minority} / 清理标记 {item.disc_cleaned}
                   </span>
@@ -368,6 +373,12 @@ export function AdFilterPage({ boot, refresh, notify }: Props) {
                 {(item.pad_blocks || []).length > 0 && (
                   <p className="hint">
                     中插拼接块：{item.pad_blocks
+                      .map((b) => `#${b.group} ${b.duration}s/${b.count}片`).join('，')}
+                  </p>
+                )}
+                {(item.foreign_blocks || []).length > 0 && (
+                  <p className="hint">
+                    外部流拼接块：{item.foreign_blocks
                       .map((b) => `#${b.group} ${b.duration}s/${b.count}片`).join('，')}
                   </p>
                 )}
