@@ -106,16 +106,26 @@ class MediaRangeTest(unittest.TestCase):
         def action(client, brief):
             self._install(handler)
             mg = fake.media_guid(brief["guid"])
-            return client.get(
-                f"/v/api/v1/media/range/{mg}",
-                headers={"User-Agent": "1.13.0 (com.trim.media.ios; "
-                                       "build:1130000; iOS 27.2) Flutter/3.11.5"},
-                follow_redirects=False)
-        resp = self._run(_title("m3u8"), action)
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("mpegurl", resp.headers["content-type"])
-        self.assertIn("#EXTM3U", resp.text)
-        self.assertIn("/v/media/online/seg?u=", resp.text)
+            ua = ("1.13.0 (com.trim.media.ios; build:1130000; "
+                  "iOS 27.2) Flutter/3.11.5")
+            first = client.get(f"/v/api/v1/media/range/{mg}",
+                               headers={"User-Agent": ua},
+                               follow_redirects=False)
+            second = client.get(first.headers["location"],
+                                headers={"User-Agent": ua},
+                                follow_redirects=False)
+            return first, second
+        first, second = self._run(_title("m3u8"), action)
+        # 统一入口：302 到 preset(mr)，由它直接返回媒体清单。
+        self.assertEqual(first.status_code, 302)
+        self.assertIn("/preset.m3u8", first.headers["location"])
+        self.assertIn("from=mr", first.headers["location"])
+        self.assertEqual(second.status_code, 200)
+        self.assertIn("mpegurl", second.headers["content-type"])
+        self.assertIn("#EXTM3U", second.text)
+        # iOS 使用短 id + .ts 路径，清单里不再出现长查询串。
+        self.assertRegex(second.text, r"/v/media/online/seg/[0-9a-f]{16}\.ts")
+        self.assertNotIn("?u=", second.text)
 
     def test_ios_slow_playlist_returns_placeholder(self):
         import asyncio
@@ -133,9 +143,10 @@ class MediaRangeTest(unittest.TestCase):
                 f"/v/api/v1/media/range/{mg}",
                 headers={"User-Agent": "1.13.0 (com.trim.media.ios; "
                                        "build:1130000; iOS 27.2) Flutter/3.11.5"},
-                follow_redirects=False)
+                follow_redirects=True)
         resp = self._run(_title("m3u8", "https://example.com/slow.m3u8"),
                          action)
+        # 慢源：跟随 302 到 preset(mr) 后先拿到占位清单，后台继续抓真实清单。
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.headers.get("x-fnmedia-placeholder"), "1")
         self.assertIn("_placeholder/placeholder.ts", resp.text)

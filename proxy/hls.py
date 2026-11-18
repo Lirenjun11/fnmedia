@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import shutil
@@ -668,6 +669,33 @@ def decode_seg(token: str) -> tuple[str, str, str]:
     return str(data.get("u", "")), str(data.get("k", "")), str(data.get("iv", ""))
 
 
+# iOS 1.13 的 fncache/Flutter 层对超长、带查询串的分片地址处理不稳定：
+# 这里给分片 token 建短 id，清单里下发 /seg/<id>.ts（无查询串、带 .ts），
+# 既缩短清单体积，也避免 & / :: 等字符进入原生播放器。
+_SEG_IDS: dict[str, tuple[str, float]] = {}
+_SEG_ID_TTL = 6 * 3600.0
+_SEG_ID_MAX = 60000
+
+
+def short_seg_id(token: str) -> str:
+    sid = hashlib.blake2s(token.encode(), digest_size=8).hexdigest()
+    _SEG_IDS[sid] = (token, time.monotonic() + _SEG_ID_TTL)
+    if len(_SEG_IDS) > _SEG_ID_MAX:
+        now = time.monotonic()
+        for key in [k for k, (_, exp) in _SEG_IDS.items() if exp < now]:
+            _SEG_IDS.pop(key, None)
+        while len(_SEG_IDS) > _SEG_ID_MAX:
+            _SEG_IDS.pop(next(iter(_SEG_IDS)), None)
+    return sid
+
+
+def get_seg_id(sid: str) -> str:
+    item = _SEG_IDS.get(sid)
+    if not item or item[1] < time.monotonic():
+        return ""
+    return item[0]
+
+
 _KEYS: dict = {}
 _KEY_TTL = 120.0
 
@@ -859,7 +887,8 @@ def pick_best_variant(text: str) -> str | None:
 def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
                      variant_prefix: str = "", is_master: bool = False,
                      decrypt_keys: bool = False,
-                     variant_query: str = "") -> str:
+                     variant_query: str = "",
+                     short_segs: bool = False) -> str:
     if not is_master and ad_rules_active(ad_rules()):
         original = text
         text, ad_stats = strip_ads(text, base_url)
@@ -941,7 +970,10 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
 
             def sub(match):
                 absolute = urllib.parse.urljoin(base_url, match.group(1))
-                return (f'URI="{attr_target}?u={encode_url(absolute)}'
+                token = encode_url(absolute)
+                if short_segs and not is_master:
+                    return f'URI="{attr_target}/{short_seg_id(token)}.ts"'
+                return (f'URI="{attr_target}?u={token}'
                         f'{extra}"')
             out.append(_URI_ATTR.sub(sub, line))
             continue
@@ -951,11 +983,12 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
         target = variant_prefix if is_master else seg_prefix
         absolute = urllib.parse.urljoin(base_url, stripped)
         extra = variant_query if is_master else ""
-        if key_url:
-            iv = key_iv or f"{seq:032x}"
-            out.append(f"{target}?u={encode_seg(absolute, key_url, iv)}{extra}")
+        token = (encode_seg(absolute, key_url, key_iv or f"{seq:032x}")
+                 if key_url else encode_url(absolute))
+        if short_segs and not is_master:
+            out.append(f"{target}/{short_seg_id(token)}.ts")
         else:
-            out.append(f"{target}?u={encode_url(absolute)}{extra}")
+            out.append(f"{target}?u={token}{extra}")
         seq += 1
     return "\n".join(out) + "\n"
 
@@ -1012,18 +1045,21 @@ def playlist_response(text: str, base: str, seg_prefix: str,
                       variant_prefix: str = "",
                       is_master: bool = False,
                       decrypt_keys: bool = False,
-                      start_offset: float = 0.0) -> Response:
+                      start_offset: float = 0.0,
+                      short_segs: bool = False) -> Response:
     variant_query = ""
     if is_master and start_offset > 0:
         # master 不能带 EXT-X-START，把起播点透传给子清单。
         variant_query = f"&start={int(start_offset)}"
     body = rewrite_playlist(text, base, seg_prefix, variant_prefix,
-                            is_master, decrypt_keys, variant_query)
+                            is_master, decrypt_keys, variant_query,
+                            short_segs=short_segs)
     if start_offset > 0:
         body = inject_start(body, start_offset)
     return Response(body,
                     media_type="application/vnd.apple.mpegurl",
-                    headers={"Cache-Control": "no-store"})
+                    headers={"Cache-Control": "no-store",
+                             "Connection": "close"})
 
 
 async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
@@ -1043,7 +1079,14 @@ async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
     for key in ("content-type", "content-range", "accept-ranges", "etag"):
         if key in resp.headers:
             out_headers[key] = resp.headers[key]
+    # httpx 会自动解压；有 content-encoding 时原长度对应压缩体，不能透传。
+    if "content-length" in resp.headers and \
+            "content-encoding" not in resp.headers:
+        out_headers["content-length"] = resp.headers["content-length"]
     out_headers["Cache-Control"] = "public, max-age=3600"
+    # iOS 原生播放器（mediaserverd）会长期复用连接；分片响应必须用完即关，
+    # 否则几轮播放后连接池被占满，后续分片请求发不出来（重启扩展才恢复）。
+    out_headers["Connection"] = "close"
     status = resp.status_code
     if status >= 400:
         await resp.aclose()

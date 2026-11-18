@@ -25,7 +25,7 @@ DEFAULTS = {
     "ui_theme": "system",
     "enabled_limit": 200,
     "search_timeout": 2.5,
-    "search_concurrency": 5,
+    "search_concurrency": 8,
     "search_debounce_ms": 200,
     "play_timeout": 8.0,
     "online_first": True,

@@ -282,8 +282,8 @@ _CACHE_TTL = 120.0
 
 
 async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: str,
-                     timeout: float = 2.5, concurrency: int = 5,
-                     enough: int = 24) -> list[OnlineTitle]:
+                     timeout: float = 2.5, concurrency: int = 8,
+                     enough: int = 120) -> list[OnlineTitle]:
     keyword = (keyword or "").strip()
     if not keyword or not sources:
         return []
@@ -300,13 +300,19 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
         return await task
 
     async def run() -> list[OnlineTitle]:
-        sem = asyncio.Semaphore(max(1, concurrency))
+        # 多源时并发至少 8（最多 12）：并发过小会导致排在后面的源在总预算内
+        # 根本轮不到，表现就是「启用的源越多，结果越不全」。
+        sem = asyncio.Semaphore(min(max(concurrency, 8), 12, len(sources)))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.5, timeout)
+        # 单源超时略短于总预算，慢源不会长期占住并发槽位。
+        per_source = min(max(0.6, timeout * 0.7), 1.8)
+        completed = True
 
         async def one(src):
             async with sem:
-                return await search_source(client, src, keyword, timeout=timeout)
+                return await search_source(client, src, keyword,
+                                           timeout=per_source)
 
         tasks = [asyncio.create_task(one(s)) for s in sources]
         found: list[OnlineTitle] = []
@@ -314,16 +320,19 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
             for fut in asyncio.as_completed(tasks):
                 remain = deadline - loop.time()
                 if remain <= 0:
+                    completed = False
                     break
                 try:
                     found.extend(await asyncio.wait_for(fut, timeout=remain))
                 except Exception:  
                     continue
                 if len(found) >= enough:
+                    completed = False
                     break
         finally:
             for t in tasks:
                 if not t.done():
+                    completed = False
                     t.cancel()
         dedup, seen = [], set()
         for item in found:
@@ -331,7 +340,15 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
             if key not in seen:
                 seen.add(key)
                 dedup.append(item)
-        if dedup:
+        # 精确/包含关键词的结果排前面，减少“搜出来一堆不相关”的观感。
+        norm_kw = _norm_title(keyword)
+        dedup.sort(key=lambda t: (
+            0 if _norm_title(t.title) == norm_kw else
+            1 if norm_kw in _norm_title(t.title) else 2,
+            str(t.provider)))
+        # 只缓存完整轮询到的结果；超时/提前截断的部分结果不落缓存，
+        # 否则用户会在 2 分钟内一直看到同一份不全的结果。
+        if dedup and completed:
             if len(_CACHE) > 200:
                 _CACHE.clear()
             _CACHE[cache_key] = (time.monotonic(), dedup)

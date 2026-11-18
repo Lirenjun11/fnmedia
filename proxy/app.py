@@ -411,7 +411,7 @@ async def search_list(request: Request):
         titles = await cms.search_all(
             request.app.state.src, sources, keyword,
             timeout=float(cfg.get("search_timeout", 2.5)),
-            concurrency=int(cfg.get("search_concurrency", 5)),
+            concurrency=int(cfg.get("search_concurrency", 8)),
         )
     except Exception as exc:  
         runtime.log(f"search error: {type(exc).__name__}")
@@ -969,6 +969,8 @@ async def play_info_route(request: Request):
             item["duration"] = int(meta["duration"])
     runtime.log(f"play/info: {brief.get('title', '')[:30]} "
                 f"ep{index + 1} ts={pos} resume={pos > 0}")
+    # 播放页一打开就开始抓清单，等播放器真正请求 media/range/preset 时已就绪。
+    _prewarm_online(request, brief, canonical, index, 0)
     return JSONResponse(fake.ok(fake.normalize_detail(info, _ua(request))))
 
 
@@ -986,6 +988,7 @@ async def stream_post(request: Request):
         return await _passthrough(request)
     brief = await _hg_brief(request, brief) or brief
     line = _line_from_body(brief, body)
+    _prewarm_online(request, brief, guid, index, line)
     meta = hls.get_playlist_meta((guid, line, index))
     data = fake.stream_payload(
         brief, mg,
@@ -1046,24 +1049,13 @@ async def media_range_route(file_hash: str, request: Request):
     if is_hls:
         auto = "&auto=1" if not explicit else ""
         if _is_ios(request):
-            # 新版 iOS（1.13.0+ fncache）对 media/range 的 302 只会把 main 清单
-            # 当普通内容取下来，原生播放器不再继续请求分片，界面一直「视频加载中」。
-            # 这里同一请求内直接构造并返回单线路 main 清单（200），复刻官方行为。
-            main_scope = dict(request.scope)
-            main_scope["path"] = f"{ONLINE}/{mg}/main.m3u8"
-            main_scope["query_string"] = (
-                f"line={line}&index={index}{auto}&ph=1").encode()
-            started = time.monotonic()
-            resp = await main_m3u8(mg, Request(main_scope))
-            body = resp.body if isinstance(resp.body, (bytes, bytearray)) else b""
-            segs = sum(1 for ln in body.splitlines()
-                       if ln.strip() and not ln.startswith(b"#"))
-            ph = " ph=1" if resp.headers.get(
-                "X-fnmedia-Placeholder") == "1" else ""
-            runtime.log(f"ios hls: {brief.get('title', '')[:30]} ep{index + 1} "
-                        f"line{line} -> {resp.status_code}{ph} segs={segs} "
-                        f"{int((time.monotonic() - started) * 1000)}ms")
-            return resp
+            # iOS（电影/剧集统一）：先预热，再 302 到 preset(mr)。
+            # App 会跟随到 .m3u8 地址；preset(mr) 直接返回媒体清单，
+            # 不再下发 master（1.13 拿到 master 后不跟变体）。
+            _warm_playlist_task(request, brief, guid, index, line)
+            return Response(status_code=302, headers={
+                "Location": f"{ONLINE}/{mg}/preset.m3u8?line={line}"
+                            f"&index={index}{auto}&from=mr"})
         # 其它端保持原逻辑：302 到媒体清单，避免多包一层 master 等待。
         return Response(status_code=302, headers={
             "Location": f"{ONLINE}/{mg}/main.m3u8?line={line}"
@@ -1137,27 +1129,6 @@ async def play_play(request: Request):
         link, "HLS" if is_hls else "MP4"))
 
 
-async def _warm_line(client, brief: dict, guid: str, index: int,
-                     no: int) -> tuple | None:
-    key = (guid, no, index)
-    hit = hls.get_playlist_text(key)
-    if hit:
-        return (no,) + hit
-    picked = _pick(brief, no, index)
-    if not picked or _is_direct_media(picked[0]):
-        return None
-    try:
-        url = hls.ensure_public_target(picked[0])
-        text, base, meta = await hls.fetch_playlist(
-            client, url, timeout=min(float(config.get().get("play_timeout", 8.0)),
-                                     2.0))
-    except Exception:
-        return None
-    hls.remember_playlist_text(key, text, base, meta)
-    hls.remember_playlist_meta(key, meta)
-    return no, text, base, meta
-
-
 @app.get(f"{ONLINE}/{{mg}}/preset.m3u8")
 async def preset_m3u8(mg: str, request: Request):
     """播放 master：只列当前线路。手机端会逐条预取 master 的所有变体，
@@ -1175,18 +1146,41 @@ async def preset_m3u8(mg: str, request: Request):
         return Response(status_code=302, headers={
             "Location": f"{ONLINE}/{mg}/direct?line={line}&index={index}"})
 
-    # 当前线路先就绪并缓存，播放器随后取 main.m3u8 直接命中。
-    selected = asyncio.create_task(
-        _warm_line(request.app.state.src, brief, guid, index, line))
-    try:
-        await asyncio.wait_for(asyncio.shield(selected),
-                               timeout=min(float(config.get().get(
-                                   "play_timeout", 8.0)), 2.0))
-    except asyncio.TimeoutError:
-        pass
+    if request.query_params.get("from") == "mr":
+        # 剧集经 media/range -> preset 进来：App 只认 .m3u8 地址上的媒体清单，
+        # 这里直接返回 main（不再下发 master，避免它不跟变体）。
+        scope = dict(request.scope)
+        scope["path"] = f"{ONLINE}/{mg}/main.m3u8"
+        q = f"line={line}&index={index}&ph=1"
+        start = request.query_params.get("start")
+        if start:
+            q += f"&start={start}"
+        scope["query_string"] = q.encode()
+        resp = await main_m3u8(mg, Request(scope))
+        body = resp.body if isinstance(resp.body, (bytes, bytearray)) else b""
+        segs = sum(1 for ln in body.splitlines()
+                   if ln.strip() and not ln.startswith(b"#"))
+        ph = " ph=1" if resp.headers.get("X-fnmedia-Placeholder") == "1" else ""
+        runtime.log(f"preset(mr): {brief.get('title', '')[:30]} ep{index + 1} "
+                    f"line{line} -> {resp.status_code}{ph} segs={segs}")
+        return resp
+
+    # 与 media/range/main 共用同一个单飞预热任务：避免 preset 与 main 各自
+    # 再抓一次清单，冷启动最多只等一次。
+    selected = _warm_playlist_task(request, brief, guid, index, line)
+    if selected is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(selected),
+                                   timeout=min(float(config.get().get(
+                                       "play_timeout", 8.0)), 2.0))
+        except asyncio.TimeoutError:
+            pass
     label = (fake.line_display(brief, names[line]) if names
              else "原画").replace('"', "")
-    main_uri = f"main.m3u8?line={line}&index={index}"
+    # 根路径绝对地址：iOS 经 media/range 302 到 preset 后，会以原始
+    # media/range 地址为基准解析相对 URI，写成 main.m3u8 会变成
+    # /v/api/v1/media/range/main.m3u8（错误路径）。
+    main_uri = f"{ONLINE}/{mg}/main.m3u8?line={line}&index={index}"
     try:
         start = int(float(request.query_params.get("start") or 0))
     except ValueError:
@@ -1198,15 +1192,18 @@ async def preset_m3u8(mg: str, request: Request):
             f"{main_uri}\n")
     return Response(text, media_type="application/vnd.apple.mpegurl",
                     headers={"Access-Control-Allow-Origin": "*",
-                             "Cache-Control": "no-store"})
+                             "Cache-Control": "no-store",
+                             "Connection": "close"})
 
 
 _PLACEHOLDER_DIR = Path(__file__).resolve().parent / "assets" / "placeholder"
 _PH_SEG_DUR = 2.0
 _PH_WINDOW = 3
 _IOS_READY_BUDGET = 2.2
-_IOS_WARM_TIMEOUT = 20.0
+_IOS_WARM_TIMEOUT = 8.0
 _IOS_WARM: dict[tuple, asyncio.Task] = {}
+# 预热只是提速手段，不能和搜索/海报抢资源：同时最多 2 条清单。
+_WARM_SEM = asyncio.Semaphore(2)
 
 
 def _placeholder_playlist(mg: str) -> Response:
@@ -1227,6 +1224,7 @@ def _placeholder_playlist(mg: str) -> Response:
                     media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store",
                              "Access-Control-Allow-Origin": "*",
+                             "Connection": "close",
                              "X-fnmedia-Placeholder": "1"})
 
 
@@ -1244,6 +1242,8 @@ def _warm_playlist_task(request: Request, brief: dict, guid: str,
                         index: int, line: int) -> asyncio.Task | None:
     """单飞预热清单：首个 media/range 只等 2.2s，剩余时间在后台继续抓。"""
     key = (guid, line, index)
+    if hls.get_playlist_text(key):
+        return None  # 已缓存：不要再抓一次
     task = _IOS_WARM.get(key)
     if task is not None and not task.done():
         return task
@@ -1257,9 +1257,10 @@ def _warm_playlist_task(request: Request, brief: dict, guid: str,
     client = request.app.state.src
 
     async def run():
-        text, base, meta = await asyncio.wait_for(
-            hls.fetch_playlist(client, url, timeout=_IOS_WARM_TIMEOUT),
-            timeout=_IOS_WARM_TIMEOUT)
+        async with _WARM_SEM:
+            text, base, meta = await asyncio.wait_for(
+                hls.fetch_playlist(client, url, timeout=_IOS_WARM_TIMEOUT),
+                timeout=_IOS_WARM_TIMEOUT)
         hls.remember_playlist_text(key, text, base, meta)
         hls.remember_playlist_meta(key, meta)
         return text, base, meta
@@ -1275,6 +1276,20 @@ def _warm_playlist_task(request: Request, brief: dict, guid: str,
 
     task.add_done_callback(_clean)
     return task
+
+
+def _prewarm_online(request: Request, brief: dict, guid: str,
+                    index: int, line: int) -> None:
+    """详情/取流接口就启动清单预热，缩短起播等待（失败忽略，不影响接口）。"""
+    try:
+        if hls.get_playlist_text((guid, line, index)):
+            return
+        picked = _pick(brief, line, index)
+        if not picked or _is_direct_media(picked[0]):
+            return
+        _warm_playlist_task(request, brief, guid, index, line)
+    except Exception:
+        pass
 
 
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")
@@ -1305,7 +1320,8 @@ async def main_m3u8(mg: str, request: Request):
                                          f"{ONLINE}/variant",
                                          hls.is_master(text),
                                          hls.can_decrypt(),
-                                         start_offset=start_offset)
+                                         start_offset=start_offset,
+                                         short_segs=_is_ios(request))
     if auto_start and config.get().get("auto_best_source", True):
         winner = await _race_lines(request.app.state.src, brief, guid, index,
                                    line, 3.0)
@@ -1321,7 +1337,8 @@ async def main_m3u8(mg: str, request: Request):
                                          f"{ONLINE}/variant",
                                          hls.is_master(text),
                                          hls.can_decrypt(),
-                                         start_offset=start_offset)
+                                         start_offset=start_offset,
+                                         short_segs=_is_ios(request))
     if request.query_params.get("ph") == "1":
         # iOS media/range 专用：只等 2.2s，慢源先回占位清单，后台继续抓。
         task = _warm_playlist_task(request, brief, guid, index, line)
@@ -1381,7 +1398,8 @@ async def main_m3u8(mg: str, request: Request):
                                          f"{ONLINE}/variant",
                                          hls.is_master(text),
                                          hls.can_decrypt(),
-                                         start_offset=start_offset)
+                                         start_offset=start_offset,
+                                         short_segs=_is_ios(request))
     if last_error:
         runtime.log(f"playback failed: {brief.get('title', '')[:40]} ({last_error})")
     return Response(status_code=502)
@@ -1409,7 +1427,8 @@ async def variant_playlist(request: Request):
         start_offset = 0.0
     return hls.playlist_response(text, base, SEG_PREFIX,
                                  decrypt_keys=hls.can_decrypt(),
-                                 start_offset=start_offset)
+                                 start_offset=start_offset,
+                                 short_segs=_is_ios(request))
 
 
 @app.get(f"{ONLINE}/{{mg}}/direct")
@@ -1433,9 +1452,7 @@ async def direct_media(mg: str, request: Request):
                                  on_headers=hongguo.quality_hook(url))
 
 
-@app.get(f"{ONLINE}/seg")
-async def segment(request: Request):
-    token = request.query_params.get("u", "")
+async def _serve_segment(token: str, request: Request):
     try:
         url, key_url, iv = hls.decode_seg(token)
     except Exception:  
@@ -1471,6 +1488,19 @@ async def segment(request: Request):
                             headers={"Cache-Control": "public, max-age=3600"})
         runtime.log(f"decrypt failed: {url[:100]}")
     return await hls.proxy_media(request, url, request.app.state.src)
+
+
+@app.get(f"{ONLINE}/seg")
+async def segment(request: Request):
+    return await _serve_segment(request.query_params.get("u", ""), request)
+
+
+@app.get(f"{ONLINE}/seg/{{sid}}.ts")
+async def segment_short(sid: str, request: Request):
+    token = hls.get_seg_id(sid)
+    if not token:
+        return Response(status_code=404)
+    return await _serve_segment(token, request)
 
 
 async def _serve_online_poster(tok_path: str, request: Request) -> Response:
