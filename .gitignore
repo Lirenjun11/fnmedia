@@ -11,3 +11,4 @@ dist/
 .workbuddy/
 packaging/fpk/.build/
 .DS_Store
+tools/ssh_*.py

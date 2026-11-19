@@ -278,7 +278,10 @@ async def search_source(client: httpx.AsyncClient, source: dict,
 
 _CACHE: dict[tuple, tuple[float, list[OnlineTitle]]] = {}
 _INFLIGHT: dict[tuple, asyncio.Task] = {}
-_CACHE_TTL = 120.0
+_CACHE_TTL = 60.0
+# 多源结果只缓存几秒，用于吸收 App 重复请求；用户稍后重搜必须重新聚合，
+# 否则慢源/失败源缺失的那份结果会被反复展示。
+_MULTI_CACHE_TTL = 5.0
 
 
 async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: str,
@@ -292,8 +295,9 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
     sig = tuple(sorted((str(s.get("id") or ""), str(s.get("api") or ""))
                        for s in sources))
     cache_key = (keyword, sig)
+    ttl = _CACHE_TTL if len(sources) <= 1 else _MULTI_CACHE_TTL
     hit = _CACHE.get(cache_key)
-    if hit and hit[1] and time.monotonic() - hit[0] < _CACHE_TTL:
+    if hit and hit[1] and time.monotonic() - hit[0] < ttl:
         return hit[1]
     task = _INFLIGHT.get(cache_key)
     if task and not task.done():
@@ -306,7 +310,7 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.5, timeout)
         # 单源超时略短于总预算，慢源不会长期占住并发槽位。
-        per_source = min(max(0.6, timeout * 0.7), 1.8)
+        per_source = min(max(0.8, timeout * 0.8), 2.0)
         completed = True
 
         async def one(src):

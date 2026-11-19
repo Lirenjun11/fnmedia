@@ -1041,12 +1041,97 @@ def inject_start(text: str, offset: float) -> str:
     return "\n".join([lines[0], tag] + lines[1:]) + "\n"
 
 
+_EXTINF = re.compile(r"#EXTINF:\s*([0-9.]+)")
+_MEDIA_SEQ = re.compile(r"#EXT-X-MEDIA-SEQUENCE:\s*(\d+)", re.I)
+# 清单级标签：裁剪后仍保留在头部；其余标签跟随所属分片一起保留/丢弃。
+_GLOBAL_TAGS = (
+    "#EXTM3U", "#EXT-X-VERSION", "#EXT-X-TARGETDURATION",
+    "#EXT-X-PLAYLIST-TYPE", "#EXT-X-DISCONTINUITY-SEQUENCE",
+    "#EXT-X-INDEPENDENT-SEGMENTS", "#EXT-X-START",
+)
+
+
+def slice_from_offset(text: str, offset: float) -> tuple[str, int]:
+    """把点播清单裁到断点所在的分片，丢掉 offset 之前的分片。
+
+    iOS 1.13 的 fncache 拿到带 ``#EXT-X-START`` 的清单会卡在起播（0 分片
+    请求），所以续播不能在头部声明起播点，只能把清单本身裁到断点，并同步
+    上调 ``#EXT-X-MEDIA-SEQUENCE``。返回 (新清单, 丢弃的分片数)；起点无效
+    （<=0、超出片长、直播窗口）时原样返回，分片数 0 —— 起播路径零改动。
+    """
+    lines = text.splitlines()
+    if offset <= 0 or not lines or not lines[0].strip().startswith("#EXTM3U"):
+        return text, 0
+    if "#EXT-X-ENDLIST" not in text or "#EXT-X-STREAM-INF" in text:
+        return text, 0  # 直播窗口/主清单没有稳定时间轴，不裁剪
+    header: list[str] = []
+    groups: list[tuple[float, list[str]]] = []
+    pending: list[str] = []      # 跟随下一个分片的标签（如 DISCONTINUITY/MAP）
+    current: list[str] | None = None
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped.startswith("#EXTINF:"):
+            match = _EXTINF.match(stripped)
+            duration = float(match.group(1)) if match else 0.0
+            current = pending + [line]
+            pending = []
+            groups.append((duration, current))
+            continue
+        if current is not None:
+            current.append(line)
+            if stripped and not stripped.startswith("#"):
+                current = None
+            continue
+        if stripped.startswith("#"):
+            if stripped.startswith(_GLOBAL_TAGS) or not groups:
+                header.append(line)
+            else:
+                pending.append(line)
+            continue
+        if stripped:
+            # 没有 EXTINF 的裸分片行：时长未知，按 0 处理
+            groups.append((0.0, pending + [line]))
+            pending = []
+            current = None
+    if not groups:
+        return text, 0
+    if pending:
+        groups[-1][1].extend(pending)   # ENDLIST 等收尾标签
+    cum = 0.0
+    cut = None
+    for index, (duration, _) in enumerate(groups):
+        if cum + duration > offset:
+            cut = index
+            break
+        cum += duration
+    if cut is None or cut <= 0:
+        return text, 0  # 起点在第一段内或超出片长：原样返回，从头播
+    seq = 0
+    new_header = []
+    for line in header:
+        if _MEDIA_SEQ.match(line.strip()):
+            seq = int(_MEDIA_SEQ.match(line.strip()).group(1))
+            continue
+        if line.strip().startswith("#EXT-X-START"):
+            continue
+        new_header.append(line)
+    new_header.append(f"#EXT-X-MEDIA-SEQUENCE:{seq + cut}")
+    # lines[0] 是 #EXTM3U 魔术行：collect 从 lines[1:] 开始，必须补回去，
+    # 否则输出的不是合法 m3u8，播放器直接报 HTTP Error。
+    out = [lines[0]]
+    out.extend(new_header)
+    for _, group in groups[cut:]:
+        out.extend(group)
+    return "\n".join(out) + "\n", cut
+
+
 def playlist_response(text: str, base: str, seg_prefix: str,
                       variant_prefix: str = "",
                       is_master: bool = False,
                       decrypt_keys: bool = False,
                       start_offset: float = 0.0,
-                      short_segs: bool = False) -> Response:
+                      short_segs: bool = False,
+                      slice_start: bool = False) -> Response:
     variant_query = ""
     if is_master and start_offset > 0:
         # master 不能带 EXT-X-START，把起播点透传给子清单。
@@ -1055,7 +1140,14 @@ def playlist_response(text: str, base: str, seg_prefix: str,
                             is_master, decrypt_keys, variant_query,
                             short_segs=short_segs)
     if start_offset > 0:
-        body = inject_start(body, start_offset)
+        if slice_start:
+            # iOS 1.13 不认 EXT-X-START：裁剪清单代替头部声明起播点。
+            body, dropped = slice_from_offset(body, start_offset)
+            if dropped:
+                runtime.log(f"slice playlist: offset={int(start_offset)}s "
+                            f"dropped={dropped}")
+        else:
+            body = inject_start(body, start_offset)
     return Response(body,
                     media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store",

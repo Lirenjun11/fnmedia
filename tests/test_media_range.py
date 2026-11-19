@@ -123,11 +123,11 @@ class MediaRangeTest(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertIn("mpegurl", second.headers["content-type"])
         self.assertIn("#EXTM3U", second.text)
-        # iOS 使用短 id + .ts 路径，清单里不再出现长查询串。
+        # 快源：预热结果直接进缓存分支下发，短 id 分片地址可用（实测 206）。
         self.assertRegex(second.text, r"/v/media/online/seg/[0-9a-f]{16}\.ts")
         self.assertNotIn("?u=", second.text)
 
-    def test_ios_slow_playlist_returns_placeholder(self):
+    def test_ios_slow_playlist_waits_for_real_playlist(self):
         import asyncio
 
         async def handler(request):
@@ -146,10 +146,13 @@ class MediaRangeTest(unittest.TestCase):
                 follow_redirects=True)
         resp = self._run(_title("m3u8", "https://example.com/slow.m3u8"),
                          action)
-        # 慢源：跟随 302 到 preset(mr) 后先拿到占位清单，后台继续抓真实清单。
+        # 慢源：不下发占位假清单（1.13 的 fncache 会把它缓存成播放会话导致
+        # 整部片只转圈），多等几秒拿真实点播清单。
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.headers.get("x-fnmedia-placeholder"), "1")
-        self.assertIn("_placeholder/placeholder.ts", resp.text)
+        self.assertNotIn("x-fnmedia-placeholder", resp.headers)
+        self.assertNotIn("_placeholder/placeholder.ts", resp.text)
+        self.assertTrue(resp.text.startswith("#EXTM3U"))
+        self.assertIn("/v/media/online/seg?u=", resp.text)
 
     def test_play_link_stays_relative(self):
         ua = ("1.13.0 (com.trim.media.ios; build:1130000; "
@@ -210,6 +213,43 @@ class MediaRangeTest(unittest.TestCase):
                 return client.get(f"/v/api/v1/media/range/{mg}")
         resp = self._run(_title("mp4"), action)
         self.assertEqual(resp.status_code, 404)
+
+    def test_slice_playlist_to_resume_offset(self):
+        """iOS 续播：清单裁到断点分片，MEDIA-SEQUENCE 同步上调。"""
+        playlist = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n"
+                    "#EXT-X-MEDIA-SEQUENCE:100\n"
+                    + "".join(f"#EXTINF:6.000,\nseg{i}.ts\n" for i in range(4))
+                    + "#EXT-X-ENDLIST\n")
+        out, dropped = hls.slice_from_offset(playlist, 13)
+        self.assertEqual(dropped, 2)
+        self.assertTrue(out.startswith("#EXTM3U\n"), "EXTM3U 魔术行不能丢")
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:102", out)
+        self.assertNotIn("seg0.ts", out)
+        self.assertNotIn("seg1.ts", out)
+        self.assertIn("seg2.ts", out)
+        self.assertIn("#EXT-X-ENDLIST", out)
+        self.assertNotIn("#EXT-X-START", out)
+
+    def test_slice_playlist_noop_cases(self):
+        """起点无效（0 / 超出片长）时原样返回，起播路径不受影响。"""
+        playlist = ("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                    "#EXTINF:6.000,\nseg0.ts\n#EXT-X-ENDLIST\n")
+        self.assertEqual(hls.slice_from_offset(playlist, 0), (playlist, 0))
+        self.assertEqual(hls.slice_from_offset(playlist, 600), (playlist, 0))
+        # 直播窗口（无 ENDLIST）不裁剪
+        live = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:6.0,\ns.ts\n"
+        self.assertEqual(hls.slice_from_offset(live, 60), (live, 0))
+
+    def test_slice_playlist_keeps_trailing_tags_with_last_segment(self):
+        """收尾标签（ENDLIST）与中间标签（DISCONTINUITY）跟随分片保留。"""
+        playlist = ("#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+                    "#EXTINF:6.000,\na.ts\n#EXT-X-DISCONTINUITY\n"
+                    "#EXTINF:6.000,\nb.ts\n#EXT-X-ENDLIST\n")
+        out, dropped = hls.slice_from_offset(playlist, 8)
+        self.assertEqual(dropped, 1)
+        self.assertIn("#EXT-X-DISCONTINUITY", out)
+        self.assertIn("b.ts", out)
+        self.assertNotIn("a.ts\n#EXT-X-DISCONTINUITY", out)
 
 
 if __name__ == "__main__":

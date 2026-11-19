@@ -923,6 +923,36 @@ def _range_selection(request: Request, brief: dict) -> tuple[int, bool]:
     return 0, False
 
 
+def _play_start(request: Request) -> int:
+    """从 media/range 请求里取续播点（秒）。
+
+    iOS 继续播放时客户端把 play_link（带 &start=N）放进 Play-Link 头或
+    playlink 参数回传，续播点就在它的 query 里；也可能直接作为 media/range
+    自身的 query。两种都要认，否则 302 到 preset 时 start 被丢，播放器从 0 起播。
+    范围与 play/play 保持一致：5s 以下不当续播，超过 12 小时视为异常。
+    """
+    values = [request.query_params.get(k)
+              for k in ("start", "startTimestamp", "start_ts")]
+    link = request.query_params.get("playlink") or \
+        request.headers.get("Play-Link", "")
+    if link:
+        try:
+            parsed = parse_qs(urlsplit(link).query)
+        except ValueError:
+            parsed = {}
+        for key in ("start", "startTimestamp", "start_ts"):
+            if key in parsed:
+                values.append(parsed[key][0])
+    for value in values:
+        try:
+            number = int(float(value or 0))
+        except (TypeError, ValueError):
+            continue
+        if 5 <= number <= 43200:
+            return number
+    return 0
+
+
 @app.post("/v/api/v1/play/info")
 async def play_info_route(request: Request):
     body = await _body(request)
@@ -1052,10 +1082,31 @@ async def media_range_route(file_hash: str, request: Request):
             # iOS（电影/剧集统一）：先预热，再 302 到 preset(mr)。
             # App 会跟随到 .m3u8 地址；preset(mr) 直接返回媒体清单，
             # 不再下发 master（1.13 拿到 master 后不跟变体）。
+            # 继续播放的 start 在 Play-Link / query 里，必须一起带给 preset，
+            # 否则它会从 0 起播。
             _warm_playlist_task(request, brief, guid, index, line)
-            return Response(status_code=302, headers={
-                "Location": f"{ONLINE}/{mg}/preset.m3u8?line={line}"
-                            f"&index={index}{auto}&from=mr"})
+            location = (f"{ONLINE}/{mg}/preset.m3u8?line={line}"
+                        f"&index={index}{auto}&from=mr")
+            start = _play_start(request)
+            if not start:
+                # 1.13 续播不回传起点（Play-Link 是 App 内部 UUID），从播放
+                # 记录取：服务端把清单裁到断点，不依赖客户端注入/seek。
+                # 剧集只认“最后观看的那一集”，避免用别集进度错位裁剪。
+                try:
+                    if brief.get("is_tv"):
+                        start = playstate.episode_ts(
+                            guid, fake.episode_guid(guid, index))
+                    else:
+                        start = playstate.ts_for(guid)
+                except Exception:
+                    start = 0
+            if 5 <= start <= 43200:
+                # 超过片长 95% 视为“已看完重看”，从头播。
+                meta = hls.get_playlist_meta((guid, line, index)) or {}
+                total = float(meta.get("duration") or 0)
+                if not (total > 0 and start > total * 0.95):
+                    location += f"&start={start}"
+            return Response(status_code=302, headers={"Location": location})
         # 其它端保持原逻辑：302 到媒体清单，避免多包一层 master 等待。
         return Response(status_code=302, headers={
             "Location": f"{ONLINE}/{mg}/main.m3u8?line={line}"
@@ -1146,9 +1197,13 @@ async def preset_m3u8(mg: str, request: Request):
         return Response(status_code=302, headers={
             "Location": f"{ONLINE}/{mg}/direct?line={line}&index={index}"})
 
-    if request.query_params.get("from") == "mr":
+    if request.query_params.get("from") == "mr" or _is_ios(request):
         # 剧集经 media/range -> preset 进来：App 只认 .m3u8 地址上的媒体清单，
         # 这里直接返回 main（不再下发 master，避免它不跟变体）。
+        # iOS 1.13（fncache）从 play/play 的 play_link 直接请求 preset 时没有
+        # from=mr，也会落到这个 master 分支；它拿到 master 后不请求变体，
+        # 表现就是「继续播放」一直转圈。凡是 iOS 一律直接下发媒体清单，
+        # start 由下面转为 main 的 query，最终注入 EXT-X-START。
         scope = dict(request.scope)
         scope["path"] = f"{ONLINE}/{mg}/main.m3u8"
         q = f"line={line}&index={index}&ph=1"
@@ -1307,6 +1362,9 @@ async def main_m3u8(mg: str, request: Request):
         start_offset = float(request.query_params.get("start") or 0)
     except ValueError:
         start_offset = 0.0
+    # iOS 1.13 对 EXT-X-START 兼容有问题（续播拿到就卡死）：start>0 时改用
+    # 裁剪清单实现续播；start=0 时裁剪是空操作，起播清单与原来完全一致。
+    slice_start = _is_ios(request)
     # 带显式 line 的 auto=1 来自 media/range（App 起播）：直接用该线路，
     # 不再竞速所有候选。竞速会给慢源叠加最多 3s，也可能选中“清单快但分片死”
     # 的线路，表现就是部分影片一直加载。
@@ -1321,7 +1379,8 @@ async def main_m3u8(mg: str, request: Request):
                                          hls.is_master(text),
                                          hls.can_decrypt(),
                                          start_offset=start_offset,
-                                         short_segs=_is_ios(request))
+                                         short_segs=_is_ios(request),
+                                         slice_start=slice_start)
     if auto_start and config.get().get("auto_best_source", True):
         winner = await _race_lines(request.app.state.src, brief, guid, index,
                                    line, 3.0)
@@ -1338,18 +1397,20 @@ async def main_m3u8(mg: str, request: Request):
                                          hls.is_master(text),
                                          hls.can_decrypt(),
                                          start_offset=start_offset,
-                                         short_segs=_is_ios(request))
+                                         short_segs=_is_ios(request),
+                                         slice_start=slice_start)
     if request.query_params.get("ph") == "1":
-        # iOS media/range 专用：只等 2.2s，慢源先回占位清单，后台继续抓。
+        # iOS media/range 专用：绝不下发占位清单——1.13 的 fncache 会把这份
+        # 直播式假清单缓存成该条目的播放会话，之后整部片只转圈（实测）。
+        # 慢源多等几秒拿真实点播清单；真拿不到就落入下方换线兜底。
         task = _warm_playlist_task(request, brief, guid, index, line)
         if task is not None:
             try:
                 text, base, meta = await asyncio.wait_for(
-                    asyncio.shield(task), _IOS_READY_BUDGET)
+                    asyncio.shield(task), _IOS_WARM_TIMEOUT + 1.0)
             except asyncio.TimeoutError:
                 runtime.log(f"ios slow playlist: {brief.get('title', '')[:40]} "
-                            f"line{line} -> placeholder")
-                return _placeholder_playlist(mg)
+                            f"line{line} -> failover")
             except Exception as exc:
                 _mark_bad_line(guid, line)
                 runtime.log(f"ios playlist error: {brief.get('title', '')[:40]} "
@@ -1359,7 +1420,8 @@ async def main_m3u8(mg: str, request: Request):
                                              f"{ONLINE}/variant",
                                              hls.is_master(text),
                                              hls.can_decrypt(),
-                                             start_offset=start_offset)
+                                             start_offset=start_offset,
+                                             slice_start=slice_start)
 
     last_error = ""
     tried = set()
@@ -1381,9 +1443,13 @@ async def main_m3u8(mg: str, request: Request):
                 last_error = "blocked"
                 continue
             try:
+                fetch_timeout = min(
+                    float(config.get().get("play_timeout", 8.0)), 2.5)
+                if _is_ios(request):
+                    # iOS 不再喂占位清单，慢源（分享页要解一次 HTML）多给时间。
+                    fetch_timeout = float(config.get().get("play_timeout", 8.0))
                 text, base, meta = await hls.fetch_playlist(
-                    request.app.state.src, url,
-                    timeout=min(float(config.get().get("play_timeout", 8.0)), 2.5))
+                    request.app.state.src, url, timeout=fetch_timeout)
             except Exception as exc:
                 last_error = type(exc).__name__
                 _mark_bad_line(guid, attempt)
@@ -1399,7 +1465,8 @@ async def main_m3u8(mg: str, request: Request):
                                          hls.is_master(text),
                                          hls.can_decrypt(),
                                          start_offset=start_offset,
-                                         short_segs=_is_ios(request))
+                                         short_segs=_is_ios(request),
+                                         slice_start=slice_start)
     if last_error:
         runtime.log(f"playback failed: {brief.get('title', '')[:40]} ({last_error})")
     return Response(status_code=502)
@@ -1428,7 +1495,8 @@ async def variant_playlist(request: Request):
     return hls.playlist_response(text, base, SEG_PREFIX,
                                  decrypt_keys=hls.can_decrypt(),
                                  start_offset=start_offset,
-                                 short_segs=_is_ios(request))
+                                 short_segs=_is_ios(request),
+                                 slice_start=_is_ios(request))
 
 
 @app.get(f"{ONLINE}/{{mg}}/direct")
