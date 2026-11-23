@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -1154,9 +1155,46 @@ def playlist_response(text: str, base: str, seg_prefix: str,
                              "Connection": "close"})
 
 
+# 媒体流的读超时：httpx 客户端是全局 8s，对「首字节要等源站取址」的源太短。
+# 红果新版 /api/stream 服务端自己给的是 30s 初始化 + 20s 首块，8s 必然先抛
+# ReadTimeout，播放器表现就是一直转圈（第一集因为取址已缓存才显得正常）。
+_MEDIA_READ_TIMEOUT = 45.0
+# 源站瞬时错误：这些码值得换地址/换档位重试一次，而不是直接怼给播放器。
+_RETRY_CODES = (408, 425, 429, 500, 502, 503, 504)
+
+
+async def _open_media(client: httpx.AsyncClient, url: str, headers: dict,
+                      read_timeout: float) -> httpx.Response:
+    """按单次请求设置读超时：客户端全局超时管不住长首包。"""
+    req = client.build_request("GET", url, headers=headers)
+    req.extensions["timeout"] = {
+        "connect": 8.0,
+        "read": max(float(read_timeout), 8.0),
+        "write": 30.0,
+        "pool": 15.0,
+    }
+    return await client.send(req, stream=True)
+
+
+async def _error_body(resp: httpx.Response, limit: int = 200) -> str:
+    """错误响应体前若干字节；上游用 {error,code} 说明原因，靠它定位。"""
+    try:
+        data = await resp.aread()
+    except Exception:  # noqa: BLE001 - 读错误体失败不影响主流程
+        return ""
+    return " ".join(data[:limit].decode("utf-8", "replace").split())
+
+
 async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
-                      timeout: float = 8.0,
-                      on_headers=None) -> StreamingResponse | Response:
+                      timeout: float = _MEDIA_READ_TIMEOUT,
+                      on_headers=None,
+                      retry_urls: tuple[str, ...] = ()) -> StreamingResponse | Response:
+    """转发媒体流；源站 5xx/429 时按 ``retry_urls`` 顺序再试一次。
+
+    ``retry_urls`` 用于红果这类「高清通道被限流、低档还能出流」的源：首档
+    返回 503/空响应时换 compat（360P H.264）重取，播放器拿到的是可播的
+    流，而不是一个让它无限转圈的错误码。
+    """
     headers = {"User-Agent": _UA}
     for key in ("range", "if-range", "if-none-match"):
         if key in request.headers:
@@ -1165,8 +1203,36 @@ async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
     # 不能把播放器（我们自己的 NAS 地址）的 Referer 透传给源站，
     # 分享页的密钥/分片服务器会因此返回无效内容。
     headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
-    resp = await client.send(client.build_request("GET", url, headers=headers),
-                             stream=True)
+    targets = (url,) + tuple(u for u in retry_urls if u)
+    resp: httpx.Response | None = None
+    for index, target in enumerate(targets):
+        started = time.monotonic()
+        try:
+            resp = await _open_media(client, target, headers, timeout)
+        except Exception as exc:  # noqa: BLE001 - 超时/连接失败换下个地址
+            resp = None
+            runtime.log(f"media open failed: {type(exc).__name__} "
+                        f"try{index + 1} {target[:100]}")
+            if index + 1 < len(targets):
+                await asyncio.sleep(0.8)
+                continue
+            raise
+        if resp.status_code < 400:
+            if index:
+                runtime.log(f"media retry ok: try{index + 1} "
+                            f"{resp.status_code} {target[:100]} "
+                            f"{time.monotonic() - started:.1f}s")
+            break
+        body = await _error_body(resp)
+        await resp.aclose()
+        runtime.log(f"media upstream {resp.status_code}: try{index + 1} "
+                    f"{target[:100]} body={body[:120]!r}")
+        if resp.status_code not in _RETRY_CODES or index + 1 >= len(targets):
+            return Response(status_code=resp.status_code, headers={
+                "Cache-Control": "no-store", "Connection": "close"})
+        await asyncio.sleep(0.8)
+    if resp is None:
+        return Response(status_code=502, headers={"Connection": "close"})
     out_headers = {}
     for key in ("content-type", "content-range", "accept-ranges", "etag"):
         if key in resp.headers:
@@ -1180,9 +1246,6 @@ async def proxy_media(request: Request, url: str, client: httpx.AsyncClient,
     # 否则几轮播放后连接池被占满，后续分片请求发不出来（重启扩展才恢复）。
     out_headers["Connection"] = "close"
     status = resp.status_code
-    if status >= 400:
-        await resp.aclose()
-        return Response(status_code=status, headers=out_headers)
     # 上游自报的媒体属性（红果的 x-stream-quality / x-stream-codec）交给
     # 适配层缓存；回调失败绝不能影响播放。
     if on_headers:

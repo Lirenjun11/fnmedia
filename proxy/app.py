@@ -32,6 +32,7 @@ import playcache
 import playstate
 import playstate_api
 import runtime
+import skipmarks
 import tmdb
 import upstream
 import vlib
@@ -687,6 +688,31 @@ async def _body(request: Request) -> dict:
         return {}
 
 
+def _dump_play(tag: str, body: dict, ref: dict | None = None) -> None:
+    """临时诊断：记录客户端传来的标识字段（定位「选第 N 集却播第 1 集」）。
+
+    只写 stdout（uvicorn 会转进 journal），不改任何行为。定位完即删。
+    """
+    try:
+        fields = {"mg": body.get("media_guid"), "vg": body.get("video_guid"),
+                  "ig": body.get("item_guid"), "g": body.get("guid"),
+                  "idx": body.get("index"), "ep": body.get("episode"),
+                  "eidx": body.get("episode_index"),
+                  "sidx": body.get("season_index"),
+                  "vi": body.get("video_index"),
+                  "start": body.get("startTimestamp") or body.get("start_ts"),
+                  "ts": body.get("ts")}
+        picked = {k: v for k, v in fields.items() if v not in (None, "")}
+        tail = " -> None"
+        if ref:
+            tail = (f" -> idx={ref['index']} "
+                    f"ep={(ref.get('episode') or '')[:10]}")
+        print(f"[playdump] {tag} keys={sorted(body)} {picked}{tail}",
+              flush=True)
+    except Exception:  # noqa: BLE001 - 诊断失败绝不能影响播放
+        pass
+
+
 def _resume_index(store: cms.TitleStore, guid: str) -> int:
     episode = playstate.episode_for(guid)
     if episode:
@@ -712,6 +738,23 @@ def _tv_guid_of(store: cms.TitleStore, guid: str) -> str | None:
     if season:
         return season
     return guid if _brief(store, guid) else None
+
+
+def _skip_keys(store: cms.TitleStore, guid: str) -> tuple[str, list[str]]:
+    """把客户端给的身份归一化成「基础影片」标记键，并返回读侧候选键。
+
+    客户端可能传集 guid、季 guid、剧级 guid 或 media/video guid：能反查的都
+    归到剧/片级，这样换集、换线路共用同一份片头/片尾秒数。反查是内存索引，
+    重启或缓存淘汰后会失败，此时原样当键、并把原始 guid 放进候选键，标记不会
+    因为一次反查失败而读不到。
+    """
+    raw = str(guid or "")
+    if not raw:
+        return "", []
+    key = _tv_guid_of(store, raw) or raw
+    aliases = [fake.season_guid(key), raw]
+    return key, [a for i, a in enumerate(aliases) if a and a != key
+                 and a not in aliases[:i]]
 
 
 def _brief(store: cms.TitleStore, guid: str, enforce: bool = True) -> dict | None:
@@ -958,6 +1001,7 @@ async def play_info_route(request: Request):
     body = await _body(request)
     store = request.app.state.store
     ref = await _resolve_play_ref(store, request.app.state.src, body)
+    _dump_play("info", body, ref)
     if not ref:
         runtime.log(f"play/info unresolved keys={sorted(body)}")
         return await _passthrough(request)
@@ -976,8 +1020,13 @@ async def play_info_route(request: Request):
             return await _passthrough(request)
         brief = await _hg_brief(request, brief) or brief
         if brief.get("is_tv"):
-            # 整部剧点播放：解析到续播集，播放器才有“下一集/选集”身份。
-            index = _resume_index(store, guid)
+            # 集级 media/video guid 已经带了对的集号，绝不能被续播覆盖：
+            # 详情页选集后起播走的正是这条路径，覆盖回去就会变成第 1 集
+            # 或上次看到的那一集。只有「剧级 guid」才是从上次继续。
+            if ref["media"] != fake.media_guid(guid):
+                index = ref["index"]
+            else:
+                index = _resume_index(store, guid)
             eg = fake.episode_guid(guid, index)
             info = fake.episode_play_info(brief, index, eg)
         else:
@@ -985,7 +1034,13 @@ async def play_info_route(request: Request):
             # 起播不等待富化：只读已缓存结果（纯内存，零网络）。
             info = fake.play_info(brief, mg, vg, guid, tmdb.cached(brief))
         canonical = guid
-    pos = playstate.ts_for(canonical)
+    # 续播点必须按「集」取：进度记录每部剧只存最后观看那一集的 ts，直接用
+    # 剧级 key 取会把上一集的秒数塞给新一集，客户端拿 watched_ts 直接 seek，
+    # 表现为「当前集没播完就切下一集，从上一集的进度接着播」。
+    if brief.get("is_tv"):
+        pos = playstate.episode_ts(canonical, fake.episode_guid(canonical, index))
+    else:
+        pos = playstate.ts_for(canonical)
     info["ts"] = pos
     # 官方 Web/App 的续播点是 play/info 响应里的 item.watched_ts（客户端
     # 直接拿它 seek），只写外层 ts 不会被读取。
@@ -1004,11 +1059,105 @@ async def play_info_route(request: Request):
     return JSONResponse(fake.ok(fake.normalize_detail(info, _ua(request))))
 
 
+@app.post("/v/api/v1/play/setConfigByItem")
+async def play_set_config_by_item(request: Request):
+    """原生「跳过片头/片尾」写入口（body 就是配置对象，无 data 包装）。
+
+    官方播放器在菜单里设完秒数后调这个接口；标记按基础影片/季保存，所以同一
+    部剧换线路、换集都不用重设。
+
+    响应体踩过两次坑，别随手改回去：
+
+    * 第一版只给 ``{guid, play_config:{...}}``、第二版把 ``skip_opening`` /
+      ``skip_ending`` 平铺到 ``data`` 上，客户端都照样弹「影视服务出错，请检查
+      服务」——但写入其实成功了、跳片也生效。说明官方成功的响应体不是我们猜的
+      这几种形状。
+    * 所以现在不再猜：把原请求透传给官方影视服务，官方返回 ``code=0`` 就直接
+      把它那份原文回给客户端（形状必然匹配）；官方不认（未知 guid / 鉴权失败）
+      才退回我们自己拼的成功体。
+    * ``guid`` 回显请求里的原 guid，不是归一化后的剧级 key。
+    """
+    body = await _body(request)
+    store = request.app.state.store
+    raw = str(body.get("guid") or body.get("item_guid")
+              or body.get("parent_guid") or "")
+    key, aliases = _skip_keys(store, raw)
+    if not key:
+        return JSONResponse({"code": 400, "msg": "缺少 guid", "data": None},
+                            status_code=400)
+    try:
+        skipmarks.set_mark(key, body)
+    except ValueError as exc:
+        return JSONResponse({"code": 400, "msg": str(exc), "data": None},
+                            status_code=400)
+    config_ = skipmarks.play_config(key, *aliases)
+    msg = (f"play/setConfigByItem: {key[:8]} "
+           f"片头={config_['skip_opening']}s 片尾={config_['skip_ending']}s")
+    runtime.log(msg)
+    # runtime.log 只在内存里，出问题要进 journal 才能回溯客户端传了什么。
+    print(f"[skipmarks] {msg} raw={raw[:64]} body={str(body)[:300]}", flush=True)
+
+    # 官方的响应形状才是客户端真正期待的那一份。把原请求原样转给官方：
+    # 官方认（code=0）就直接拿它的原文回客户端，一字不改；官方不认（未知
+    # guid、鉴权失败等）才退回我们自己拼的成功体，功能照旧不受影响。
+    # 两个分支都把官方原文打进 journal，下次再对不上就有对照物。
+    try:
+        probe = await upstream.forward(request, request.app.state.up)
+        raw_up = bytes(getattr(probe, "body", b"") or b"")
+        print(f"[skipmarks] upstream status={probe.status_code} "
+              f"len={len(raw_up)} body={raw_up[:300]!r}", flush=True)
+        if probe.status_code == 200 and b'"code":0' in raw_up.replace(b" ", b""):
+            return probe
+    except Exception as exc:
+        print(f"[skipmarks] upstream err {type(exc).__name__}: {exc}", flush=True)
+
+    echo = raw or key
+    data = {
+        "guid": echo,
+        "item_guid": echo,
+        "skip_opening": config_["skip_opening"],
+        "skip_ending": config_["skip_ending"],
+        "play_config": {**config_, "guid": echo},
+    }
+    runtime.log(f"skipmarks fallback shape used for {key[:8]}")
+    print("[skipmarks] fallback shape: data=null "
+          f"(would be {json.dumps(data, ensure_ascii=False)[:200]})", flush=True)
+    # 兜底用官方「写操作成功」的最小形状：同一个播放器模块的 play/record、
+    # play/quit 都是 {code:0,msg:"",data:null}，客户端从不报错。带内容的
+    # data 反而被拒过两次，说明这个模块对 data 的期望不是「配置对象」。
+    return JSONResponse({"code": 0, "msg": "", "data": None})
+
+
+@app.get("/v/api/ext/skip-marks")
+async def ext_skip_marks_get(request: Request):
+    """管理台用：读取某部影片/剧当前生效的跳过标记。"""
+    store = request.app.state.store
+    key, aliases = _skip_keys(store, request.query_params.get("guid") or "")
+    if not key:
+        return JSONResponse({"code": 400, "msg": "缺少 guid", "data": None},
+                            status_code=400)
+    return JSONResponse(fake.ok({"guid": key, "mark": skipmarks.get(key, *aliases),
+                                 "play_config": skipmarks.play_config(key, *aliases)}))
+
+
+@app.delete("/v/api/ext/skip-marks")
+async def ext_skip_marks_delete(request: Request):
+    """管理台用：清掉某部影片/剧的跳过标记（客户端菜单重置即走这里）。"""
+    store = request.app.state.store
+    key, aliases = _skip_keys(store, request.query_params.get("guid") or "")
+    if not key:
+        return JSONResponse({"code": 400, "msg": "缺少 guid", "data": None},
+                            status_code=400)
+    skipmarks.delete(key, *aliases)
+    return JSONResponse(fake.ok(True))
+
+
 @app.post("/v/api/v1/stream")
 async def stream_post(request: Request):
     body = await _body(request)
     store = request.app.state.store
     ref = await _resolve_play_ref(store, request.app.state.src, body)
+    _dump_play("stream", body, ref)
     if not ref:
         runtime.log(f"stream unresolved keys={sorted(body)}")
         return await _passthrough(request)
@@ -1058,6 +1207,9 @@ async def media_range_route(file_hash: str, request: Request):
     ref = _play_ref(store, file_hash)
     if not ref and await _ensure_vlib(store, request.app.state.src, file_hash):
         ref = _play_ref(store, file_hash)
+    _dump_play("range", {"guid": file_hash,
+                         "line": request.query_params.get("line"),
+                         "index": request.query_params.get("index")}, ref)
     if not ref:
         return await _passthrough(request)
     guid, index, mg = ref["guid"], ref["index"], ref["media"]
@@ -1116,8 +1268,19 @@ async def media_range_route(file_hash: str, request: Request):
     except ValueError:
         _mark_bad_line(guid, line)
         return Response(status_code=404)
-    return await hls.proxy_media(request, url, request.app.state.src,
-                                 on_headers=hongguo.quality_hook(url))
+    retry = ()
+    if hongguo.STREAM_MARK in url:
+        alt = hongguo.compat_url(url)
+        retry = (alt,) if alt else ()
+    started = time.monotonic()
+    resp = await hls.proxy_media(request, url, request.app.state.src,
+                                 timeout=hls._MEDIA_READ_TIMEOUT,
+                                 on_headers=hongguo.quality_hook(url),
+                                 retry_urls=retry)
+    runtime.log(f"media/range direct: {brief.get('title', '')[:24]} "
+                f"ep{index + 1} {resp.status_code} "
+                f"{time.monotonic() - started:.1f}s")
+    return resp
 
 
 @app.post("/v/api/v1/play/play")
@@ -1125,6 +1288,7 @@ async def play_play(request: Request):
     body = await _body(request)
     store = request.app.state.store
     ref = await _resolve_play_ref(store, request.app.state.src, body)
+    _dump_play("play", body, ref)
     if not ref:
         runtime.log(f"play/play unresolved keys={sorted(body)}")
         return await _passthrough(request)
@@ -1151,6 +1315,14 @@ async def play_play(request: Request):
         return _err("该线路暂不支持，请在红果服务里切换内置源", 404)
     is_hls = not _is_direct_media(url)
     suffix = "preset.m3u8" if is_hls else "direct"
+    if not is_hls:
+        # 红果直链：起播前先让源站把地址取好，切集不再干等 10–30 秒；
+        # 剧集顺带预热下一集，连续追剧时切集几乎无等待。
+        nxt = ""
+        if brief.get("is_tv"):
+            ahead = _pick(brief, line, index + 1)
+            nxt = str(ahead[0]) if ahead else ""
+        _prewarm_hongguo(request.app.state.src, url, nxt)
     # 保持相对地址：App 会按自己配置的服务器地址（含 5666 端口）解析。
     # 不能按 Host 拼绝对地址——反代会把 Host 写成不带端口的 $host，
     # 拼出来会丢端口，App 请求到 80 端口报「视频文件不存在」。
@@ -1185,10 +1357,17 @@ async def preset_m3u8(mg: str, request: Request):
     """播放 master：只列当前线路。手机端会逐条预取 master 的所有变体，
     多变体会把它拖到超时；换线由 qualities -> play/play 重新下发单变体。"""
     target = await _media_target(request, mg, enforce=False)
+    _dump_play("preset", {"mg": mg,
+                          "line": request.query_params.get("line"),
+                          "index": request.query_params.get("index")},
+               {"index": target[1]} if target else None)
     if not target:
         runtime.log(f"preset miss: {mg[:12]}")
         return Response(status_code=404)
     guid, index, brief = target
+    # 红果条目只有 vod_id 时先把分集线路补齐，否则直链判定会失败、
+    # 误走 master 分支，iOS/App 拿到 master 后不跟变体就一直转圈。
+    brief = await _hg_brief(request, brief) or brief
     line, _ = _range_selection(request, brief)
     names = brief.get("line_names") or []
     line = max(0, min(line, len(names) - 1)) if names else 0
@@ -1347,6 +1526,60 @@ def _prewarm_online(request: Request, brief: dict, guid: str,
         pass
 
 
+# 红果直链（/api/stream）取址在服务端是「打上游签名接口 + 解密首块」，冷门集
+# 第一次要 10–30 秒；播放器等不到就一直转圈。起播接口下发地址时顺手取 1KB
+# 把地址与首块灌进源站缓存，播放器真正请求时秒回。
+_HG_WARM: dict[str, float] = {}
+_HG_WARM_TTL = 120.0
+
+
+def _prewarm_hongguo(client, url: str, next_url: str = "") -> None:
+    """后台取 1KB 触发源站取址（fire-and-forget，失败只记日志）。
+
+    ``next_url`` 是下一集：追剧时一起排进队列，切集时源站已有地址，
+    不会再让播放器等一次冷取址。
+    """
+    links = [str(url or ""), str(next_url or "")]
+    links = [link for link in links if hongguo.STREAM_MARK in link]
+    if not links:
+        return
+    now = time.monotonic()
+    for key, ts in list(_HG_WARM.items()):
+        if now - ts > _HG_WARM_TTL:
+            _HG_WARM.pop(key, None)
+    todo = [link for link in links
+            if now - _HG_WARM.get(link, 0.0) >= _HG_WARM_TTL]
+    if not todo:
+        return
+    for link in todo:
+        _HG_WARM[link] = now
+
+    async def fetch(link: str) -> None:
+        req = client.build_request(
+            "GET", link, headers={"User-Agent": hls._UA,
+                                  "Range": "bytes=0-1023"})
+        req.extensions["timeout"] = {"connect": 8.0,
+                                     "read": hls._MEDIA_READ_TIMEOUT,
+                                     "write": 30.0, "pool": 15.0}
+        resp = await client.send(req, stream=True)
+        try:
+            await resp.aread()
+        finally:
+            await resp.aclose()
+
+    async def run():
+        for link in todo:
+            try:
+                await fetch(link)
+            except Exception as exc:  # noqa: BLE001 - 预热失败不影响起播
+                runtime.log(f"hongguo prewarm: {type(exc).__name__}")
+
+    try:
+        asyncio.create_task(run())
+    except RuntimeError:  # 没有事件循环（测试/同步上下文）时直接跳过
+        pass
+
+
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")
 async def main_m3u8(mg: str, request: Request):
     target = await _media_target(request, mg, enforce=False)
@@ -1502,22 +1735,44 @@ async def variant_playlist(request: Request):
 @app.get(f"{ONLINE}/{{mg}}/direct")
 async def direct_media(mg: str, request: Request):
     target = await _media_target(request, mg, enforce=False)
+    _dump_play("direct", {"mg": mg,
+                          "line": request.query_params.get("line"),
+                          "index": request.query_params.get("index")},
+               {"index": target[1]} if target else None)
     if not target:
         return Response(status_code=404)
     guid, index, brief = target
+    # 搜索结果/榜单里的红果条目可能只带 vod_id，没有分集线路：这里补一次
+    # 详情，否则 _pick 拿不到地址，切第二集就变成 404（播放器一直转圈）。
+    brief = await _hg_brief(request, brief) or brief
     try:
         line = int(request.query_params.get("line", 0))
     except ValueError:
         line = 0
     picked = _pick(brief, line, index)
     if not picked:
+        runtime.log(f"direct: no pick {brief.get('title', '')[:24]} "
+                    f"ep{index + 1} line{line}")
         return Response(status_code=404)
     try:
         url = hls.ensure_public_target(picked[0])
     except ValueError:
         return Response(status_code=400)
-    return await hls.proxy_media(request, url, request.app.state.src,
-                                 on_headers=hongguo.quality_hook(url))
+    # 红果：高清档被限流（503/空响应）时换 compat（360P）重取一次，
+    # 宁可降档也别让播放器无限转圈。
+    retry = ()
+    if hongguo.STREAM_MARK in url:
+        alt = hongguo.compat_url(url)
+        retry = (alt,) if alt else ()
+    started = time.monotonic()
+    resp = await hls.proxy_media(request, url, request.app.state.src,
+                                 timeout=hls._MEDIA_READ_TIMEOUT,
+                                 on_headers=hongguo.quality_hook(url),
+                                 retry_urls=retry)
+    runtime.log(f"direct: {brief.get('title', '')[:24]} ep{index + 1} "
+                f"line{line} {resp.status_code} "
+                f"{time.monotonic() - started:.1f}s")
+    return resp
 
 
 async def _serve_segment(token: str, request: Request):

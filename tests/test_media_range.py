@@ -1,4 +1,5 @@
 import _bootstrap
+import asyncio
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ import httpx
 import cms
 import fake
 import hls
+import hongguo
 import upstream
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -250,6 +252,102 @@ class MediaRangeTest(unittest.TestCase):
         self.assertIn("#EXT-X-DISCONTINUITY", out)
         self.assertIn("b.ts", out)
         self.assertNotIn("a.ts\n#EXT-X-DISCONTINUITY", out)
+
+
+class HongguoFallbackTest(unittest.TestCase):
+    """红果高清档被限流时，媒体代理换 compat 重取一次，而不是回 503。"""
+
+    EP = "https://hg.example.com/api/stream/7241?q=auto&at=t0k"
+
+    def _title(self):
+        return cms.OnlineTitle(
+            provider="hg_x", vod_id="900", title="红果兜底测试", type_name="短剧",
+            lines={"红果": [cms.Episode("第1集", self.EP, direct=True),
+                          cms.Episode("第2集", self.EP.replace("7241", "7242"),
+                                      direct=True)]})
+
+    def test_compat_url_rewrites_quality_only(self):
+        alt = hongguo.compat_url(self.EP)
+        self.assertIn("q=compat", alt)
+        self.assertIn("at=t0k", alt)
+        self.assertIn("/api/stream/7241", alt)
+        self.assertEqual(hongguo.compat_url(alt), "")
+        self.assertEqual(hongguo.compat_url("https://x.com/y.m3u8"), "")
+
+    def test_auto_503_retries_with_compat(self):
+        seen = []
+
+        def handler(request):
+            seen.append(str(request.url))
+            if "q=auto" in str(request.url):
+                return httpx.Response(503, json={"error": "同时播放数已达上限",
+                                                 "code": "BUSY"})
+            return httpx.Response(200, content=b"\x22" * 64,
+                                  headers={"content-type": "video/mp4",
+                                           "x-stream-quality": "compat",
+                                           "x-stream-codec": "h264"})
+
+        with patch.object(hls, "ensure_public_target", side_effect=lambda u: u):
+            with TestClient(appmod.app) as client:
+                client.get("/v/online-admin")
+                appmod.app.state.src = httpx.AsyncClient(
+                    transport=httpx.MockTransport(handler))
+                brief = appmod.app.state.store.remember([self._title()])[0]
+                mg = fake.ep_media_guid(fake.episode_guid(brief["guid"], 1))
+                resp = client.get(f"/v/api/v1/media/range/{mg}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(seen), 2)
+        self.assertIn("q=auto", seen[0])
+        self.assertIn("q=compat", seen[1])
+        self.assertIn("7242", seen[1])
+
+    def test_client_error_is_not_retried(self):
+        seen = []
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(404, json={"error": "剧集不存在"})
+
+        with patch.object(hls, "ensure_public_target", side_effect=lambda u: u):
+            with TestClient(appmod.app) as client:
+                client.get("/v/online-admin")
+                appmod.app.state.src = httpx.AsyncClient(
+                    transport=httpx.MockTransport(handler))
+                brief = appmod.app.state.store.remember([self._title()])[0]
+                mg = fake.ep_media_guid(fake.episode_guid(brief["guid"], 0))
+                resp = client.get(f"/v/api/v1/media/range/{mg}")
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(len(seen), 1)
+
+    def test_prewarm_current_and_next_episode_once(self):
+        """起播预热只打当前集与下一集各一次，重复调用不再打上游。"""
+        seen = []
+
+        def handler(request):
+            seen.append(request.headers.get("range", ""))
+            seen.append(str(request.url))
+            return httpx.Response(206, content=b"\x00" * 16,
+                                  headers={"content-range": "bytes 0-15/100",
+                                           "content-type": "video/mp4"})
+
+        appmod._HG_WARM.clear()
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        first = "https://hg.example.com/api/stream/1?q=auto"
+        second = "https://hg.example.com/api/stream/2?q=auto"
+
+        async def run():
+            appmod._prewarm_hongguo(client, first, second)
+            await asyncio.sleep(0.05)
+            appmod._prewarm_hongguo(client, first, second)
+            await asyncio.sleep(0.05)
+            await client.aclose()
+
+        asyncio.run(run())
+        urls = [item for item in seen if item.startswith("http")]
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(any("/api/stream/2" in u for u in urls))
+        self.assertIn("bytes=0-1023", seen)
+        appmod._HG_WARM.clear()
 
 
 if __name__ == "__main__":

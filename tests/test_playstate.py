@@ -152,6 +152,38 @@ class PlayStateTest(unittest.TestCase):
             self.assertEqual(info1["item"]["watched_ts"], 30)
             self.assertEqual(playstate.episode_ts(tv, eg2), 0)
 
+    def test_switching_episode_does_not_inherit_previous_position(self):
+        """当前集没播完就切下一集，新一集必须从 0 开始，不能带上一集的 ts。
+
+        进度记录每部剧只存最后观看那一集的 ts；play/info 若按剧级 key 取，
+        上一集的秒数会被当成新一集的续播点，客户端直接 seek 过去。
+        """
+        with TestClient(appmod.app) as client:
+            client.get("/v/online-admin")
+            brief = appmod.app.state.store.remember([make_tv()])[0]
+            tv = brief["guid"]
+            eg1 = fake.episode_guid(tv, 0)
+            eg2 = fake.episode_guid(tv, 1)
+            client.post("/v/api/v1/play/record", json={
+                "guid": tv, "item_guid": eg2,
+                "media_guid": fake.ep_media_guid(eg2),
+                "ts": 120, "duration": 600})
+
+            # 第 2 集本身仍是 120 秒续播
+            info2 = client.post("/v/api/v1/play/info",
+                                json={"item_guid": eg2}).json()["data"]
+            self.assertEqual(info2["item"]["watched_ts"], 120)
+
+            # 切到第 1 集：不能继承第 2 集的 120 秒
+            for payload in ({"item_guid": eg1},
+                            {"media_guid": fake.ep_media_guid(eg1)},
+                            {"video_guid": fake.ep_video_guid(eg1)}):
+                info1 = client.post("/v/api/v1/play/info",
+                                    json=payload).json()["data"]
+                self.assertEqual(info1["item"]["guid"], eg1, payload)
+                self.assertEqual(info1["item"]["watched_ts"], 0, payload)
+                self.assertEqual(info1["ts"], 0, payload)
+
     def test_play_link_carries_resume_position(self):
         """play/play 的 startTimestamp 要带进播放地址，原生播放器才会接着播。"""
         with TestClient(appmod.app) as client:

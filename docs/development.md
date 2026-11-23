@@ -14,6 +14,7 @@ proxy/
   fake.py          官方响应伪造与 TV 端严格字段规整
   hls.py           m3u8 改写、分片与海报代理
   playstate.py     播放状态存取（收藏 / 已看 / 续播），按飞牛账号分区
+  skipmarks.py     跳过片头 / 片尾标记（原生 play_config），按飞牛账号分区
   charts.py        豆瓣榜单缓存（虚拟库展示层）
   catalog.py       资源站分类深翻（虚拟库内容层）
   vlib.py          虚拟媒体库定义、卡片、榜单条目懒绑定

@@ -20,6 +20,17 @@
 - **重启后仍可见**：标题库（`cms.TitleStore`）是进程级内存态，服务重启/升级安装后为空。播放过、收藏过的条目 brief 会落盘到 `state/play_titles.json`（上限 300 条，只在新增条目时立即写、其余 30 秒节流），启动时先恢复进标题库，所以「最近播放 / 收藏」不会因为升级而变空，点进去也仍可续播。恢复时只保留 `playstate` 里仍被引用的条目，源被禁用则丢弃。
 - 已知限制：`state/play_titles.json` 只在播放/收藏时写入，因此**本版之前**就已丢失展示的记录无法自动找回（状态本身仍在 `playstate`，重新搜索该条目播放一次即可恢复卡片）；删除源后缓存条目在下次启动时清理。
 
+## 跳过片头 / 片尾
+
+原生播放器只认 `play/info` 响应里的 `play_config.skip_opening / skip_ending`（秒），并在用户在播放器菜单里设完秒数后调 `POST /v/api/v1/play/setConfigByItem` 回写。扩展接管这条链路（`skipmarks.py`）：
+
+- 电影与剧集两条 `play/info` 路径都下发真实 `play_config`；未设置时两个值都是 0，客户端不会自动跳（`play_config` 从此不再是 `null`，这是客户端显示「跳过片头/片尾」菜单的前提）。
+- 标记按**基础影片**保存：客户端传集 guid、季 guid、剧级 guid 还是 media/video guid，都归一化到同一部剧，换集、换线路不用重设。反查失败（重启或缓存淘汰）时退回原 guid 当键，读侧再按「季 guid / 集 guid」候选键兜底，标记不会因为一次归一化失败而读不到。
+- `enabled=false` 只是下发 0，已设秒数保留，重新打开即恢复；单个值上限 600 秒。
+- 与广告过滤的「片头跳过」（`adfilter_head_skip`，服务端直接删掉片头分片）互不影响：这里是客户端按秒 seek，不删分片；两者可以同时开。
+- 按飞牛账号分区，存 `state/skip_marks.json`（独立文件，不和 `config.json` 的节流写互相覆盖）。
+- 管理接口：`GET /v/api/ext/skip-marks?guid=`、`DELETE /v/api/ext/skip-marks?guid=`。
+
 ## 详情页图片（海报 / 背景）
 
 详情响应的 `poster`、`backdrops`、`posters`、`logos` 必须全部落在本站 `/online/<token>.jpg` 代理上，不能把外链直接交给客户端：

@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime
 
 import cms
+import skipmarks
 
 TAG = "【在线】"
 
@@ -571,7 +572,7 @@ def play_info(b: dict, mg: str, vg: str, guid: str,
               meta: dict | None = None) -> dict:
     return {
         "grand_guid": "", "guid": guid, "parent_guid": "",
-        "play_config": None, "ts": 0,
+        "play_config": skipmarks.play_config(guid), "ts": 0,
         "type": "TV" if b.get("is_tv") else "Movie",
         "video_guid": vg, "audio_guid": "", "subtitle_guid": "",
         "media_guid": mg, "item": detail_item(b, meta),
@@ -580,10 +581,14 @@ def play_info(b: dict, mg: str, vg: str, guid: str,
 
 
 def episode_play_info(b: dict, index: int, guid: str) -> dict:
+    # 跳过标记按「基础影片」存：同一部剧换集/换线路共享同一份秒数；候选键
+    # 带上季 guid 与集 guid，内存索引被淘汰导致归一化失败时仍能读回。
+    series = str(b.get("guid") or "")
+    keys = (series, season_guid(series), guid) if series else (guid,)
     return {
         "grand_guid": "", "guid": guid,
         "parent_guid": season_guid(b["guid"]),
-        "play_config": None, "ts": 0, "type": "Episode",
+        "play_config": skipmarks.play_config(*keys), "ts": 0, "type": "Episode",
         "video_guid": ep_video_guid(guid), "audio_guid": "", "subtitle_guid": "",
         "media_guid": ep_media_guid(guid), "item": episode_item(b, index),
         "direct_link_audio_index": -1,

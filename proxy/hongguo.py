@@ -179,6 +179,25 @@ def stream_url(source: dict, ep_id: str, quality: str = "auto") -> str:
             f"{urllib.parse.quote(str(ep_id), safe='')}{query}")
 
 
+def compat_url(url: str) -> str:
+    """同一分集的 360P H.264 兜底地址（``q=compat``）。
+
+    红果新版的高清档要走官方签名通道，被限流/熔断时 /api/stream 直接回
+    503/空响应；compat 是明文 H.264 通道，通常仍可用。已经就是 compat、
+    或者不是 /api/stream 地址时返回空串。
+    """
+    parts = urllib.parse.urlsplit(str(url or ""))
+    if STREAM_MARK not in parts.path:
+        return ""
+    query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+    if str((query.get("q") or ["auto"])[0]).strip().lower() == "compat":
+        return ""
+    query["q"] = ["compat"]
+    return urllib.parse.urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urllib.parse.urlencode(query, doseq=True), parts.fragment))
+
+
 def play_placeholder(source: dict, flag: str, ep_id: str) -> str:
     """非内置线路的占位标记；播放前会被识别并给出明确提示。"""
     return f"hgplay://{urllib.parse.quote(str(flag) or 'flag', safe='')}/" \
