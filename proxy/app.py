@@ -1638,24 +1638,32 @@ _HG_WARM: dict[str, float] = {}
 _HG_WARM_TTL = 120.0
 
 
-def _prewarm_hongguo(client, url: str, next_url: str = "") -> None:
+def _prewarm_hongguo(client, url: str, next_url: str = ""):
     """后台取 1KB 触发源站取址（fire-and-forget，失败只记日志）。
 
     ``next_url`` 是下一集：追剧时一起排进队列，切集时源站已有地址，
     不会再让播放器等一次冷取址。
+
+    返回排队的 Task（没有可预热链接或都在 TTL 内时返回 ``None``），
+    生产代码忽略返回值，测试可 await 它，避免赌后台任务的调度时机。
     """
     links = [str(url or ""), str(next_url or "")]
     links = [link for link in links if hongguo.STREAM_MARK in link]
     if not links:
-        return
+        return None
     now = time.monotonic()
     for key, ts in list(_HG_WARM.items()):
         if now - ts > _HG_WARM_TTL:
             _HG_WARM.pop(key, None)
+    # 注意：用 None 判断「没预热过」。以前写 _HG_WARM.get(link, 0.0)，
+    # 而 monotonic 是开机时长——刚开机的机器 now 只有几十秒，减 0.0
+    # 小于 TTL，于是永远不算过期，预热一次都不发（CI 新 runner 上必现，
+    # 本机 uptime 长才看起来正常）。
     todo = [link for link in links
-            if now - _HG_WARM.get(link, 0.0) >= _HG_WARM_TTL]
+            if _HG_WARM.get(link) is None
+            or now - _HG_WARM[link] >= _HG_WARM_TTL]
     if not todo:
-        return
+        return None
     for link in todo:
         _HG_WARM[link] = now
 
@@ -1680,9 +1688,9 @@ def _prewarm_hongguo(client, url: str, next_url: str = "") -> None:
                 runtime.log(f"hongguo prewarm: {type(exc).__name__}")
 
     try:
-        asyncio.create_task(run())
+        return asyncio.create_task(run())
     except RuntimeError:  # 没有事件循环（测试/同步上下文）时直接跳过
-        pass
+        return None
 
 
 @app.get(f"{ONLINE}/{{mg}}/main.m3u8")

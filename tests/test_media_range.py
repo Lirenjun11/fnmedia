@@ -1,6 +1,5 @@
 import _bootstrap
 import asyncio
-import time
 import unittest
 from unittest.mock import patch
 
@@ -337,16 +336,13 @@ class HongguoFallbackTest(unittest.TestCase):
         second = "https://hg.example.com/api/stream/2?q=auto"
 
         async def run():
-            appmod._prewarm_hongguo(client, first, second)
-            # 预热是 fire-and-forget 的后台任务：CI runner 负载高时 50ms
-            # 不够它跑完（实测因此偶发 0 != 2）。轮询到两个链接都完成，
-            # 再重复调用验证去重，而不是赌固定 sleep。
-            deadline = time.monotonic() + 3.0
-            while len([u for u in seen if u.startswith("http")]) < 2 \
-                    and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
-            appmod._prewarm_hongguo(client, first, second)
-            await asyncio.sleep(0.05)
+            # 预热是 fire-and-forget：生产代码不看返回值，测试直接 await
+            # 返回的 Task，不用轮询/sleep 赌调度时机。
+            task = appmod._prewarm_hongguo(client, first, second)
+            self.assertIsNotNone(task)
+            await task
+            # TTL 内重复调用：不排队、不打上游。
+            self.assertIsNone(appmod._prewarm_hongguo(client, first, second))
             await client.aclose()
 
         asyncio.run(run())
@@ -354,6 +350,35 @@ class HongguoFallbackTest(unittest.TestCase):
         self.assertEqual(len(urls), 2)
         self.assertTrue(any("/api/stream/2" in u for u in urls))
         self.assertIn("bytes=0-1023", seen)
+        appmod._HG_WARM.clear()
+
+    def test_prewarm_on_fresh_boot(self):
+        """机器刚开机（monotonic 只有几十秒）时也必须预热。
+
+        曾经把「没预热过」当成时间戳 0.0，刚开机的机器 now-0.0 小于 TTL，
+        于是一集都不预热（CI 新 runner 上必现 0 != 2）。
+        """
+        seen = []
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(206, content=b"\x00" * 16,
+                                  headers={"content-range": "bytes 0-15/100",
+                                           "content-type": "video/mp4"})
+
+        appmod._HG_WARM.clear()
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        link = "https://hg.example.com/api/stream/7?q=auto"
+
+        async def run():
+            with patch.object(appmod.time, "monotonic", return_value=5.0):
+                task = appmod._prewarm_hongguo(client, link)
+            self.assertIsNotNone(task)
+            await task
+            await client.aclose()
+
+        asyncio.run(run())
+        self.assertEqual(len([u for u in seen if u.startswith("http")]), 1)
         appmod._HG_WARM.clear()
 
 
