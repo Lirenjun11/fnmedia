@@ -56,10 +56,11 @@ jobs:
           mkdir -p proxy/static
           cp -a web/dist/. proxy/static/
 
-      - name: Install Python dependencies and run tests
-        run: |
-          python -m pip install -r requirements.txt
-          python -m unittest discover -s tests
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
 
       - name: Download fnpack
         run: |

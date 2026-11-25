@@ -1,5 +1,6 @@
 import _bootstrap
 import asyncio
+import time
 import unittest
 from unittest.mock import patch
 
@@ -337,7 +338,13 @@ class HongguoFallbackTest(unittest.TestCase):
 
         async def run():
             appmod._prewarm_hongguo(client, first, second)
-            await asyncio.sleep(0.05)
+            # 预热是 fire-and-forget 的后台任务：CI runner 负载高时 50ms
+            # 不够它跑完（实测因此偶发 0 != 2）。轮询到两个链接都完成，
+            # 再重复调用验证去重，而不是赌固定 sleep。
+            deadline = time.monotonic() + 3.0
+            while len([u for u in seen if u.startswith("http")]) < 2 \
+                    and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
             appmod._prewarm_hongguo(client, first, second)
             await asyncio.sleep(0.05)
             await client.aclose()
