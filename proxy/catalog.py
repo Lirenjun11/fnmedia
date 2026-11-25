@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -23,11 +25,21 @@ import httpx
 
 import cms
 import config
+import drpy
 import hongguo
+import runtime
 
 STATE = config.STATE_DIR / "catalog.json"
+# 列表页独立落盘：源站（尤其 drpy 的 HTML 站）单页要 3~14 秒，只放内存的话
+# 每次升级/重启后第一次进每个分类都得现场等一遍。
+PAGES_STATE = config.STATE_DIR / "catalog_pages.json"
 PER_PAGE = 20
-PAGE_TTL = 600.0
+PAGE_TTL = 1800.0
+# 过期不立刻抛：先返回旧页、后台刷新（stale-while-revalidate），
+# 避免「进分类要等十几秒才出海报墙」。超过这个时长才真正重新抓。
+PAGE_STALE = 24 * 3600.0
+PAGES_MAX = 240          # 内存里最多留多少页
+PAGES_PERSIST = 80       # 落盘只保留最近这么多页，控制文件体积
 ROUTE_TTL = 6 * 3600.0
 _PROBE_TIMEOUT = 6.0
 
@@ -171,6 +183,74 @@ def _page_rows(payload: dict | None, source: dict) -> list[cms.OnlineTitle]:
     return out
 
 
+#: 列表页缓存的体积上限。老版本把分集地址一起存，实测 176MB；
+#: 超过这个量级说明是旧格式，直接放弃加载而不是把它解析进内存。
+PAGES_FILE_MAX = 16 * 1024 * 1024
+#: 落盘用的“轻量条目”：去掉分集地址，只留海报墙/详情要用的元数据 + 集数。
+_SLIM_FIELDS = ("provider", "vod_id", "title", "provider_name", "type_name",
+                "year", "area", "remarks", "score", "poster", "overview",
+                "actor", "director", "updated")
+
+_PAGES_WRITE_LOCK = threading.Lock()
+
+
+def _slim(t: cms.OnlineTitle) -> cms.OnlineTitle:
+    """缓存副本：丢掉分集地址，用 ``ep_hint`` 保住集数。
+
+    一页 80 条、每条上百集就是上万个 Episode 对象，几十页叠起来能把
+    进程顶到 cgroup 上限；播放要用的分集由 ``_online_brief`` 按需补。
+    """
+    if not t.lines:
+        return t
+    return dataclasses.replace(t, lines={}, line_sources={},
+                               ep_hint=cms.episode_count(t))
+
+
+def _page_payload(key: tuple, ts: float,
+                  rows: list[cms.OnlineTitle]) -> str:
+    items = []
+    for t in rows:
+        rec = {name: getattr(t, name, "") for name in _SLIM_FIELDS}
+        rec["ep_hint"] = int(t.ep_hint or cms.episode_count(t))
+        items.append(rec)
+    return json.dumps({"api": key[0], "type_id": key[1], "page": key[2],
+                       "ts": ts, "items": items},
+                      ensure_ascii=False, separators=(",", ":"))
+
+
+def _write_pages(text: str) -> None:
+    """线程里写盘；正在写就跳过（下一次节流到点会再写）。"""
+    if not _PAGES_WRITE_LOCK.acquire(blocking=False):
+        return
+    try:
+        PAGES_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PAGES_STATE.with_suffix(".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(PAGES_STATE)
+    except OSError as exc:  # noqa: BLE001 - 落盘失败不影响浏览
+        runtime.log(f"catalog: 列表页落盘失败 {type(exc).__name__}")
+    finally:
+        _PAGES_WRITE_LOCK.release()
+
+
+#: 抓页时顺手把条目注册进 store（分类里点开即可播，不必再等详情）。
+_STORE = None
+
+
+def bind_store(store) -> None:
+    global _STORE
+    _STORE = store
+
+
+def _remember(rows: list[cms.OnlineTitle]) -> None:
+    if _STORE is None or not rows:
+        return
+    try:
+        _STORE.remember(rows)
+    except Exception as exc:  # noqa: BLE001 - 入库失败不影响列表
+        runtime.log(f"catalog: 条目入库失败 {type(exc).__name__}")
+
+
 class Catalog:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -180,6 +260,14 @@ class Catalog:
         self._last_attempt = 0.0
         self._refreshing = False
         self._pages: dict[tuple, tuple[float, list[cms.OnlineTitle]]] = {}
+        # 值里的 float 是**墙上时钟**（time.time），落盘后跨重启仍然有效；
+        # 以前用 time.monotonic 导致缓存只能活在单次进程里。
+        self._refreshing_pages: set[tuple] = set()
+        self._pages_write = 0.0
+        # 每页的 JSON 片段：抓取时就渲染好，落盘只要拼字符串，绝不会在事件
+        # 循环里对整张缓存再做一次 dataclasses.asdict（一页上万个分集，
+        # 全量序列化能把进程卡住十几秒，所有接口一起超时）。
+        self._page_json: dict[tuple, str] = {}
         self._load()
 
     # ---------- 持久化 ----------
@@ -201,6 +289,80 @@ class Catalog:
                     for sid, rows in raw_classes.items()
                     if isinstance(rows, list)}
             self._updated_at = float(data.get("updated_at") or 0)
+        self._load_pages()
+
+    def _load_pages(self) -> None:
+        """恢复列表页缓存；只认还在 ``PAGE_STALE`` 内的记录。"""
+        try:
+            # 旧版本把每页的全部分集地址也存了（实测 176MB / 79 万条），
+            # 启动时解析就会吃掉几百兆内存。超限直接放弃，宁可首屏重抓。
+            if PAGES_STATE.stat().st_size > PAGES_FILE_MAX:
+                runtime.log("catalog: 列表页缓存过大，按新版重建")
+                return
+            raw = json.loads(PAGES_STATE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        rows = raw.get("pages") if isinstance(raw, dict) else None
+        if not isinstance(rows, list):
+            return
+        names = {f.name for f in dataclasses.fields(cms.OnlineTitle)}
+        now = time.time()
+        for rec in rows:
+            if not isinstance(rec, dict):
+                continue
+            api, tid, page = rec.get("api"), rec.get("type_id"), rec.get("page")
+            ts, items = rec.get("ts"), rec.get("items")
+            if not (api and tid and page and isinstance(items, list)):
+                continue
+            if not isinstance(ts, (int, float)) or now - float(ts) > PAGE_STALE:
+                continue
+            restored = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    # 分集地址不落盘（一页上万个），集数靠 ep_hint 保留；
+                    # 真要播放时 _online_brief 会按需补一次详情。
+                    data = {k: v for k, v in item.items()
+                            if k in names and k not in ("lines", "line_sources")}
+                    data["lines"], data["line_sources"] = {}, {}
+                    restored.append(cms.OnlineTitle(**data))
+                except TypeError:
+                    continue
+            if restored:
+                key = (str(api), str(tid), int(page))
+                self._pages[key] = (float(ts), restored)
+                self._page_json[key] = _page_payload(key, float(ts), restored)
+
+    def _persist_pages(self, force: bool = False) -> None:
+        """把列表页落盘：只拼已经渲染好的片段，写盘交给线程。
+
+        以前这里对整张缓存做 ``dataclasses.asdict``——一页上万集，几十页
+        加起来 79 万个对象，一次要 13 秒且**跑在事件循环上**，所有接口
+        （含搜索）一起超时。现在每页抓取时就渲染好片段，落盘只是拼字符串。
+        """
+        now = time.time()
+        if not force and now - self._pages_write < 10.0:
+            return
+        self._pages_write = now
+        parts = []
+        for key, (ts, rows) in sorted(self._pages.items(),
+                                      key=lambda kv: kv[1][0],
+                                      reverse=True)[:PAGES_PERSIST]:
+            if not rows:
+                continue
+            body = self._page_json.get(key)
+            if body is None:
+                body = _page_payload(key, ts, rows)
+                self._page_json[key] = body
+            parts.append(body)
+        text = '{"v":2,"pages":[' + ",".join(parts) + "]}"
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _write_pages(text)
+            return
+        loop.run_in_executor(None, _write_pages, text)
 
     def _persist(self) -> None:
         try:
@@ -275,6 +437,47 @@ class Catalog:
     def total(self, cat: str) -> int:
         return int((self.route(cat) or {}).get("total") or 0)
 
+    async def warm_pages(self, client: httpx.AsyncClient, limit: int = 30,
+                         gap: float = 0.4) -> int:
+        """后台预热各分类首页。
+
+        源站单页 3~14 秒，冷启动后每个分类的第一次打开都得现场等。这里在
+        后台把过期/缺失的首页顺序灌进缓存，用户点进去就是现成的。串行 +
+        间隔，避免把慢站打挂。
+
+        排序上把 ``drpy`` / ``hongguo`` 排前面：CMS 站一页 1~3 秒，
+        JS 源/红果常常 10 秒以上，先灌慢的收益最大；``limit`` 只数真正
+        发起的抓取，命中的新鲜页不占名额，否则前面一批快源会把名额吃光，
+        慢源永远排在后面。
+        """
+        warmed = 0
+        order = sorted(
+            self._routes.items(),
+            key=lambda kv: 0 if str((kv[1] or {}).get("kind") or "") in
+            ("drpy", "hongguo") else 1)
+        for cat, route in order:
+            if warmed >= limit:
+                break
+            if not isinstance(route, dict) or not route.get("api"):
+                continue
+            key = (route["api"], route.get("type_id"), 1)
+            hit = self._pages.get(key)
+            if hit and hit[1] and time.time() - hit[0] < PAGE_TTL:
+                continue
+            try:
+                rows = await self._fetch_page(client, route, 1)
+                if rows:
+                    warmed += 1
+                    # 预热只把海报墙灌进缓存，行里的分集不会留在 _pages；
+                    # 顺手写进 store，用户点开热过的卡片仍然能直接播。
+                    _remember(rows)
+            except Exception as exc:  # noqa: BLE001 - 预热失败不影响浏览
+                runtime.log(f"catalog: 预热 {cat} 失败 {type(exc).__name__}")
+            await asyncio.sleep(gap)
+        if warmed:
+            runtime.log(f"catalog: 预热 {warmed} 个分类首页")
+        return warmed
+
     def stale(self, ttl: float = ROUTE_TTL) -> bool:
         """路由是否该重扫。``ttl`` 传「刷新间隔」小时数转成的秒数。
 
@@ -341,7 +544,9 @@ class Catalog:
         self._routes = {}
         self._updated_at = 0.0
         self._pages.clear()
+        self._page_json.clear()
         self._persist()
+        self._persist_pages(force=True)
 
     # ---------- 路由重建 ----------
     async def refresh_routes(self, client: httpx.AsyncClient,
@@ -373,7 +578,9 @@ class Catalog:
                 self._routes.update(table)
                 self._updated_at = time.time()
                 self._pages.clear()
+                self._page_json.clear()
                 self._persist()
+                self._persist_pages(force=True)
             elif table is not None and split \
                     and not self.missing_split_routes(sources):
                 # 本轮没有新分类可补（映射源的库都齐了）：记为「已检查」。
@@ -507,10 +714,19 @@ class Catalog:
                      row: dict) -> dict | None:
         type_id = str(row.get("id") or row.get("type_id") or "")
         pagecount = 0
+        per_page = PER_PAGE
         if hongguo.enabled(source):
             # 红果没有 pagecount / total，只能按首屏条数估一个量级，
             # 真实边界靠翻到空页时在 window() 里收敛。
             titles = await hongguo.page_titles(client, source, type_id, 1)
+            per_page = max(1, len(titles))
+            total = len(titles) * 20
+        elif drpy.enabled(source):
+            # drpy 源是 HTML 列表，同样没有总数；翻到空页再收敛。
+            # 每页条数按首屏实测（dbku 是 48 条/页，不是 CMS 的 20），
+            # 否则 offset → 页码换算会错位，翻页重复/漏条。
+            titles = await drpy.page_titles(client, source, type_id, 1)
+            per_page = max(1, len(titles))
             total = len(titles) * 20
         else:
             payload = await _get_json(client, source["api"],
@@ -526,7 +742,13 @@ class Catalog:
         if not titles:
             return None
         # 探测页顺手入缓存，首次浏览第一页不必再打一次源站。
-        self._pages[(source["api"], type_id, 1)] = (time.monotonic(), titles)
+        probe_key = (source["api"], type_id, 1)
+        probe_slim = [_slim(t) for t in titles]
+        probe_ts = time.time()
+        self._pages[probe_key] = (probe_ts, probe_slim)
+        self._page_json[probe_key] = _page_payload(probe_key, probe_ts, probe_slim)
+        _remember(titles)
+        self._persist_pages()
         return {
             "source_id": source.get("id") or "",
             "source_name": source.get("name") or source.get("id") or "",
@@ -536,7 +758,8 @@ class Catalog:
             "type_name": str(row.get("name") or row.get("type_name") or ""),
             "mdb": str(row.get("mdb") or "Mix"),
             "junk": bool(row.get("junk")),
-            "pages": max(1, pagecount or (total + PER_PAGE - 1) // PER_PAGE),
+            "pages": max(1, pagecount or (total + per_page - 1) // per_page),
+            "per_page": per_page,
             "total": max(len(titles), total),
             "posters": [t.poster for t in titles[:8] if t.poster],
         }
@@ -544,10 +767,58 @@ class Catalog:
     # ---------- 分页读取 ----------
     async def _page(self, client: httpx.AsyncClient, route: dict,
                     page: int) -> list[cms.OnlineTitle]:
+        """取某页条目：命中缓存直回；过期先回旧页并在后台刷新。
+
+        源站单页常常要 3~14 秒（dbku 的综艺页实测 12 秒），如果过期就同步
+        重抓，用户每进一次分类都要干等十几秒。这里改成 stale-while-revalidate：
+        24 小时内的旧页立刻返回，刷新在后台做完写盘，下次进来就是新的。
+        """
         key = (route["api"], route["type_id"], page)
         hit = self._pages.get(key)
-        if hit and time.monotonic() - hit[0] < PAGE_TTL:
-            return hit[1]
+        if hit:
+            age = time.time() - hit[0]
+            if age < PAGE_TTL:
+                return hit[1]
+            if age < PAGE_STALE and hit[1]:
+                self._refresh_page(client, route, page, key)
+                return hit[1]
+        try:
+            return await self._fetch_page(client, route, page)
+        except Exception as exc:  # noqa: BLE001 - 源站超时/改版不该让整库 500
+            runtime.log(f"catalog: {route.get('type_id')} p{page} 抓取失败 "
+                        f"{type(exc).__name__}")
+            return hit[1] if hit else []
+
+    def _refresh_page(self, client: httpx.AsyncClient, route: dict,
+                      page: int, key: tuple) -> None:
+        """后台刷新一页（单飞，同一页不会并发重抓）。"""
+        if key in self._refreshing_pages:
+            return
+        self._refreshing_pages.add(key)
+
+        async def run() -> None:
+            try:
+                rows = await self._fetch_page(client, route, page, cache=False)
+                if rows:
+                    slim = [_slim(t) for t in rows]
+                    ts = time.time()
+                    self._pages[key] = (ts, slim)
+                    self._page_json[key] = _page_payload(key, ts, slim)
+                    self._persist_pages()
+            except Exception as exc:  # noqa: BLE001 - 后台刷新失败保留旧页
+                runtime.log(f"catalog: 后台刷新 p{page} 失败 "
+                            f"{type(exc).__name__}")
+            finally:
+                self._refreshing_pages.discard(key)
+
+        try:
+            asyncio.get_running_loop().create_task(run())
+        except RuntimeError:
+            self._refreshing_pages.discard(key)
+
+    async def _fetch_page(self, client: httpx.AsyncClient, route: dict,
+                          page: int, cache: bool = True) -> list[cms.OnlineTitle]:
+        key = (route["api"], route["type_id"], page)
         source = {"id": route.get("source_id") or "catalog",
                   "name": route.get("source_name") or "",
                   "api": route["api"],
@@ -558,14 +829,34 @@ class Catalog:
             source = hongguo.find_source(str(source["id"])) or source
             titles = await hongguo.page_titles(client, source,
                                                str(route["type_id"]), page)
+        elif drpy.enabled(source):
+            # 规则文本只存在完整源配置里，翻页必须取回来重放一遍。
+            source = drpy.find_source(str(source["id"])) or source
+            titles = await drpy.page_titles(client, source,
+                                            str(route["type_id"]), page)
         else:
             payload = await _get_json(
                 client, route["api"],
                 {"ac": "detail", "t": route["type_id"], "pg": page}, 8.0)
             titles = _page_rows(payload, source)
-        if len(self._pages) > 240:
-            self._pages.clear()
-        self._pages[key] = (time.monotonic(), titles)
+        if not titles:
+            # 空页多半是源站限流/临时错误页：不要用空结果覆盖已有缓存。
+            return []
+        if not cache:
+            return titles
+        if len(self._pages) > PAGES_MAX:
+            # 淘汰最旧的一批，而不是整表清空（清空后所有分类都要重抓）。
+            for old in sorted(self._pages.items(),
+                              key=lambda kv: kv[1][0])[:PAGES_MAX // 4]:
+                self._pages.pop(old[0], None)
+                self._page_json.pop(old[0], None)
+        # 缓存里放轻量副本（不带分集），返回值保持完整：跟着返回的分集
+        # 会被写入 store，用户点开就能直接播。
+        slim = [_slim(t) for t in titles]
+        ts = time.time()
+        self._pages[key] = (ts, slim)
+        self._page_json[key] = _page_payload(key, ts, slim)
+        self._persist_pages()
         return titles
 
     async def window(self, client: httpx.AsyncClient, cat: str,
@@ -574,24 +865,42 @@ class Catalog:
         if not route:
             return [], 0
         total = int(route.get("total") or 0)
+        per_page = int(route.get("per_page") or 0)
+        if not per_page:
+            # 老路由（per_page 落盘前建的）没有每页条数。drpy/红果的页长
+            # 由源站决定（dbku 是 48），用首页实测一次并写回，避免 offset
+            # 按 20 换算导致翻页重复/漏条。CMS 源仍按 PER_PAGE。
+            if str(route.get("kind") or "").lower() in ("drpy", "hongguo"):
+                first = await self._page(client, route, 1)
+                per_page = max(1, len(first)) if first else PER_PAGE
+                route["per_page"] = per_page
+                self._persist()
+            else:
+                per_page = PER_PAGE
         offset = max(0, int(offset))
         size = max(1, min(int(size), 100))
         if total and offset >= total:
             return [], total
-        first_page = offset // PER_PAGE + 1
-        last_page = (offset + size + PER_PAGE - 1) // PER_PAGE
+        first_page = offset // per_page + 1
+        last_page = (offset + size + per_page - 1) // per_page
         titles: list[cms.OnlineTitle] = []
         for page in range(first_page, max(first_page, last_page) + 1):
             rows = await self._page(client, route, page)
             if not rows:
+                if page == 1 and total:
+                    # 首页取空但总数不为 0：源站限流/超时/改版都会这样，
+                    # 一次失败就把 total 归零会让整个库从列表里消失（手机端
+                    # 直接看不到这张库）。保留原总数，下次请求再试。
+                    runtime.log(f"catalog: {cat} 首页无数据，保留 total={total}")
+                    break
                 # 到头：把总数收敛到真实位置，前端据此自然停止滚动。
-                real_total = (page - 1) * PER_PAGE
+                real_total = (page - 1) * per_page
                 if not total or real_total < total:
                     route["total"] = real_total
                     self._persist()
                 break
             titles.extend(rows)
-        skip = offset - (first_page - 1) * PER_PAGE
+        skip = offset - (first_page - 1) * per_page
         return titles[skip:skip + size], int(route.get("total") or 0)
 
 
@@ -599,6 +908,11 @@ async def client_get_classes(client: httpx.AsyncClient, source: dict):
     # 红果服务没有苹果 CMS 的 ac=list，分类走 /api/home 的 classes。
     if hongguo.enabled(source):
         rows = await hongguo.classes(client, source)
+        return {"code": 1, "class": [{"type_id": r["id"], "type_name": r["name"]}
+                                     for r in rows]}
+    # drpy 源按 class_parse 从首页导航抓分类。
+    if drpy.enabled(source):
+        rows = await drpy.classes(client, source)
         return {"code": 1, "class": [{"type_id": r["id"], "type_name": r["name"]}
                                      for r in rows]}
     return await _get_json(client, source["api"], _params(source["api"]),

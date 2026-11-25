@@ -48,6 +48,10 @@ def _load() -> None:
         brief = (rec or {}).get("brief") if isinstance(rec, dict) else None
         if not guid or not isinstance(brief, dict) or not brief.get("title"):
             continue
+        # 老文件里带着完整分集（实测 800 条 135MB），加载时就地卸掉。
+        if brief.get("lines"):
+            brief = dict(brief)
+            brief["lines"] = {}
         _items[str(guid)] = {"ts": float(rec.get("ts") or 0), "brief": brief}
 
 
@@ -88,7 +92,12 @@ def remember(briefs: list[dict]) -> None:
         _load()
         now = time.time()
         for brief in rows:
-            _items[str(brief["guid"])] = {"ts": now, "brief": dict(brief)}
+            # 分集地址是内存大头（一条剧集平均 242 集 / 173KB）。这里只留
+            # 元数据：guid 能反查到条目，卡片点开不会报「媒体库不存在」；
+            # 真正要播时播放入口会按需补一次详情拿到线路。
+            slim = dict(brief)
+            slim["lines"] = {}
+            _items[str(brief["guid"])] = {"ts": now, "brief": slim}
         if len(_items) > _MAX:
             oldest = sorted(_items, key=lambda g: _items[g].get("ts", 0))
             for key in oldest[:len(_items) - _MAX]:
@@ -97,7 +106,10 @@ def remember(briefs: list[dict]) -> None:
 
 
 def restore(store) -> int:
-    """启动时恢复可播放 brief；源已禁用或过期的直接丢弃。"""
+    """启动时恢复条目元数据；源已禁用或过期的直接丢弃。
+
+    分集地址不落盘（太占内存），播放时由 ``_online_brief`` 按需补详情。
+    """
     count = 0
     dropped = 0
     now = time.time()

@@ -191,20 +191,64 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
     };
   })();
 
+  // 通配授权：``*`` = 全部库，``src:<sid>:*`` / ``chart:*`` = 一整组。
+  // 分类列表是按需拉取的，写通配后以后新增的分类库自动包含，不会出现
+  // 「全选保存完、等分类补上又显示没勾上」。
+  const libOnOf = (cur: string[], key: string) => cur.includes('*') || cur.includes(key)
+    || (key.includes(':')
+      && cur.includes(`${key.slice(0, key.lastIndexOf(':'))}:*`));
+  const libOn = (key: string) => libOnOf(libs, key);
+  // 取消单条要先把通配展开成显式键，否则「取消」等于没生效。
+  const expandLibs = (cur: string[]): string[] => {
+    const out = new Set<string>();
+    for (const key of cur) {
+      if (key === '*') {
+        (status?.libs || []).forEach((l) => out.add(l.key));
+      } else if (key.endsWith(':*')) {
+        const prefix = key.slice(0, -1);
+        (status?.libs || []).forEach((l) => { if (l.key.startsWith(prefix)) out.add(l.key); });
+      } else {
+        out.add(key);
+      }
+    }
+    return [...out];
+  };
   const allChecked = (items: AclLib[]) =>
-    items.length > 0 && items.every((l) => libs.includes(l.key));
-  const toggleKeys = (items: AclLib[]) => setLibs((cur) => allChecked(items)
-    ? cur.filter((k) => !items.some((l) => l.key === k))
-    : [...new Set([...cur, ...items.map((l) => l.key)])]);
+    items.length > 0 && items.every((l) => libOn(l.key));
+  // 同组共用一个前缀时写通配，比逐个 key 更稳。
+  const groupWildcard = (items: AclLib[]): string => {
+    const sid = items.map((l) => /^src:([^:]+):/.exec(l.key)?.[1]).find(Boolean);
+    if (sid && items.every((l) => l.key.startsWith(`src:${sid}:`))) return `src:${sid}:*`;
+    return '';
+  };
+  const toggleKeys = (items: AclLib[]) => setLibs((cur) => {
+    const on = items.length > 0 && items.every((l) => libOnOf(cur, l.key));
+    const wild = groupWildcard(items);
+    if (on) {
+      const drop = new Set(items.map((l) => l.key));
+      return expandLibs(cur).filter((k) => !drop.has(k) && k !== wild);
+    }
+    if (wild) return [...new Set([...cur.filter((k) => k !== wild), wild])];
+    return [...new Set([...cur, ...items.map((l) => l.key)])];
+  });
+  const allLibsOn = (status?.libs || []).length > 0
+    && (status?.libs || []).every((l) => libOn(l.key));
+
+  // 片源同理：``*`` = 全部片源（含以后新增的）。
+  const srcOn = (id: string) => sources.includes('*') || sources.includes(id);
+  const srcExpand = (cur: string[]) => (cur.includes('*')
+    ? (status?.sources || []).map((s) => s.id) : cur);
+  const allSrcOn = (status?.sources || []).length > 0
+    && (status?.sources || []).every((s) => srcOn(s.id));
 
   const libBox = (lib: AclLib) => (
     <label key={lib.key} className="row" style={{ cursor: 'pointer', gap: 6 }}>
       <input
         className="check" type="checkbox"
-        checked={libs.includes(lib.key)}
+        checked={libOn(lib.key)}
         onChange={(e) => setLibs((cur) => e.target.checked
           ? [...new Set([...cur, lib.key])]
-          : cur.filter((k) => k !== lib.key))}
+          : expandLibs(cur).filter((k) => k !== lib.key))}
       />
       <span>{lib.title}</span>
       <span className="small">{lib.key}</span>
@@ -443,7 +487,10 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                   <span className="small acl-id">id: {subject.id}</span>
                   <span className="small">
                     {configured
-                      ? `已单独配置：${libs.length} 库 / ${online ? `${sources.length} 源` : '在线已禁用'}`
+                      ? `已单独配置：${libs.includes('*') ? '全部' : `${libs.length} 个`}库 / `
+                        + (online
+                          ? `${sources.includes('*') ? '全部' : `${sources.length} 个`}源`
+                          : '在线已禁用')
                       : '未单独配置，按默认策略'}
                   </span>
                 </div>
@@ -452,9 +499,8 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                 <div className="row">
                   <label className="field" style={{ margin: 0 }}>虚拟媒体库</label>
                   <button className="btn sm ghost" onClick={() => setLibs(
-                    libs.length === (status?.libs.length || 0) ? []
-                      : (status?.libs.map((l) => l.key) || []))}>
-                    {libs.length === (status?.libs.length || 0) ? '全不选' : '全部全选'}
+                    allLibsOn ? [] : ['*'])}>
+                    {allLibsOn ? '全不选' : '全部全选'}
                   </button>
                 </div>
 
@@ -504,9 +550,8 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                 <div className="row">
                   <label className="field" style={{ margin: 0 }}>片源</label>
                   <button className="btn sm ghost" onClick={() => setSources(
-                    sources.length === (status?.sources.length || 0) ? []
-                      : (status?.sources.map((s) => s.id) || []))}>
-                    {sources.length === (status?.sources.length || 0) ? '全不选' : '全选'}
+                    allSrcOn ? [] : ['*'])}>
+                    {allSrcOn ? '全不选' : '全选'}
                   </button>
                   <span className="small">
                     {online
@@ -519,11 +564,11 @@ export function AccountsPage({ boot, refresh, notify }: Props) {
                     <label key={src.id} className="row" style={{ cursor: 'pointer', gap: 6 }}>
                       <input
                         className="check" type="checkbox"
-                        checked={sources.includes(src.id)}
+                        checked={srcOn(src.id)}
                         disabled={!online}
                         onChange={(e) => setSources((cur) => e.target.checked
                           ? [...new Set([...cur, src.id])]
-                          : cur.filter((id) => id !== src.id))}
+                          : srcExpand(cur).filter((id) => id !== src.id))}
                       />
                       <span>{src.name || src.id}</span>
                       <span className="small">{src.id}</span>

@@ -996,7 +996,8 @@ def rewrite_playlist(text: str, base_url: str, seg_prefix: str,
 
 async def fetch_playlist(client: httpx.AsyncClient, url: str,
                          timeout: float = 3.0,
-                         depth: int = 0) -> tuple[str, str, dict]:
+                         depth: int = 0,
+                         retried: bool = False) -> tuple[str, str, dict]:
     parsed = urllib.parse.urlparse(url)
     headers = {"User-Agent": _UA,
                "Referer": f"{parsed.scheme}://{parsed.netloc}/"}
@@ -1010,7 +1011,13 @@ async def fetch_playlist(client: httpx.AsyncClient, url: str,
             if child:
                 return await fetch_playlist(
                     client, ensure_public_target(urllib.parse.urljoin(base, child)),
-                    timeout, depth + 1)
+                    timeout, depth + 1, retried)
+        if not retried:
+            # 源站首次常返回边缘错误页/防盗链 HTML（CDN 冷启动、清单还在
+            # 生成），同一地址隔一小会儿再抓一次通常就是正常清单。不重试
+            # 会让客户端「转圈几秒后播放失败、点重试才能播」。
+            await asyncio.sleep(0.25)
+            return await fetch_playlist(client, url, timeout, depth, True)
         raise ValueError("not a playlist")
     if is_master(text) and depth < 2:
         best = pick_best_variant(text)

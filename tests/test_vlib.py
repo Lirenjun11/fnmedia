@@ -64,6 +64,9 @@ class VlibTest(unittest.TestCase):
         catalog.catalog._routes = {}
         catalog.catalog._updated_at = time.time()
         catalog.catalog._pages.clear()
+        # 有些用例把 _page 直接替换成假实现（不走 patch），用例结束不会还原；
+        # 这里复位，避免后续用例调到的其实是上一个用例的桩。
+        catalog.catalog._page = catalog.Catalog._page.__get__(catalog.catalog)
         vlib._BINDS.clear()
         vlib._FAILED.clear()
 
@@ -298,6 +301,185 @@ class VlibTest(unittest.TestCase):
         self.assertEqual(got[0].title, "片25")
         self.assertEqual(got[-1].title, "片34")
 
+    def test_catalog_window_uses_route_per_page(self):
+        """drpy 源每页 48 条：offset 必须按路由的 per_page 换算，不能写死 20。"""
+        titles = [make_title(vod_id=f"d{i}", title=f"片{i}") for i in range(96)]
+        pages = {1: titles[0:48], 2: titles[48:96]}
+        catalog.catalog._routes = {"s_2:1": {
+            "source_id": "s_2", "source_name": "dbku", "api": "https://b.invalid",
+            "type_id": "1", "type_name": "电影", "pages": 2, "per_page": 48,
+            "total": 96, "posters": []}}
+        catalog.catalog._updated_at = time.time()
+
+        async def fake_page(client, route, page):
+            return pages.get(page, [])
+
+        catalog.catalog._page = fake_page
+        got, total = asyncio.run(
+            catalog.catalog.window(None, "s_2:1", 50, 10))
+        self.assertEqual(total, 96)
+        self.assertEqual(len(got), 10)
+        self.assertEqual(got[0].title, "片50")
+        self.assertEqual(got[-1].title, "片59")
+
+    def test_catalog_window_keeps_total_on_empty_first_page(self):
+        """首页取空（限流/改版）不能把 total 收敛成 0，否则整库从列表消失。"""
+        catalog.catalog._routes = {"s_2:1": {
+            "source_id": "s_2", "source_name": "dbku", "api": "https://b.invalid",
+            "type_id": "1", "type_name": "电影", "pages": 20, "per_page": 48,
+            "total": 960, "posters": []}}
+        catalog.catalog._updated_at = time.time()
+
+        async def fake_page(client, route, page):
+            return []
+
+        catalog.catalog._page = fake_page
+        got, total = asyncio.run(
+            catalog.catalog.window(None, "s_2:1", 0, 20))
+        self.assertEqual(got, [])
+        self.assertEqual(total, 960)
+        self.assertEqual(catalog.catalog._routes["s_2:1"]["total"], 960)
+
+    def test_catalog_page_caches_fetch(self):
+        """同一页第二次读取必须命中缓存，不再打源站（源站单页要 3~14 秒）。"""
+        catalog.catalog._pages.clear()
+        route = {"api": "https://c.invalid/api", "type_id": "9",
+                 "source_id": "s_1"}
+        calls = []
+
+        async def fake_json(client, api, params, timeout):
+            calls.append(params.get("pg"))
+            return {"code": "1"}
+
+        rows = [make_title(vod_id="p1", title="页1")]
+        with patch.object(catalog, "_get_json", fake_json), \
+                patch.object(catalog, "_page_rows",
+                             lambda payload, source: rows):
+            asyncio.run(catalog.catalog._page(None, route, 1))
+            got = asyncio.run(catalog.catalog._page(None, route, 1))
+        self.assertEqual(calls, [1])
+        self.assertEqual([t.title for t in got], ["页1"])
+
+    def test_catalog_page_cache_keeps_metadata_only(self):
+        """页缓存只留元数据：分集地址随返回值交给 store，不进缓存/落盘。
+
+        一页可能有上万个分集地址，留在缓存里既吃内存，落盘时全量
+        ``dataclasses.asdict`` 还会把事件循环卡住十几秒（搜索/接口全超时）。
+        """
+        catalog.catalog._pages.clear()
+        catalog.catalog._page_json.clear()
+        route = {"api": "https://c.invalid/api", "type_id": "11",
+                 "source_id": "s_1"}
+        rows = [make_title(vod_id="p2", title="页2", episodes=3)]
+
+        async def fake_json(client, api, params, timeout):
+            return {"code": "1"}
+
+        with patch.object(catalog, "_get_json", fake_json), \
+                patch.object(catalog, "_page_rows", lambda payload, source: rows):
+            got = asyncio.run(catalog.catalog._page(None, route, 1))
+        key = (route["api"], "11", 1)
+        # 返回值必须是完整的：vlib 拿它写入 store，点开就能播。
+        self.assertEqual(len(got[0].lines["m3u8"]), 3)
+        cached = catalog.catalog._pages[key][1][0]
+        self.assertEqual(cached.lines, {})
+        self.assertEqual(cms.episode_count(cached), 3)
+        self.assertIn('"ep_hint":3', catalog.catalog._page_json[key])
+
+    def test_catalog_page_serves_stale_then_refreshes(self):
+        """过期页先返回旧数据，刷新在后台完成（不能同步干等源站）。"""
+        catalog.catalog._pages.clear()
+        key = ("https://c.invalid/api", "9", 1)
+        route = {"api": key[0], "type_id": key[1], "source_id": "s_1"}
+        catalog.catalog._pages[key] = (
+            time.time() - catalog.PAGE_TTL - 5,
+            [make_title(vod_id="old", title="旧页")])
+        calls = []
+
+        async def fake_json(client, api, params, timeout):
+            calls.append(params.get("pg"))
+            return {"code": "1"}
+
+        async def run():
+            with patch.object(catalog, "_get_json", fake_json), \
+                    patch.object(catalog, "_page_rows",
+                                 lambda payload, source: [
+                                     make_title(vod_id="new", title="新页")]):
+                rows = await catalog.catalog._page(None, route, 1)
+                self.assertEqual([t.title for t in rows], ["旧页"])
+                await asyncio.sleep(0.05)
+
+        asyncio.run(run())
+        self.assertEqual(calls, [1])
+        self.assertEqual([t.title for t in catalog.catalog._pages[key][1]],
+                         ["新页"])
+
+    def test_catalog_pages_survive_restart(self):
+        """落盘后新进程能恢复海报墙；分集地址不进文件，集数靠 ep_hint。"""
+        import tempfile
+        from pathlib import Path
+
+        tmp = Path(tempfile.mkdtemp()) / "catalog_pages.json"
+        key = ("https://d.invalid", "3", 1)
+        catalog.catalog._pages = {key: (time.time(), [
+            make_title(vod_id="kept", title="落盘页", episodes=2)])}
+        catalog.catalog._page_json = {}
+        with patch.object(catalog, "PAGES_STATE", tmp):
+            catalog.catalog._persist_pages(force=True)
+            text = tmp.read_text(encoding="utf-8")
+            catalog.catalog._pages.clear()
+            catalog.catalog._load_pages()
+        rows = catalog.catalog._pages[key][1]
+        self.assertEqual([t.title for t in rows], ["落盘页"])
+        # 分集地址（一页上万个）不落盘，否则文件 170MB+、序列化能卡住
+        # 整个事件循环；集数改用 ep_hint 保住。
+        self.assertEqual(rows[0].lines, {})
+        self.assertEqual(cms.episode_count(rows[0]), 2)
+        self.assertNotIn("a.invalid", text)
+
+    def test_catalog_warm_pages_skips_fresh(self):
+        """后台预热只补过期/缺失的首页，已新鲜的不重复打源站。"""
+        catalog.catalog._pages.clear()
+        catalog.catalog._routes = {
+            "a": {"api": "https://w.invalid", "type_id": "1"},
+            "b": {"api": "https://w.invalid", "type_id": "2"}}
+        catalog.catalog._pages[("https://w.invalid", "1", 1)] = (
+            time.time(), [make_title(vod_id="fresh")])
+        calls = []
+
+        async def fake_json(client, api, params, timeout):
+            calls.append(params.get("t"))
+            return {"code": "1"}
+
+        with patch.object(catalog, "_get_json", fake_json), \
+                patch.object(catalog, "_page_rows",
+                             lambda payload, source: [make_title(vod_id="w")]):
+            warmed = asyncio.run(catalog.catalog.warm_pages(None, gap=0))
+        self.assertEqual(calls, ["2"])
+        self.assertEqual(warmed, 1)
+
+    def test_catalog_warm_pages_prioritizes_slow_sources(self):
+        """慢源（drpy/红果）要先预热，且新鲜的页不占 limit 名额。
+
+        以前按字典序取前 limit 个路由：前面一批快 CMS 源把名额吃光，
+        dbku 这类一页十几秒的源永远排不到，用户点进去照样干等。
+        """
+        catalog.catalog._pages.clear()
+        catalog.catalog._routes = {
+            "fast1": {"api": "https://fast.invalid", "type_id": "1", "kind": "cms"},
+            "fast2": {"api": "https://fast.invalid", "type_id": "2", "kind": "cms"},
+            "slow": {"api": "https://slow.invalid", "type_id": "9", "kind": "drpy"}}
+        calls = []
+
+        async def fake_fetch(client, route, page, cache=True):
+            calls.append(route.get("type_id"))
+            return [make_title(vod_id="w")]
+
+        with patch.object(catalog.catalog, "_fetch_page", fake_fetch):
+            warmed = asyncio.run(catalog.catalog.warm_pages(None, limit=1, gap=0))
+        self.assertEqual(calls, ["9"])
+        self.assertEqual(warmed, 1)
+
     def test_catalog_item_list_returns_cards(self):
         titles = [make_title(vod_id=f"c{i}", title=f"片{i}") for i in range(5)]
         catalog.catalog._routes = {"movie": {
@@ -422,6 +604,15 @@ class VlibSourceMappingTest(unittest.TestCase):
         self.assertIn(guid, vlib.lib_guids())
         self.assertIn("src:s_1:1",
                       [row["key"] for row in vlib.library_keys()])
+
+    def test_classes_fall_back_to_routes_when_cache_lost(self):
+        """分类缓存丢失时用已建路由兜底，库键不会从授权页整组消失。"""
+        catalog.catalog._classes = {}
+        self.assertEqual([row["id"] for row in vlib.selected_classes("s_1")],
+                         ["1", "2"])
+        keys = [row["key"] for row in vlib.library_keys()]
+        self.assertIn("src:s_1:1", keys)
+        self.assertIn("src:s_1:2", keys)
 
     def test_account_source_grant_filters_libraries(self):
         cfg = config.get()

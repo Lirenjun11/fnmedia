@@ -597,7 +597,7 @@ def sources(ignore_acl: bool = False) -> list[dict]:
     if ignore_acl or not enabled():
         return pool
     allow = granted_sources(current().uid)
-    if allow is None:
+    if allow is None or "*" in allow:
         return pool
     return [s for s in pool if str(s.get("id") or "") in allow]
 
@@ -612,7 +612,20 @@ def provider_allowed(pid: str) -> bool:
     if not pid:
         return False
     allow = granted_sources(current().uid)
-    return allow is None or pid in allow
+    return allow is None or "*" in allow or pid in allow
+
+
+def _lib_match(libs: set[str], key: str) -> bool:
+    """库键是否被授权：``*`` 全局放行，``chart:*`` / ``src:<sid>:*`` 前缀放行。
+
+    前缀通配是「全选」的正确表达：管理页的分类列表是按需拉取的，没拉到
+    分类的源整组缺席，保存后再补上就变成「勾了却没勾上」。写通配后，
+    以后新增的分类库自动包含，不需要重新保存一次授权。
+    """
+    if "*" in libs or key in libs:
+        return True
+    head = key.rsplit(":", 1)[0]
+    return bool(head and f"{head}:*" in libs)
 
 
 def lib_allowed(key: str) -> bool:
@@ -624,7 +637,7 @@ def lib_allowed(key: str) -> bool:
     libs = granted_libs(current().uid)
     if libs is None:
         return default_visible()
-    return "*" in libs or key in libs
+    return _lib_match(libs, key)
 
 
 def filter_brief(brief: dict | None, enforce: bool = True) -> dict | None:
@@ -652,7 +665,7 @@ def filter_brief(brief: dict | None, enforce: bool = True) -> dict | None:
         src = str(brief.get("provider") or "")
         if not config.source_live(src):
             return None
-        if allow is not None and src not in allow:
+        if allow is not None and "*" not in allow and src not in allow:
             return None
         return brief
     keep: list[str] = []
@@ -660,7 +673,7 @@ def filter_brief(brief: dict | None, enforce: bool = True) -> dict | None:
         src = str(mapping.get(name) or brief.get("provider") or "")
         if not config.source_live(src):
             continue
-        if allow is not None and src not in allow:
+        if allow is not None and "*" not in allow and src not in allow:
             continue
         if not lines.get(name):
             continue
@@ -733,8 +746,9 @@ def status() -> dict:
         if isinstance(value, dict):
             granted_any |= {str(x) for x in (value.get("sources") or [])}
     enabled_ids = [str(s.get("id") or "") for s in config.enabled_sources()]
-    # 默认放行时「没配过」≠「不能用」，不该提示成缺口。
-    unassigned_sources = ([] if default_online() else
+    # 默认放行时「没配过」≠「不能用」，不该提示成缺口；有账号写了
+    # ``sources: ["*"]`` 也同样视为覆盖全部源。
+    unassigned_sources = ([] if (default_online() or "*" in granted_any) else
                           [sid for sid in enabled_ids if sid not in granted_any])
     unassigned_subjects = ([] if (default_visible() and default_online()) else
                            [row["id"] for row in subjects_list

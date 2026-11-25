@@ -11,6 +11,8 @@ proxy/
   subscription.py  订阅解析、归一化、SSRF 防护
   netguard.py      订阅 / 海报 / 分片 / 直链的统一目标校验（内网放行策略）
   cms.py           苹果 CMS 搜索与内存标题库
+  drpy.py          drpy2 单文件 JS 源（.js 规则）：规则解析、选择器、播放页解析
+  hongguo.py       自托管红果短剧服务（hongguo-web）适配层
   fake.py          官方响应伪造与 TV 端严格字段规整
   hls.py           m3u8 改写、分片与海报代理
   playstate.py     播放状态存取（收藏 / 已看 / 续播），按飞牛账号分区
@@ -30,6 +32,8 @@ packaging/fpk/     FPK 骨架与 build.sh
 ```
 
 请求链：`nginx /v → /var/run/trim_media.sock → uvicorn`；具名路由命中在线条目时伪造响应，其余请求原样转发 `trim_media_upstream.sock`。管理页走独立桌面网关，不进入媒体链路。
+
+在线片源有三类：苹果 CMS 接口（`cms.py`）、自托管红果服务（`hongguo.py`）、drpy2 单文件 JS 规则（`drpy.py`）。第三类只解析 `rule` 对象并用 selectolax 执行选择器，不引入 Node；播放地址靠内置的通用播放页解析，详见 [js-source.md](js-source.md)。
 
 搜索接口在扩展侧做会话级输入防抖（`search_debounce_ms`，默认 200ms，`0` 关闭，上限 1000）：飞牛客户端录入即搜产生的连续请求仍各自透传官方后端，但按会话只有最后一次会去查在线源，中间请求只返回官方本地结果；防抖等待不计入 `search_timeout` 预算，预算从防抖结束、开始查询时才起算。会话按凭据哈希分组，避免多设备互相抑制。飞牛前端的请求时机与官方本地结果均不受影响。
 

@@ -643,6 +643,48 @@ class AppContractTest(unittest.TestCase):
             self.assertEqual(video["bps"], 5000000)
 
 
+    def test_stream_list_fills_online_lines_for_search_card(self):
+        """搜索结果卡没有分集：stream/list 必须现场补线路。
+
+        不补的话线上源条目会返回「0 条分集」，客户端判定没有可播流，表现
+        就是搜索里点播放毫无反应（而 play/info 会补，所以重试又好了）。
+        """
+        import cms as cms_mod
+        import fake
+        from types import SimpleNamespace
+
+        store = cms_mod.TitleStore()
+        fresh = {"guid": "f" * 32, "provider": "s_dr", "title": "谷雨",
+                 "vod_id": "https://x.invalid/1.html", "lines": {},
+                 "line_names": [], "is_tv": False, "episodes": 0,
+                 "primary_ext": "m3u8"}
+        store.put_brief(fresh)
+        filled = dict(fresh, is_tv=True, episodes=30,
+                      line_names=["视频列表"],
+                      lines={"视频列表": [{"title": f"第{i + 1}集",
+                                          "url": f"https://x.invalid/p-{i}.html",
+                                          "direct": False, "headers": {}}
+                                         for i in range(30)]})
+        calls = []
+
+        async def fake_online(_request, brief):
+            calls.append(brief.get("guid"))
+            store.put_brief(filled)
+            return filled
+
+        request = SimpleNamespace(
+            headers={"user-agent": "test"},
+            app=SimpleNamespace(state=SimpleNamespace(store=store)))
+        with patch.object(appmod, "_online_brief", new=fake_online):
+            resp = asyncio.run(appmod._stream_list_impl(fresh["guid"], request))
+        data = json.loads(bytes(resp.body))["data"]
+        self.assertEqual(calls, [fresh["guid"]])
+        # 补完线路后必须按「集级」guid 出流，而不是剧级。
+        eg = fake.episode_guid(fresh["guid"], 0)
+        self.assertEqual(data["video_streams"][0]["guid"],
+                         fake.ep_video_guid(eg))
+        self.assertEqual(data["files"][0]["can_play"], 1)
+
     def test_ordered_lines_skips_bad(self):
         brief = {"line_names": ["a", "b", "c"]}
         self.assertEqual(appmod._ordered_lines(brief, 0, set()), [0, 1, 2])
@@ -827,6 +869,24 @@ class HlsTest(unittest.TestCase):
                 hls.fetch_playlist(client, "https://play.invalid/play/abc"))
         self.assertIn("#EXTINF", text)
         self.assertIn("index.m3u8", base)
+
+    def test_fetch_retries_transient_html_error(self):
+        """源站首次返回错误页时同址重抓一次，避免起播直接失败。"""
+        hits = {"n": 0}
+
+        def handler(_request):
+            hits["n"] += 1
+            if hits["n"] == 1:
+                return httpx.Response(200, headers={"content-type": "text/html"},
+                                      text="<html>502</html>")
+            return httpx.Response(200, text="#EXTM3U\n#EXTINF:6.0,\nseg.ts\n")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.object(hls, "ensure_public_target", new=lambda u: u):
+            text, _base, _meta = asyncio.run(
+                hls.fetch_playlist(client, "https://play.invalid/play/abc"))
+        self.assertIn("#EXTINF", text)
+        self.assertEqual(hits["n"], 2)
 
     def test_fetch_rejects_page_without_m3u8(self):
         def handler(_request):

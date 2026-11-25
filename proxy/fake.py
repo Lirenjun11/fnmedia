@@ -277,8 +277,11 @@ def detail_item(b: dict, meta: dict | None = None) -> dict:
         "number_of_episodes": b.get("episodes", 0),
         "local_number_of_episodes": b.get("episodes", 0) if b.get("is_tv") else 0,
         "local_number_of_seasons": 1 if b.get("is_tv") else 0,
-        "can_play": 1, "type": "TV" if b.get("is_tv") else "Movie",
-        "play_error": "", "parent_guid": "", "ancestor_guid": "",
+        # 线路还没补出来（源站超时/限流）时明确标成不可播：以前一律给 1，
+        # 客户端会显示播放按钮，点下去拿到空的分集流，只表现成「点了没反应」。
+        "can_play": 1 if b.get("lines") else 0,
+        "type": "TV" if b.get("is_tv") else "Movie",
+        "play_error": "" if b.get("lines") else "暂无在线片源", "parent_guid": "", "ancestor_guid": "",
         "ancestor_name": "🌐在线资源",
         "ancestor_category": "TV" if b.get("is_tv") else "Movie",
         "play_item_guid": b["guid"], "duration": 0, "logic_type": 0,

@@ -1,5 +1,6 @@
 import _bootstrap  # noqa: F401
 import asyncio
+import time
 import unittest
 from unittest.mock import patch
 
@@ -85,3 +86,28 @@ class SearchRetryTest(unittest.IsolatedAsyncioTestCase):
             await client.aclose()
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].provider, "s_2")
+
+    async def test_slow_source_is_cut_at_per_source_budget(self):
+        """慢源必须按预算硬断，不能把整次搜索拖到配置的 20 秒。
+
+        drpy / 红果的搜索内部会连着打多页、不吃 ``timeout`` 参数；不掐断
+        的话 ``search_timeout`` 设成 20 秒时整次搜索要等十几秒，手机端先
+        超时断开（nginx 里一串 499），用户看到的是「搜索失败」。
+        """
+        async def fake_search(client, source, keyword, timeout):
+            if source["id"] == "s_1":
+                await asyncio.sleep(30)
+            return [_title("s_2")]
+
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda req: httpx.Response(200)))
+        started = time.monotonic()
+        try:
+            with patch.object(cms, "search_source", side_effect=fake_search):
+                result = await cms.search_all(
+                    client, [SOURCE, SOURCE2], "慢源", timeout=20.0,
+                    concurrency=8)
+        finally:
+            await client.aclose()
+        self.assertLess(time.monotonic() - started, cms.SEARCH_HARD_LIMIT + 1.0)
+        self.assertEqual([t.provider for t in result], ["s_2"])

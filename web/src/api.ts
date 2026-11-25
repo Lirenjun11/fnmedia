@@ -326,6 +326,11 @@ export const api = {
       source: Source;
       probe: { ok: boolean; version: string; active: string; message: string };
     }>('/v/api/ext/sources/hongguo', json('POST', value)),
+  addDrpySource: (value: { name?: string; rule: string }) =>
+    request<{
+      source: Source;
+      probe: { ok: boolean; title: string; classes: number; message: string };
+    }>('/v/api/ext/sources/drpy', json('POST', value)),
   batchSources: (ids: string[], action: 'enable' | 'disable' | 'delete') =>
     request<{ changed: number; action: string; total: number }>(
       '/v/api/ext/sources/batch', json('POST', { ids, action })),

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import urllib.parse
 from pathlib import Path
@@ -11,12 +12,15 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 import acl
+import briefcache
 import cms
 import catalog
 import charts
 import config
+import drpy
 import hls
 import hongguo
+import playcache
 import runtime
 import subscription
 import tmdb
@@ -54,9 +58,9 @@ async def body_json(request: Request) -> dict:
 def _version() -> str:
     try:
         version_file = Path(__file__).resolve().parent.parent / "VERSION"
-        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.18"
+        return version_file.read_text(encoding="utf-8").strip() or "0.0.2.19"
     except OSError:
-        return "0.0.2.18"
+        return "0.0.2.19"
 
 
 def _public_config() -> dict:
@@ -194,6 +198,52 @@ async def add_hongguo_source(request: Request):
     runtime.log(f"hongguo source added: {candidate['name']} "
                 f"v{probe.get('version') or '?'} active={probe.get('active') or '?'}")
     return ok({"source": candidate, "probe": probe})
+
+
+@router.post("/sources/drpy")
+async def add_drpy_source(request: Request):
+    """录入一个 drpy2 单文件源（``var rule = {...}`` 的 ``.js``）。
+
+    只解析规则里的对象字面量，再用 selectolax 执行选择器，不引入 Node、也不
+    执行 ``lazy`` 里的 JS：播放地址走内置的通用播放页解析。磁力站（链接是
+    ``magnet:`` 的源）可以直接录入，但播放会明确提示不支持。
+    """
+    guard(request)
+    body = await body_json(request)
+    rule_text = str(body.get("rule") or body.get("js") or "").strip()
+    if not rule_text:
+        return fail("请粘贴 .js 源内容（var rule = {...}）")
+    if len(rule_text) > 400_000:
+        return fail("规则文件过大")
+    try:
+        rule = drpy.parse_rule(rule_text)
+    except drpy.JsRuleError as exc:
+        return fail(f"规则解析失败：{exc}")
+    host = drpy._host(rule, {})
+    if not host.startswith(("http://", "https://")):
+        return fail("规则里的 host 不合法")
+    candidate = {
+        "id": drpy.new_id(host, str(rule.get("title") or "")),
+        "name": str(body.get("name") or rule.get("title") or "").strip()[:60],
+        "api": host,
+        "kind": drpy.KIND,
+        "rule": rule_text,
+        "detail": host,
+        "from": "manual",
+        "enabled": bool(body.get("enabled", True)),
+    }
+    cfg = config.get()
+    if any(s.get("id") == candidate["id"] for s in cfg["sources"]):
+        return fail("该 JS 源已录入")
+    probe = await drpy.probe(request.app.state.src, candidate)
+    if not probe.get("ok"):
+        return fail(probe.get("message") or "该规则对应的站点打不开")
+    cfg["sources"].append(candidate)
+    config.save(cfg)
+    runtime.log(f"drpy source added: {candidate['name']} "
+                f"host={host} classes={probe.get('classes')}")
+    return ok({"source": {k: v for k, v in candidate.items() if k != "rule"},
+               "probe": probe})
 
 
 @router.post("/sources")
@@ -450,8 +500,20 @@ async def clear_cache(request: Request):
 
 # --------------------------------------------------------------- 账号权限
 
-def _acl_payload() -> dict:
-    """管理页需要的完整视图：状态 + 可选库 + 可选源。"""
+async def _acl_payload(request: Request) -> dict:
+    """管理页需要的完整视图：状态 + 可选库 + 可选源。
+
+    ``library_keys()`` 读的是源站分类缓存，而缓存是按需拉的：没拉过分类的
+    源整组不会出现在授权列表里，用户点「全选」也勾不到它们，保存后等分类
+    补上就变成「勾了却没勾上」。渲染前先把缺失的分类补拉一遍（并发、失败
+    忽略），保证列表完整。
+    """
+    try:
+        mapped = vlib.mapped_sources()
+        if mapped:
+            await catalog.catalog.load_classes(request.app.state.src, mapped)
+    except Exception:  # noqa: BLE001 - 分类拉取失败不影响授权页
+        pass
     status = acl.status()
     status["libs"] = vlib.library_keys()
     status["sources"] = [
@@ -465,7 +527,7 @@ def _acl_payload() -> dict:
 @router.get("/acl/status")
 async def acl_status(request: Request):
     guard(request)
-    return ok(_acl_payload())
+    return ok(await _acl_payload(request))
 
 
 @router.get("/acl/probe")
@@ -511,7 +573,7 @@ async def acl_config(request: Request):
     runtime.log(f"acl: enabled={cfg.get('acl_enabled')} "
                 f"subjects={len(cfg.get('acl_subjects') or [])} "
                 f"grants={len(cfg.get('acl_grants') or [])}")
-    return ok(_acl_payload())
+    return ok(await _acl_payload(request))
 
 
 @router.post("/acl/grant")
@@ -530,6 +592,21 @@ async def acl_grant(request: Request):
         entry["sources"] = body.get("sources") or []
     if "online" in body:
         entry["online"] = bool(body.get("online"))
+    # 勾了某个源的分类库，就等于允许用这个源。管理页把「库」和「片源」
+    # 分成两个维度，只勾库不勾源时 ``libraries()`` 的 provider_allowed 会
+    # 判假，表现就是「明明授权了这个库，客户端却看不到」。
+    libs = entry.get("libs")
+    sources = entry.get("sources")
+    if isinstance(libs, list) and isinstance(sources, list) and "*" not in sources:
+        extra: list[str] = []
+        for key in libs:
+            text = str(key)
+            if text.startswith("src:") and text.count(":") >= 2:
+                sid = text.split(":")[1]
+                if sid and sid not in sources and sid not in extra:
+                    extra.append(sid)
+        if extra:
+            entry["sources"] = sources + extra
     grants[uid] = entry
     cfg["acl_grants"] = grants
     if body.get("name"):
@@ -540,7 +617,7 @@ async def acl_grant(request: Request):
             cfg["acl_subjects"] = subjects
     config.save(cfg)
     acl.invalidate(uid)
-    return ok(_acl_payload())
+    return ok(await _acl_payload(request))
 
 
 @router.delete("/acl/grant/{uid}")
@@ -552,7 +629,7 @@ async def acl_revoke(uid: str, request: Request):
     cfg["acl_grants"] = grants
     config.save(cfg)
     acl.invalidate(uid)
-    return ok(_acl_payload())
+    return ok(await _acl_payload(request))
 
 
 @router.post("/acl/subjects")
@@ -569,7 +646,7 @@ async def acl_add_subject(request: Request):
         subjects.append({"id": uid, "name": name, "source": "manual"})
     cfg["acl_subjects"] = subjects
     config.save(cfg)
-    return ok(_acl_payload())
+    return ok(await _acl_payload(request))
 
 
 @router.delete("/acl/subjects/{uid}")
@@ -590,7 +667,7 @@ async def acl_del_subject(uid: str, request: Request):
     config.save(cfg)
     acl.invalidate(uid)
     runtime.log(f"acl: del subject {uid} grants={'yes' if dropped else 'no'}")
-    return ok(_acl_payload())
+    return ok(await _acl_payload(request))
 
 
 @router.patch("/ui/theme")
@@ -722,6 +799,68 @@ async def vlib_clear(request: Request):
 @router.get("/logs")
 async def logs(request: Request):
     return ok({"logs": runtime.recent(int(request.query_params.get("limit", 100)))})
+
+
+def _deep_size(obj, seen: set[int] | None = None) -> int:
+    """估算对象及容器内容占用的字节数（同一对象只算一次）。"""
+    seen = seen if seen is not None else set()
+    oid = id(obj)
+    if oid in seen:
+        return 0
+    seen.add(oid)
+    total = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            total += _deep_size(key, seen) + _deep_size(value, seen)
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        for value in obj:
+            total += _deep_size(value, seen)
+    elif hasattr(obj, "__dict__") and not isinstance(obj, type):
+        total += _deep_size(vars(obj), seen)
+    return total
+
+
+@router.get("/memory")
+async def memory_profile(request: Request):
+    """按缓存拆开内存占用，定位「插件吃内存」到底是哪些结构。"""
+    guard(request)
+    store = getattr(request.app.state, "store", None)
+    parts = {
+        "store_items": _deep_size(getattr(store, "_items", {})),
+        "store_media": _deep_size(getattr(store, "_media", {})),
+        "store_episode": _deep_size(getattr(store, "_episode", {})),
+        "store_season": _deep_size(getattr(store, "_season", {})),
+        "catalog_pages": _deep_size(catalog.catalog._pages),
+        "catalog_page_json": _deep_size(catalog.catalog._page_json),
+        "catalog_routes": _deep_size(catalog.catalog._routes),
+        "catalog_classes": _deep_size(catalog.catalog._classes),
+        "search_cache": _deep_size(cms._CACHE),
+        "browse_titles": _deep_size(briefcache._items),
+        "play_titles": _deep_size(playcache._items),
+        "charts": _deep_size(charts.chart_cache._charts) +
+                  _deep_size(charts.chart_cache._index),
+    }
+    counts = {
+        "store_items": len(getattr(store, "_items", {})),
+        "store_media": len(getattr(store, "_media", {})),
+        "store_episode": len(getattr(store, "_episode", {})),
+        "search_keys": len(cms._CACHE),
+        "browse": len(briefcache._items),
+        "play": len(playcache._items),
+    }
+    rss = 0
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                rss = int(line.split()[1]) * 1024
+                break
+    except OSError:
+        pass
+    return ok({"rss_mb": round(rss / 1048576, 1),
+               "parts_mb": {k: round(v / 1048576, 2)
+                            for k, v in sorted(parts.items(),
+                                               key=lambda kv: -kv[1])},
+               "counts": counts})
 
 
 @router.get("/adfilter/preview")

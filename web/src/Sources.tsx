@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, type Bootstrap, type ProbeResult } from './api';
 import type { Notify } from './App';
 
@@ -15,11 +15,14 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
   const [probe, setProbe] = useState<Record<string, ProbeResult>>({});
   const [showAdd, setShowAdd] = useState(false);
   const [showHg, setShowHg] = useState(false);
+  const [showJs, setShowJs] = useState(false);
   const [showProbe, setShowProbe] = useState(false);
   const [keyword, setKeyword] = useState('');
   const [busy, setBusy] = useState('');
   const [form, setForm] = useState({ name: '', key: '', api: '', detail: '' });
   const [hgForm, setHgForm] = useState({ name: '', api: '', token: '' });
+  const [jsForm, setJsForm] = useState({ name: '', rule: '' });
+  const jsFileRef = useRef<HTMLInputElement | null>(null);
   const [editing, setEditing] = useState<{
     id: string; name: string; key: string; api: string; detail: string;
   } | null>(null);
@@ -137,6 +140,44 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
     });
   }
 
+  async function loadJsFile(file: File) {
+    if (file.size > 400_000) {
+      notify(`脚本文件过大（${Math.ceil(file.size / 1024)} KB，上限 400 KB）`, 'err');
+      return;
+    }
+    let text = '';
+    try {
+      text = await file.text();
+    } catch {
+      notify(`读取 ${file.name} 失败`, 'err');
+      return;
+    }
+    if (!text.trim()) {
+      notify(`${file.name} 内容为空`, 'err');
+      return;
+    }
+    setJsForm((f) => ({
+      name: f.name.trim() ? f.name : file.name.replace(/\.(js|txt)$/i, ''),
+      rule: text,
+    }));
+    notify(`已载入 ${file.name}（${Math.max(1, Math.round(text.length / 1024))} KB）`, 'ok');
+  }
+
+  async function doAddJs() {
+    await run('add-js', async () => {
+      const rule = jsForm.rule.trim();
+      if (!rule) throw new Error('请粘贴或上传 .js 源内容');
+      const result = await api.addDrpySource({
+        name: jsForm.name.trim(), rule,
+      });
+      setJsForm({ name: '', rule: '' });
+      setShowJs(false);
+      notify(`JS 源已录入（${result.probe.title || result.source.name}，`
+        + `${result.probe.classes} 个分类），已启用`, 'ok');
+      await refresh();
+    });
+  }
+
   async function doSaveEdit() {
     if (!editing) return;
     await run('save-edit', async () => {
@@ -194,6 +235,9 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
           </button>
           <button className="btn sm info" onClick={() => setShowHg(!showHg)}>
             添加红果服务
+          </button>
+          <button className="btn sm info" onClick={() => setShowJs(!showJs)}>
+            添加 JS 源
           </button>
           {selected.size === 0 && (
             <span className="small">勾选视频源后可进行批量操作</span>
@@ -281,6 +325,73 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
           </div>
         )}
 
+        {showJs && (
+          <div className="stack probe-box mt">
+            <p className="card-sub">
+              粘贴或上传 drpy2 单文件源（<code>var rule = {'{...}'}</code> 的 .js）全文。
+              只解析规则对象并用 HTML 选择器抓取，不引入 Node、不执行 <code>lazy</code> 里的 JS；
+              播放地址走内置的通用播放页解析。磁力源的链接是 <code>magnet:</code>，
+              录入后能浏览但播不了，会明确提示。
+            </p>
+            <div className="row">
+              <div className="grow">
+                <label className="field">名称（可选，默认取规则标题）</label>
+                <input type="text" value={jsForm.name} placeholder="例如：独播库"
+                       onChange={(e) => setJsForm((f) => ({ ...f, name: e.target.value }))} />
+              </div>
+            </div>
+            <div>
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                <label className="field">规则内容</label>
+                <div className="row" style={{ gap: 8 }}>
+                  <input
+                    ref={jsFileRef} type="file" style={{ display: 'none' }}
+                    accept=".js,.txt,text/javascript,application/javascript"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = '';
+                      if (file) void loadJsFile(file);
+                    }}
+                  />
+                  <button className="btn sm ghost" type="button"
+                          onClick={() => jsFileRef.current?.click()}>
+                    选择 .js 文件
+                  </button>
+                  {jsForm.rule.trim() ? (
+                    <button className="btn sm ghost" type="button"
+                            onClick={() => setJsForm((f) => ({ ...f, rule: '' }))}>
+                      清空
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+              <textarea
+                rows={10} value={jsForm.rule} spellCheck={false}
+                placeholder="var rule = { title: '...', host: 'https://...', ... }（也可以把 .js 文件直接拖进来）"
+                style={{ width: '100%', fontFamily: 'monospace', fontSize: 12 }}
+                onChange={(e) => setJsForm((f) => ({ ...f, rule: e.target.value }))}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const file = e.dataTransfer.files?.[0];
+                  if (file) void loadJsFile(file);
+                }}
+              />
+              <p className="small">
+                {jsForm.rule.trim()
+                  ? `已载入 ${jsForm.rule.length.toLocaleString()} 字符，可直接录入`
+                  : '支持 .js / .txt，单文件上限 400 KB'}
+              </p>
+            </div>
+            <div className="row end">
+              <button className="btn primary sm" disabled={busy === 'add-js'}
+                      onClick={() => void doAddJs()}>
+                {busy === 'add-js' ? '校验中…' : '录入'}
+              </button>
+            </div>
+          </div>
+        )}
+
         {editing && (
           <div className="modal-overlay" onClick={() => setEditing(null)}>
             <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -364,6 +475,12 @@ export default function SourcesPage({ boot, refresh, notify }: Props) {
                           <span className="badge" style={{ marginLeft: 6 }}
                                 title={s.version ? `hongguo-web v${s.version}` : '自托管红果服务'}>
                             红果
+                          </span>
+                        )}
+                        {s.kind === 'drpy' && (
+                          <span className="badge" style={{ marginLeft: 6 }}
+                                title="drpy2 单文件 JS 源">
+                            JS
                           </span>
                         )}
                       </td>

@@ -73,8 +73,18 @@ def split_by_source() -> bool:
 
 
 def selected_classes(sid: str) -> list[dict]:
-    """该源要显示哪些原始分类：显式配置优先，否则全部非脏分类。"""
-    rows = catalog.catalog.classes(sid)
+    """该源要显示哪些原始分类：显式配置优先，否则全部非脏分类。
+
+    分类缓存会因重启、清缓存或源站临时失败而丢；这里用已建路由的 type_id
+    补齐，保证「源 × 分类」库键与卡片不会整组消失——否则管理页「全选」
+    时这一组根本不在列表里，保存后自然显示成没勾上。
+    """
+    rows = list(catalog.catalog.classes(sid))
+    have = {str(r.get("id")) for r in rows}
+    for cid in catalog.catalog.route_ids(sid):
+        if cid and cid not in have:
+            have.add(cid)
+            rows.append({"id": cid, "name": cid, "junk": False})
     picked = (config.get().get("vlib_class_ids") or {}).get(sid)
     if isinstance(picked, list) and picked:
         wanted = {str(x) for x in picked}

@@ -9,11 +9,13 @@ import time
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 
 import httpx
 
 import config
+import drpy
 import hongguo
 
 _MEDIA = re.compile(r"\.(m3u8|mp4|flv|mkv|ts)(\?|$)", re.I)
@@ -57,6 +59,9 @@ class OnlineTitle:
     lines: dict = field(default_factory=dict)
     # 线路名 -> provider：合并卡里线路来自不同源，账号授权裁剪必须靠它。
     line_sources: dict = field(default_factory=dict)
+    # 缓存页会把 ``lines``（一页上万个分集地址）丢掉，只留这个集数，
+    # 这样剧集卡片的 TV 标记/总集数不会因为裁剪而变成电影。
+    ep_hint: int = 0
 
     @property
     def online_id(self) -> str:
@@ -83,7 +88,8 @@ def line_names(t: OnlineTitle) -> list[str]:
 
 def episode_count(t: OnlineTitle) -> int:
     names = line_names(t)
-    return max((len(t.lines[n]) for n in names), default=0)
+    return max(max((len(t.lines[n]) for n in names), default=0),
+               int(t.ep_hint or 0))
 
 
 def parse_play(play_from: str, play_url: str, api: str) -> dict:
@@ -247,12 +253,67 @@ def merge_titles(titles: list[OnlineTitle]) -> list[OnlineTitle]:
     return out
 
 
+async def ensure_lines(client: httpx.AsyncClient, store,
+                       brief: dict | None, timeout: float = 8.0) -> dict | None:
+    """CMS 源条目缺分集时，按 ``vod_id`` 回源取一次详情。
+
+    内存里只给近期条目留完整线路，老条目被卸成元数据 stub；没有这一步，
+    重启后点开 bd/bd12 的卡片会因为没有 lines 而起播失败（红果/drpy
+    各自有 ensure_lines，CMS 原来没有）。
+    """
+    if not brief or brief.get("lines"):
+        return None
+    pid = str(brief.get("provider") or "")
+    vod_id = str(brief.get("vod_id") or "")
+    if not pid or not vod_id:
+        return None
+    source = next((s for s in config.enabled_sources()
+                   if str(s.get("id")) == pid), None)
+    if (not source or hongguo.enabled(source) or drpy.enabled(source)
+            or not source.get("api")):
+        return None
+    try:
+        resp = await client.get(source["api"],
+                                params={"ac": "detail", "ids": vod_id},
+                                headers={"User-Agent": _UA}, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = (_xml_to_json(resp.text) if "/at/xml" in source["api"].lower()
+                else resp.json())
+        rows = data.get("list") if isinstance(data, dict) else None
+        for row in rows or []:
+            if str(row.get("vod_id") or "") != vod_id:
+                continue
+            title = map_vod(row, source)
+            if not title or not title.lines:
+                continue
+            from fake import brief_of
+            fresh = brief_of(title, str(brief.get("guid") or ""))
+            updated = dict(brief)
+            for key in ("lines", "line_names", "line_sources", "episodes",
+                        "primary_ext", "title", "poster", "overview",
+                        "actor", "director", "remarks", "type_name"):
+                if fresh.get(key):
+                    updated[key] = fresh[key]
+            store.put_brief(updated)
+            return updated
+    except Exception:  # noqa: BLE001 - 回源失败就保留原条目
+        return None
+    return None
+
+
 async def search_source(client: httpx.AsyncClient, source: dict,
                         keyword: str, timeout: float) -> list[OnlineTitle]:
     # 自托管红果服务走自己的 /api/search，不认苹果 CMS 的 ac=detail&wd=。
     if hongguo.enabled(source):
         try:
             return await hongguo.search_titles(client, source, keyword)
+        except Exception:  # noqa: BLE001 - 单源失败不影响其它源
+            return []
+    # drpy 单文件源：按规则里的 searchUrl 抓 HTML 列表。
+    if drpy.enabled(source):
+        try:
+            return await drpy.search_titles(client, source, keyword)
         except Exception:  # noqa: BLE001 - 单源失败不影响其它源
             return []
     try:
@@ -279,6 +340,12 @@ async def search_source(client: httpx.AsyncClient, source: dict,
 _CACHE: dict[tuple, tuple[float, list[OnlineTitle]]] = {}
 _INFLIGHT: dict[tuple, asyncio.Task] = {}
 _CACHE_TTL = 60.0
+# 单次搜索的硬上限（秒）。``search_timeout`` 设成 20 也只是「最多等 20 秒」，
+# 但手机端 10 秒左右就会断开（nginx 记录成 499），等满 20 秒等于必然失败。
+SEARCH_HARD_LIMIT = 6.0
+# store 里同时保留完整分集地址的条目数。800 条带线路要 135MB，
+# 96 条约 16MB；被卸掉的条目仍可按 guid 打开，只是首次播放要补一次详情。
+RICH_MAX = 96
 # 多源结果只缓存几秒，用于吸收 App 重复请求；用户稍后重搜必须重新聚合，
 # 否则慢源/失败源缺失的那份结果会被反复展示。
 _MULTI_CACHE_TTL = 5.0
@@ -308,15 +375,26 @@ async def search_all(client: httpx.AsyncClient, sources: list[dict], keyword: st
         # 根本轮不到，表现就是「启用的源越多，结果越不全」。
         sem = asyncio.Semaphore(min(max(concurrency, 8), 12, len(sources)))
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(0.5, timeout)
-        # 单源超时略短于总预算，慢源不会长期占住并发槽位。
-        per_source = min(max(0.8, timeout * 0.8), 2.0)
+        # 总预算最多 8 秒：手机端 10 秒左右就会放弃请求，等再久也只会变成
+        # nginx 里的 499（用户看到「搜索失败」），不如按预算把已有结果给出去。
+        deadline = loop.time() + max(0.5, min(timeout, SEARCH_HARD_LIMIT))
+        # 单源预算：按配置比例给，但必须留出余量。CMS 源正常 1~3 秒，
+        # 掐太紧（以前是 2 秒封顶）会把主力源切掉，搜索只剩零星几条。
+        per_source = min(max(1.5, timeout * 0.8), SEARCH_HARD_LIMIT)
         completed = True
 
         async def one(src):
             async with sem:
-                return await search_source(client, src, keyword,
-                                           timeout=per_source)
+                try:
+                    # drpy / 红果的搜索自己连着打多页，不吃上面这个 timeout；
+                    # 不额外掐断的话，一个慢源就能把整次搜索拖到十几秒，
+                    # 手机端会先超时断开（nginx 里是一串 499），用户看到
+                    # 「搜索失败」。这里统一按单源预算硬断。
+                    return await asyncio.wait_for(
+                        search_source(client, src, keyword, timeout=per_source),
+                        timeout=per_source + 0.5)
+                except Exception:  # noqa: BLE001 - 单源超时/失败不影响其它源
+                    return []
 
         tasks = [asyncio.create_task(one(s)) for s in sources]
         found: list[OnlineTitle] = []
@@ -381,6 +459,35 @@ class TitleStore:
         self._season: dict[str, str] = {}
         self._max = max_items
         self._ttl = ttl
+        # 分集地址才是内存大头（实测一条剧集平均 242 集 / 173KB）。
+        # 只给最近使用的少量条目保留完整 lines，其余卸成元数据 stub；
+        # 播放入口的 _online_brief 会按需要重新补一次详情。
+        self._rich: OrderedDict[str, None] = OrderedDict()
+
+    def _unrich(self, guid: str) -> None:
+        """把条目卸成元数据 stub，释放它的分集地址与反查映射。"""
+        brief = self._items.get(guid)
+        self._rich.pop(guid, None)
+        if not isinstance(brief, dict) or not brief.get("lines"):
+            return
+        from fake import ep_media_guid, ep_video_guid, episode_guid
+        for idx in range(max(1, int(brief.get("episodes") or 1))):
+            eg = episode_guid(guid, idx)
+            self._episode.pop(eg, None)
+            self._media.pop(ep_media_guid(eg), None)
+            self._media.pop(ep_video_guid(eg), None)
+        slim = dict(brief)
+        slim["lines"] = {}
+        self._items[guid] = slim
+
+    def _trim_rich(self) -> None:
+        """超出 RICH_MAX 的最久未用条目卸掉分集地址。"""
+        while len(self._rich) > RICH_MAX:
+            self._unrich(next(reversed(self._rich)))
+
+    def touch(self, guid: str) -> None:
+        if guid in self._rich:
+            self._rich.move_to_end(guid, last=False)
 
     @staticmethod
     def guid_of(t: OnlineTitle) -> str:
@@ -399,15 +506,45 @@ class TitleStore:
                 acl_on = bool(config.get().get("acl_enabled"))
             except Exception:  # noqa: BLE001 - 配置读取失败按原行为处理
                 acl_on = False
-        if not acl_on:
-            return brief
         old = self._items.get(guid)
         if not isinstance(old, dict):
+            return brief
+        # 不分账号：分类页缓存为了省内存不带分集地址，命中缓存后返回的是
+        # 无线路的条目，不能把 store 里已补好的可播条目覆盖成“不能播”。
+        if old.get("lines") and not brief.get("lines"):
+            return old
+        # 反向的「升级」必须放行：轻量 stub 没有分集、line_names 却可能
+        # 和补回的详情完全一样，下面的 ACL 同名判断会把它当降级挡掉。
+        if not old.get("lines") and brief.get("lines"):
+            return brief
+        if not acl_on:
             return brief
         old_names = set(old.get("line_names") or [])
         new_names = set(brief.get("line_names") or [])
         if old_names and new_names and new_names <= old_names:
             return old
+        return brief
+
+    def _register(self, guid: str, brief: dict, acl_on: bool | None = None) -> dict:
+        """注册一条 brief 及其 guid 反查表；有线路就进近期 LRU。"""
+        from fake import (brief_of, media_guid, video_guid, ep_media_guid,
+                          ep_video_guid, episode_guid, season_guid)
+        brief = self._keep_richer(guid, brief, acl_on)
+        self._items[guid] = brief
+        self._season[season_guid(guid)] = guid
+        self._media[media_guid(guid)] = (guid, 0)
+        self._media[video_guid(guid)] = (guid, 0)
+        # 没有分集的条目不建逐集反查表：800 条 × 242 集会多出几十万个
+        # 字典项，而它要等 ``_online_brief`` 补回线路才有用。
+        if brief.get("lines"):
+            for idx in range(max(1, int(brief.get("episodes") or 1))):
+                eg = episode_guid(guid, idx)
+                self._episode[eg] = (guid, idx)
+                self._media[ep_media_guid(eg)] = (guid, idx)
+                self._media[ep_video_guid(eg)] = (guid, idx)
+            self._rich[guid] = None
+            # touch() 用 last=False 把最近使用的放前面，末尾才是最久未用。
+            self._rich.move_to_end(guid, last=False)
         return brief
 
     def remember(self, titles: list[OnlineTitle]) -> list[dict]:
@@ -420,17 +557,8 @@ class TitleStore:
             acl_on = False
         for t in titles:
             guid = self.guid_of(t)
-            brief = self._keep_richer(guid, brief_of(t, guid), acl_on)
-            self._items[guid] = brief
-            self._season[season_guid(guid)] = guid
-            self._media[media_guid(guid)] = (guid, 0)
-            self._media[video_guid(guid)] = (guid, 0)
-            for idx in range(max(1, episode_count(t))):
-                eg = episode_guid(guid, idx)
-                self._episode[eg] = (guid, idx)
-                self._media[ep_media_guid(eg)] = (guid, idx)
-                self._media[ep_video_guid(eg)] = (guid, idx)
-            out.append(brief)
+            out.append(self._register(guid, brief_of(t, guid), acl_on))
+        self._trim_rich()
         if len(self._items) > self._max:
             for key in list(self._items)[: max(1, self._max // 4)]:
                 self._drop(key)
@@ -445,6 +573,7 @@ class TitleStore:
         return out
 
     def get(self, guid: str) -> dict | None:
+        self.touch(guid)
         return self._items.get(guid)
 
     def purge(self, predicate) -> int:
@@ -467,25 +596,15 @@ class TitleStore:
         用稳定的 chart guid，需要把搜源命中的线路挂到这个 guid 上，播放链
         才能照常按 guid 反查 media/episode。返回注册后的 brief。
         """
-        from fake import (media_guid, video_guid, ep_media_guid,
-                          ep_video_guid, episode_guid, season_guid)
         guid = str(brief.get("guid") or "")
         if not guid:
             return brief
-        brief = self._keep_richer(guid, brief)
-        self._items[guid] = brief
-        self._season[season_guid(guid)] = guid
-        self._media[media_guid(guid)] = (guid, 0)
-        self._media[video_guid(guid)] = (guid, 0)
-        for idx in range(max(1, int(brief.get("episodes") or 1))):
-            eg = episode_guid(guid, idx)
-            self._episode[eg] = (guid, idx)
-            self._media[ep_media_guid(eg)] = (guid, idx)
-            self._media[ep_video_guid(eg)] = (guid, idx)
+        out = self._register(guid, brief)
+        self._trim_rich()
         if len(self._items) > self._max:
             for key in list(self._items)[: max(1, self._max // 4)]:
                 self._drop(key)
-        return brief
+        return out
 
     def resolve_media(self, mg: str) -> tuple[str, int] | None:
         return self._media.get(mg)
@@ -501,6 +620,7 @@ class TitleStore:
 
     def _drop(self, guid: str) -> None:
         brief = self._items.pop(guid, None)
+        self._rich.pop(guid, None)
         if brief is None:
             return
         from fake import (media_guid, video_guid, ep_media_guid, ep_video_guid,

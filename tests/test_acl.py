@@ -229,6 +229,39 @@ class AclTest(unittest.TestCase):
         finally:
             acl.reset(token)
 
+    def test_lib_prefix_wildcard(self):
+        """「全选」写成前缀通配：之后新增的分类库自动包含。"""
+        self.enable(grants={"u1": {"libs": ["src:s_1:*"], "sources": []}})
+        token = self.as_user("u1")
+        try:
+            self.assertTrue(acl.lib_allowed("src:s_1:1"))
+            self.assertTrue(acl.lib_allowed("src:s_1:999"))
+            self.assertFalse(acl.lib_allowed("src:s_2:1"))
+            self.assertFalse(acl.lib_allowed("chart:movie"))
+        finally:
+            acl.reset(token)
+
+    def test_lib_group_wildcard(self):
+        self.enable(grants={"u1": {"libs": ["chart:*"], "sources": []}})
+        token = self.as_user("u1")
+        try:
+            self.assertTrue(acl.lib_allowed("chart:movie"))
+            self.assertTrue(acl.lib_allowed("chart:tv"))
+            self.assertFalse(acl.lib_allowed("catalog:movie"))
+        finally:
+            acl.reset(token)
+
+    def test_source_wildcard(self):
+        self.enable(grants={"u1": {"libs": [], "sources": ["*"]}})
+        token = self.as_user("u1")
+        try:
+            self.assertEqual([s["id"] for s in acl.sources()], ["s_1", "s_2"])
+            self.assertTrue(acl.provider_allowed("s_2"))
+            # 通配不等于绕过全局开关：未启用的源仍然失效。
+            self.assertFalse(acl.provider_allowed("s_3"))
+        finally:
+            acl.reset(token)
+
     # ---------------------------------------------------------- 身份
     def test_header_identity_wins(self):
         self.enable(grants={"u9": {"libs": ["chart:tv"], "sources": []}})
@@ -342,6 +375,26 @@ class AclTest(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             data = resp.json()["data"]
             self.assertEqual(data["grants"]["u1"]["sources"], ["s_1"])
+
+    def test_grant_adds_source_for_selected_library(self):
+        """只勾库没勾源时自动补源，否则库卡片会被 provider 判定挡掉。"""
+        token = config.token()
+        with TestClient(appmod.app) as client:
+            resp = client.post("/v/api/ext/acl/grant",
+                               headers={"x-admin-token": token},
+                               json={"uid": "u1", "libs": ["src:s_1:*"],
+                                     "sources": []})
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()["data"]
+            self.assertEqual(data["grants"]["u1"]["sources"], ["s_1"])
+            # 显式给的其他源要保持原样，不被覆盖。
+            resp = client.post("/v/api/ext/acl/grant",
+                               headers={"x-admin-token": token},
+                               json={"uid": "u1",
+                                     "libs": ["src:s_2:3", "chart:movie"],
+                                     "sources": ["s_1"]})
+            self.assertEqual(resp.json()["data"]["grants"]["u1"]["sources"],
+                             ["s_1", "s_2"])
 
     def test_enable_requires_grant_when_defaults_deny(self):
         """默认全禁 + 一条授权都没有 = 开启即全员无内容，必须拦住。"""
@@ -477,6 +530,19 @@ class AclTest(unittest.TestCase):
         store.put_brief(dict(rich))
         store.put_brief(dict(poor))
         self.assertEqual(store.get("g1")["line_names"], ["L1", "源二：L1"])
+
+    def test_store_upgrades_stub_even_with_same_line_names(self):
+        """轻量 stub 补回详情后必须能写回（同名线路不能被当成降级挡掉）。"""
+        self.enable(grants={"u1": {"libs": [], "sources": ["s_1"]}})
+        store = cms.TitleStore()
+        stub = brief_of(provider="s_1")
+        stub["lines"] = {}
+        store.put_brief(dict(stub))
+        self.assertEqual(store.get("g1")["lines"], {})
+        fresh = brief_of(provider="s_1", lines={
+            "L1": [{"url": "https://a.invalid/1.m3u8"}]})
+        store.put_brief(dict(fresh))
+        self.assertTrue(store.get("g1")["lines"])
 
 
 class OfficialSchemaTest(unittest.TestCase):

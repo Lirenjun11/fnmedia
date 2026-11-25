@@ -24,7 +24,15 @@ _swapped = False
 
 
 def health_ok(path: Path, timeout: float = 45.0) -> bool:
+    """探活：必须读到 200 + ``"ok"``。
+
+    注意 ``recv`` 只读一次是不够的：uvicorn 先发响应头、再发 body（小响应也
+    会分成两个包），只读一次会永远只拿到 header，于是健康检查一直失败、
+    进程 45 秒后自退（unit 是 Restart=no，整个服务就停了）。这里循环读到
+    连接关闭或读到 ``"ok"`` 为止。
+    """
     deadline = time.monotonic() + timeout
+    last = "no attempt"
     while time.monotonic() < deadline:
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -32,13 +40,26 @@ def health_ok(path: Path, timeout: float = 45.0) -> bool:
             sock.connect(str(path))
             sock.sendall(b"GET /_ext/healthz HTTP/1.1\r\nHost: localhost\r\n"
                          b"Connection: close\r\n\r\n")
-            data = sock.recv(4096)
+            chunks: list[bytes] = []
+            while len(chunks) < 64:
+                try:
+                    data = sock.recv(4096)
+                except (socket.timeout, TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+                if b'"ok"' in b"".join(chunks):
+                    break
             sock.close()
-            if b"200" in data and b'"ok"' in data:
+            blob = b"".join(chunks)
+            last = blob[:120].decode("latin-1", "replace")
+            if b"200" in blob and b'"ok"' in blob:
                 return True
-        except OSError:
-            pass
+        except OSError as exc:
+            last = f"{type(exc).__name__}: {exc}"
         time.sleep(0.25)
+    print(f"[fnmedia-ext] health check failed on {path}: {last}", flush=True)
     return False
 
 

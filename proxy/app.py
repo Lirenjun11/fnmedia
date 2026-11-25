@@ -25,6 +25,7 @@ import charts
 import cms
 import config
 import douban
+import drpy
 import fake
 import hls
 import hongguo
@@ -95,6 +96,10 @@ async def _vlib_worker(app: FastAPI) -> None:
                     runtime.log("catalog rebuilt: "
                                 f"routes={len(built.get('routes') or {})} "
                                 f"split={vlib.split_by_source()}")
+                if cfg.get("vlib_catalog", True) and config.enabled_sources():
+                    # 预热各分类首页：源站单页要 3~14 秒，先把首屏灌进缓存，
+                    # 用户点进分类就不用干等（后台串行，不影响请求）。
+                    await catalog_mod.catalog.warm_pages(app.state.src)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  
@@ -119,6 +124,9 @@ async def lifespan(app: FastAPI):
         follow_redirects=True, trust_env=False,
     )
     app.state.store = cms.TitleStore()
+    # 分类预热抓到的页只把轻量元数据留在页缓存里（分集太占内存），
+    # 完整条目注册进 store，用户点开热过的卡片仍然能直接播。
+    catalog_mod.bind_store(app.state.store)
     playstate.load()
     vlib.bind_client(app.state.src)
     restored = vlib.restore(app.state.store)
@@ -390,13 +398,16 @@ async def _search_is_latest(request: Request, debounce_ms: int) -> bool:
 
 @app.get("/v/api/v1/search/list")
 async def search_list(request: Request):
+    started = time.monotonic()
     local = await _passthrough(request)
     sources = acl.sources()
     keyword = request.query_params.get("q", "").strip()
     if not sources or not keyword:
         return local
     cfg = config.get()
-    debounce_ms = int(cfg.get("search_debounce_ms", 200))
+    # 服务端防抖封顶 500ms：配置里设 1 秒时，每次搜索都白等一秒，
+    # 叠上聚合预算就顶到手机端的超时线了；500ms 仍能吸收连续输入。
+    debounce_ms = min(int(cfg.get("search_debounce_ms", 200)), 500)
     if debounce_ms > 0 and not await _search_is_latest(request, debounce_ms):
         # A newer query arrived while waiting: return official local results
         # only. The last request of the burst is the one that queries sources.
@@ -420,10 +431,16 @@ async def search_list(request: Request):
     if cfg.get("merge_sources", True):
         titles = cms.merge_titles(titles)
     briefs = request.app.state.store.remember(titles)
+    _prewarm_search(request, briefs)
     cards = fake.normalize_cards(
         [playstate.apply(fake.search_card(b), b["guid"]) for b in briefs],
         _ua(request))
     data["data"] = cards + items if cfg.get("online_first", True) else items + cards
+    # 一行摘要：日志里能直接看出「搜索失败」是超时、源被授权裁掉、还是
+    # 聚合到了但卡片被过滤，不必再猜。
+    runtime.log(f"search '{keyword[:20]}' srcs={len(sources)} "
+                f"titles={len(titles)} cards={len(cards)} "
+                f"{time.monotonic() - started:.1f}s")
     return JSONResponse(data, status_code=200,
                         headers={"Content-Type": "application/json; charset=utf-8"})
 
@@ -493,7 +510,7 @@ async def item_detail(guid: str, request: Request):
 
 async def _item_title_detail(brief: dict, guid: str, request: Request):
     # 红果类条目：详情接口才有分集，标题详情页是补线路的最佳时机。
-    brief = await _hg_brief(request, brief) or brief
+    brief = await _online_brief(request, brief) or brief
     # TMDB 命中缓存立即用；未命中最多等 1 秒，超时先返回源站数据，后台继续补。
     meta = None
     if tmdb.enabled():
@@ -648,15 +665,19 @@ async def _stream_list_impl(guid: str, request: Request):
     if ep:
         tv_guid, ep_index = ep
         eg = guid
-    elif _brief(store, guid):
-        tv_guid = guid
         brief = _brief(store, tv_guid)
-        # 电视剧整剧身份 -> 续播集，和 play/info 保持一致。
-        ep_index = _resume_index(store, tv_guid) if brief and brief.get("is_tv") else 0
-        eg = fake.episode_guid(tv_guid, ep_index) if brief and brief.get("is_tv") else ""
     else:
-        return await _passthrough(request)
-    brief = _brief(store, tv_guid)
+        brief = _brief(store, guid)
+        if not brief:
+            return await _passthrough(request)
+        tv_guid = guid
+        # 搜索结果 / 分类卡只有标题，没有分集；不在这里补一次，线上源条目
+        # 的 stream/list 会返回 0 条分集，客户端判定「没有可播流」，表现为
+        # 搜索里点播放毫无反应（play/info 反而会补，所以重试又好了）。
+        brief = await _online_brief(request, brief) or brief
+        # 续播集和 eg 必须补完线路后再算：补之前 is_tv 还是 False。
+        ep_index = _resume_index(store, tv_guid) if brief.get("is_tv") else 0
+        eg = fake.episode_guid(tv_guid, ep_index) if brief.get("is_tv") else ""
     if not brief:
         return await _passthrough(request)
     if ep:
@@ -771,8 +792,36 @@ def _brief(store: cms.TitleStore, guid: str, enforce: bool = True) -> dict | Non
     return acl.filter_brief(store.get(guid), enforce=enforce)
 
 
-async def _hg_brief(request: Request, brief: dict | None) -> dict | None:
-    """红果类条目补播放地址。
+def _prewarm_search(request: Request, briefs: list[dict],
+                    limit: int = 3) -> None:
+    """搜索结果一出来就在后台补前几条的线路。
+
+    搜索结果本身只有标题，点播放时才去源站查详情；源站单页 3~14 秒，现场
+    等就是「点了没反应」或「播放不了」。这里先把前几条补好写回 store，
+    用户点开时直接命中。
+    """
+    targets = [b for b in briefs
+               if isinstance(b, dict) and b.get("provider")
+               and not b.get("lines")][:limit]
+    if not targets:
+        return
+
+    async def run() -> None:
+        for brief in targets:
+            try:
+                await _online_brief(request, brief)
+            except Exception as exc:  # noqa: BLE001 - 预热失败不影响搜索
+                runtime.log(f"search prewarm failed: {type(exc).__name__}")
+            await asyncio.sleep(0.2)
+
+    try:
+        asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        pass
+
+
+async def _online_brief(request: Request, brief: dict | None) -> dict | None:
+    """在线源条目补播放地址（红果 / drpy JS 源）。
 
     搜索结果与分类列表本身不带分集地址（要再查一次详情），所以在详情页、
     起播、分片这三条入口统一补一次；补完写回 store，后续请求直接命中。
@@ -780,15 +829,64 @@ async def _hg_brief(request: Request, brief: dict | None) -> dict | None:
     if not brief or brief.get("lines"):
         return brief
     source = hongguo.find_source(str(brief.get("provider") or ""))
-    if not hongguo.enabled(source):
-        return brief
+    if hongguo.enabled(source):
+        try:
+            updated = await hongguo.ensure_lines(
+                request.app.state.src, request.app.state.store, brief)
+        except Exception as exc:  # noqa: BLE001 - 补失败保留原条目
+            runtime.log(f"hongguo ensure error: {type(exc).__name__}")
+            return brief
+        return updated or brief
+    source = drpy.find_source(str(brief.get("provider") or ""))
+    if not drpy.enabled(source):
+        # CMS 源（bd/bd12 等）：内存吃紧时线路会被卸掉，重启后也要能播。
+        return await cms.ensure_lines(
+            request.app.state.src, request.app.state.store, brief) or brief
     try:
-        updated = await hongguo.ensure_lines(
+        updated = await drpy.ensure_lines(
             request.app.state.src, request.app.state.store, brief)
     except Exception as exc:  # noqa: BLE001 - 补失败保留原条目
-        runtime.log(f"hongguo ensure error: {type(exc).__name__}")
+        runtime.log(f"drpy ensure error: {type(exc).__name__}")
         return brief
     return updated or brief
+
+
+async def _drpy_play_url(request: Request, brief: dict, line: int,
+                         index: int, url: str) -> str:
+    """drpy 源的分集地址是「播放页」，起播前换成真实 m3u8 / mp4。
+
+    换到的直链写回 brief：后面的 preset / main / direct 三条链路与预热都直接
+    命中，不会为同一集重复解析。解析不出来就原样返回，让上层报错而不是
+    把一个 HTML 页面当清单去解析。
+    """
+    text = str(url or "")
+    if not text.startswith(("http://", "https://")):
+        return text
+    if _is_direct_media(text) or ".m3u8" in text.lower():
+        return text
+    source = drpy.find_source(str(brief.get("provider") or ""))
+    if not drpy.enabled(source):
+        # CMS 采集站常把上游的播放页 HTML 直接塞进 vod_play_url（例如 bd
+        # 源给的是 dbku.tv/vodplay/*.html）。本条不是 drpy 源时，按域名
+        # 借同站的 drpy 规则解析，否则把 HTML 当清单抓只会超时 / 502。
+        source = drpy.find_source_for_url(text)
+        if not source:
+            return text
+    got = await drpy.resolve(request.app.state.src, source, text)
+    if not got:
+        return text
+    names = brief.get("line_names") or []
+    name = names[line] if 0 <= line < len(names) else ""
+    eps = (brief.get("lines") or {}).get(name) or []
+    if 0 <= index < len(eps) and isinstance(eps[index], dict):
+        eps[index]["url"] = got
+        eps[index]["direct"] = True
+        try:
+            request.app.state.store.put_brief(brief)
+        except Exception as exc:  # noqa: BLE001 - 写回失败不影响本次播放
+            runtime.log(f"drpy put_brief failed: {type(exc).__name__}")
+    runtime.log(f"drpy play: ep{index + 1} -> {got[:70]}")
+    return got
 
 
 def _identity(store: cms.TitleStore, guid: str) -> tuple[str, str, str] | None:
@@ -1010,7 +1108,7 @@ async def play_info_route(request: Request):
         brief = _brief(store, guid)
         if not brief:
             return await _passthrough(request)
-        brief = await _hg_brief(request, brief) or brief
+        brief = await _online_brief(request, brief) or brief
         index = ref["index"]
         info = fake.episode_play_info(brief, index, ref["episode"])
         canonical = guid
@@ -1018,7 +1116,7 @@ async def play_info_route(request: Request):
         brief = _brief(store, guid)
         if not brief:
             return await _passthrough(request)
-        brief = await _hg_brief(request, brief) or brief
+        brief = await _online_brief(request, brief) or brief
         if brief.get("is_tv"):
             # 集级 media/video guid 已经带了对的集号，绝不能被续播覆盖：
             # 详情页选集后起播走的正是这条路径，覆盖回去就会变成第 1 集
@@ -1165,7 +1263,7 @@ async def stream_post(request: Request):
     brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
-    brief = await _hg_brief(request, brief) or brief
+    brief = await _online_brief(request, brief) or brief
     line = _line_from_body(brief, body)
     _prewarm_online(request, brief, guid, index, line)
     meta = hls.get_playlist_meta((guid, line, index))
@@ -1216,7 +1314,7 @@ async def media_range_route(file_hash: str, request: Request):
     brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
-    brief = await _hg_brief(request, brief) or brief
+    brief = await _online_brief(request, brief) or brief
     line, explicit = _range_selection(request, brief)
     picked = _pick(brief, line, index)
     if not picked:
@@ -1225,6 +1323,7 @@ async def media_range_route(file_hash: str, request: Request):
     if not str(url).startswith(("http://", "https://")):
         # 红果 JS 源占位地址：明确失败，不要当 HLS 去解析。
         return Response(status_code=404)
+    url = await _drpy_play_url(request, brief, line, index, url)
     is_hls = not _is_direct_media(url)
     runtime.log(f"media/range takeover: {brief.get('title', '')[:30]} "
                 f"ep{index + 1} line{line} -> {'hls' if is_hls else 'direct'}")
@@ -1296,7 +1395,7 @@ async def play_play(request: Request):
     brief = _brief(store, guid)
     if not brief:
         return await _passthrough(request)
-    brief = await _hg_brief(request, brief) or brief
+    brief = await _online_brief(request, brief) or brief
     explicit = any(body.get(k) for k in
                    ("bitrate", "line", "direct_link_quality_index"))
     line = _line_from_body(brief, body)
@@ -1313,6 +1412,7 @@ async def play_play(request: Request):
         # 红果 JS 源的占位地址（hgplay://）：本扩展只接管内置源，
         # 直接给明确提示，别让客户端拿到一个必然失败的地址。
         return _err("该线路暂不支持，请在红果服务里切换内置源", 404)
+    url = await _drpy_play_url(request, brief, line, index, url)
     is_hls = not _is_direct_media(url)
     suffix = "preset.m3u8" if is_hls else "direct"
     if not is_hls:
@@ -1367,7 +1467,7 @@ async def preset_m3u8(mg: str, request: Request):
     guid, index, brief = target
     # 红果条目只有 vod_id 时先把分集线路补齐，否则直链判定会失败、
     # 误走 master 分支，iOS/App 拿到 master 后不跟变体就一直转圈。
-    brief = await _hg_brief(request, brief) or brief
+    brief = await _online_brief(request, brief) or brief
     line, _ = _range_selection(request, brief)
     names = brief.get("line_names") or []
     line = max(0, min(line, len(names) - 1)) if names else 0
@@ -1409,6 +1509,11 @@ async def preset_m3u8(mg: str, request: Request):
                                        "play_timeout", 8.0)), 2.0))
         except asyncio.TimeoutError:
             pass
+        except Exception as exc:  # noqa: BLE001
+            # shield 会把预热任务的异常原样抛给等待方：源站这次返回了
+            # HTML/错误页（``not a playlist``）时，这里不接住就是 500，
+            # 客户端表现为「转圈几秒后播放失败，点重试才成功」。
+            runtime.log(f"preset warm failed: {type(exc).__name__}")
     label = (fake.line_display(brief, names[line]) if names
              else "原画").replace('"', "")
     # 根路径绝对地址：iOS 经 media/range 302 到 preset 后，会以原始
@@ -1744,7 +1849,7 @@ async def direct_media(mg: str, request: Request):
     guid, index, brief = target
     # 搜索结果/榜单里的红果条目可能只带 vod_id，没有分集线路：这里补一次
     # 详情，否则 _pick 拿不到地址，切第二集就变成 404（播放器一直转圈）。
-    brief = await _hg_brief(request, brief) or brief
+    brief = await _online_brief(request, brief) or brief
     try:
         line = int(request.query_params.get("line", 0))
     except ValueError:

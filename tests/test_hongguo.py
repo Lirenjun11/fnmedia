@@ -327,7 +327,7 @@ class HongguoIntegrationTest(unittest.TestCase):
         request = SimpleNamespace(app=SimpleNamespace(
             state=SimpleNamespace(src=client, store=store)))
         with patch.object(hongguo, "find_source", return_value=SOURCE):
-            out = asyncio.run(appmod._hg_brief(request, brief))
+            out = asyncio.run(appmod._online_brief(request, brief))
         self.assertEqual(out["episodes"], 2)
         url, _ = appmod._pick(out, 0, 1)
         self.assertIn("/api/stream/9002", url)
